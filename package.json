@@ -1,0 +1,30 @@
+{
+  "name": "whatsapp-agent-hermes",
+  "version": "1.0.0",
+  "description": "Simple Express app using JonathanChuahE-Jay/Baileys",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "demo:hermes": "tsx examples/hermes_agent_demo.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "github:JonathanChuahE-Jay/Baileys",
+    "baileys": "github:JonathanChuahE-Jay/Baileys",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.10",
+    "@types/qrcode": "^1.5.5",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
