@@ -10,7 +10,11 @@
     forwardSwitch: $('forwardSwitch'), filterInfo: $('filterInfo'), testBtn: $('testBtn'), testResult: $('testResult'),
     sendForm: $('sendForm'), sendBtn: $('sendBtn'), sendResult: $('sendResult'), sendDisabledNote: $('sendDisabledNote'),
     recipientInput: $('recipientInput'), recipientError: $('recipientError'),
+    tabText: $('tabText'), tabImage: $('tabImage'), tabDoc: $('tabDoc'),
+    panelText: $('panelText'), panelImage: $('panelImage'), panelDoc: $('panelDoc'),
     messageInput: $('messageInput'), messageError: $('messageError'), charCount: $('charCount'),
+    imageUrlInput: $('imageUrlInput'), imageUrlError: $('imageUrlError'), imageFileInput: $('imageFileInput'), imagePickBtn: $('imagePickBtn'), imageCaptionInput: $('imageCaptionInput'),
+    docUrlInput: $('docUrlInput'), docUrlError: $('docUrlError'), docFileInput: $('docFileInput'), docPickBtn: $('docPickBtn'), docFileNameInput: $('docFileNameInput'), docCaptionInput: $('docCaptionInput'),
     activityList: $('activityList'), toasts: $('toasts'),
     logoutDialog: $('logoutDialog'), logoutForm: $('logoutForm'), logoutConfirm: $('logoutConfirm'),
     authDialog: $('authDialog'), authForm: $('authForm'), authInput: $('authInput'), authError: $('authError')
@@ -25,6 +29,7 @@
   let offline = false;
   let authPending = false;
   let switchBusy = false;
+  let currentSendMode = 'text';
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -144,6 +149,15 @@
     if (!el.sendBtn.dataset.label) el.sendBtn.disabled = !connected; // leave a busy button alone
     el.recipientInput.disabled = !connected;
     el.messageInput.disabled = !connected;
+    el.imageUrlInput.disabled = !connected;
+    el.imageFileInput.disabled = !connected;
+    el.imagePickBtn.disabled = !connected;
+    el.imageCaptionInput.disabled = !connected;
+    el.docUrlInput.disabled = !connected;
+    el.docFileInput.disabled = !connected;
+    el.docPickBtn.disabled = !connected;
+    el.docFileNameInput.disabled = !connected;
+    el.docCaptionInput.disabled = !connected;
     el.sendDisabledNote.hidden = connected;
 
     // Avoid re-rendering identical content so the QR image and focus do not flicker.
@@ -333,9 +347,60 @@
     }
   });
 
+  // Send mode switching
+  function setSendMode(mode) {
+    currentSendMode = mode;
+    el.tabText.classList.toggle('active', mode === 'text');
+    el.tabText.setAttribute('aria-selected', String(mode === 'text'));
+    el.panelText.hidden = mode !== 'text';
+
+    el.tabImage.classList.toggle('active', mode === 'image');
+    el.tabImage.setAttribute('aria-selected', String(mode === 'image'));
+    el.panelImage.hidden = mode !== 'image';
+
+    el.tabDoc.classList.toggle('active', mode === 'doc');
+    el.tabDoc.setAttribute('aria-selected', String(mode === 'doc'));
+    el.panelDoc.hidden = mode !== 'doc';
+
+    el.sendBtn.textContent = mode === 'text' ? 'Send message' : (mode === 'image' ? 'Send image' : 'Send document');
+    el.sendResult.hidden = true;
+  }
+
+  el.tabText.addEventListener('click', () => setSendMode('text'));
+  el.tabImage.addEventListener('click', () => setSendMode('image'));
+  el.tabDoc.addEventListener('click', () => setSendMode('doc'));
+
+  // Local file attachment handlers
+  el.imagePickBtn.addEventListener('click', () => el.imageFileInput.click());
+  el.docPickBtn.addEventListener('click', () => el.docFileInput.click());
+
+  el.imageFileInput.addEventListener('change', () => {
+    const file = el.imageFileInput.files && el.imageFileInput.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      el.imageUrlInput.value = reader.result;
+      setFieldError(el.imageUrlInput, el.imageUrlError, '');
+    };
+    reader.readAsDataURL(file);
+  });
+
+  el.docFileInput.addEventListener('change', () => {
+    const file = el.docFileInput.files && el.docFileInput.files[0];
+    if (!file) return;
+    if (!el.docFileNameInput.value.trim()) {
+      el.docFileNameInput.value = file.name;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      el.docUrlInput.value = reader.result;
+      setFieldError(el.docUrlInput, el.docUrlError, '');
+    };
+    reader.readAsDataURL(file);
+  });
+
   function validateSend() {
     const recipient = el.recipientInput.value.trim();
-    const message = el.messageInput.value.trim();
     let valid = true;
 
     const digits = recipient.replace(/[^0-9]/g, '');
@@ -349,13 +414,58 @@
       setFieldError(el.recipientInput, el.recipientError, '');
     }
 
-    if (!message) {
-      setFieldError(el.messageInput, el.messageError, 'Enter a message to send.');
-      valid = false;
-    } else {
-      setFieldError(el.messageInput, el.messageError, '');
+    if (currentSendMode === 'text') {
+      const message = el.messageInput.value.trim();
+      if (!message) {
+        setFieldError(el.messageInput, el.messageError, 'Enter a message to send.');
+        valid = false;
+      } else {
+        setFieldError(el.messageInput, el.messageError, '');
+      }
+      return valid ? { endpoint: '/api/send', body: { to: recipient, message: message } } : null;
     }
-    return valid ? { to: recipient, message: message } : null;
+
+    if (currentSendMode === 'image') {
+      const url = el.imageUrlInput.value.trim();
+      if (!url) {
+        setFieldError(el.imageUrlInput, el.imageUrlError, 'Enter an image URL or choose a file.');
+        valid = false;
+      } else {
+        setFieldError(el.imageUrlInput, el.imageUrlError, '');
+      }
+      const caption = el.imageCaptionInput.value.trim();
+      return valid
+        ? {
+            endpoint: '/api/send-image',
+            body: { to: recipient, url: url, ...(caption ? { caption: caption } : {}) }
+          }
+        : null;
+    }
+
+    if (currentSendMode === 'doc') {
+      const url = el.docUrlInput.value.trim();
+      if (!url) {
+        setFieldError(el.docUrlInput, el.docUrlError, 'Enter a document URL or choose a file.');
+        valid = false;
+      } else {
+        setFieldError(el.docUrlInput, el.docUrlError, '');
+      }
+      const fileName = el.docFileNameInput.value.trim();
+      const caption = el.docCaptionInput.value.trim();
+      return valid
+        ? {
+            endpoint: '/api/send-document',
+            body: {
+              to: recipient,
+              url: url,
+              ...(fileName ? { fileName: fileName } : {}),
+              ...(caption ? { caption: caption } : {})
+            }
+          }
+        : null;
+    }
+
+    return null;
   }
 
   function setFieldError(input, errorNode, text) {
@@ -369,32 +479,58 @@
     setFieldError(el.messageInput, el.messageError, '');
     el.charCount.textContent = String(el.messageInput.value.length);
   });
-  el.messageInput.addEventListener('keydown', (e) => {
+  el.imageUrlInput.addEventListener('input', () => setFieldError(el.imageUrlInput, el.imageUrlError, ''));
+  el.docUrlInput.addEventListener('input', () => setFieldError(el.docUrlInput, el.docUrlError, ''));
+
+  const onCtrlEnter = (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !el.sendBtn.disabled) {
       e.preventDefault();
       el.sendForm.requestSubmit();
     }
-  });
+  };
+  el.messageInput.addEventListener('keydown', onCtrlEnter);
+  el.imageCaptionInput.addEventListener('keydown', onCtrlEnter);
+  el.docCaptionInput.addEventListener('keydown', onCtrlEnter);
 
   el.sendForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     el.sendResult.hidden = true;
     const payload = validateSend();
     if (!payload) {
-      (el.recipientError.hidden ? el.messageInput : el.recipientInput).focus();
+      if (!el.recipientError.hidden) {
+        el.recipientInput.focus();
+      } else if (currentSendMode === 'text') {
+        el.messageInput.focus();
+      } else if (currentSendMode === 'image') {
+        el.imageUrlInput.focus();
+      } else if (currentSendMode === 'doc') {
+        el.docUrlInput.focus();
+      }
       return;
     }
 
+    const actionName = currentSendMode === 'text' ? 'message' : (currentSendMode === 'image' ? 'image' : 'document');
     setBusy(el.sendBtn, true, 'Sending…');
     try {
-      const { data } = await api('/api/send', { method: 'POST', body: payload });
+      const { data } = await api(payload.endpoint, { method: 'POST', body: payload.body });
       if (data.success) {
-        showResult(el.sendResult, 'Message sent.', true);
-        el.messageInput.value = '';
-        el.charCount.textContent = '0';
+        showResult(el.sendResult, (currentSendMode === 'text' ? 'Message' : (currentSendMode === 'image' ? 'Image' : 'Document')) + ' sent.', true);
+        if (currentSendMode === 'text') {
+          el.messageInput.value = '';
+          el.charCount.textContent = '0';
+        } else if (currentSendMode === 'image') {
+          el.imageUrlInput.value = '';
+          el.imageCaptionInput.value = '';
+          el.imageFileInput.value = '';
+        } else if (currentSendMode === 'doc') {
+          el.docUrlInput.value = '';
+          el.docFileNameInput.value = '';
+          el.docCaptionInput.value = '';
+          el.docFileInput.value = '';
+        }
         fetchStatus();
       } else {
-        showResult(el.sendResult, data.error || 'The message could not be sent.', false);
+        showResult(el.sendResult, data.error || ('The ' + actionName + ' could not be sent.'), false);
       }
     } catch (err) {
       showResult(el.sendResult, 'Could not send: ' + err.message, false);

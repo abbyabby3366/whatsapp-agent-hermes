@@ -157,6 +157,7 @@ Base URL `http://127.0.0.1:3100`. When `GATEWAY_API_KEY` is set, send `x-api-key
 | `GET /api/status` | – | Full state: status, QR data URL, user, stats, recent messages, webhook config |
 | `POST /api/send` | `{ to, message, replyToMessageId? }` | `{ success: true, messageId }` |
 | `POST /api/send-image` | `{ to, url, caption?, replyToMessageId? }` | `{ success: true, messageId }` |
+| `POST /api/send-document` | `{ to, url, fileName?, mimetype?, caption?, replyToMessageId? }` | `{ success: true, messageId }` |
 | `POST /api/presence` | `{ recipient, presence }` | `presence`: `composing`, `paused`, `recording`, `available`, `unavailable` |
 | `POST /api/read` | `{ messageId }` | Marks the message as read |
 | `GET /api/media/:messageId` | – | Raw file bytes with the right `Content-Type` |

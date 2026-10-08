@@ -97,6 +97,7 @@ All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>`
 | --- | --- | --- |
 | `POST /api/send` | `{ "to": "<phone or chatJid>", "message": "...", "replyToMessageId"?: "..." }` | Send a text message (optionally quoting one) |
 | `POST /api/send-image` | `{ "to": "<phone or chatJid>", "url": "...", "caption"?: "...", "replyToMessageId"?: "..." }` | Send an image (URL, local file, or data URI) |
+| `POST /api/send-document` | `{ "to": "<phone or chatJid>", "url": "...", "fileName"?: "...", "caption"?: "...", "replyToMessageId"?: "..." }` | Send a document (URL, local file, or data URI) |
 | `POST /api/presence` | `{ "recipient": "<chatJid>", "presence": "composing" \| "paused" \| "recording" \| "available" \| "unavailable" }` | Typing indicator |
 | `POST /api/read` | `{ "messageId": "..." }` | Mark a received message as read (blue ticks) |
 | `GET /api/media/:messageId` | – | Download the media of a recent message (raw bytes, correct `Content-Type`) |

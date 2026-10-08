@@ -158,6 +158,51 @@ input:disabled, textarea:disabled { background: var(--surface-2); cursor: not-al
 .send-form { display: flex; flex-direction: column; gap: 14px; }
 .form-actions { display: flex; }
 
+.mode-tabs {
+  display: inline-flex;
+  align-self: flex-start;
+  background: var(--surface-2);
+  padding: 3px;
+  border-radius: 8px;
+  gap: 4px;
+  border: 1px solid var(--border);
+}
+.mode-tab {
+  border: none;
+  background: transparent;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-family: inherit;
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.mode-tab:hover:not(.active) { color: var(--text); }
+.mode-tab.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+.mode-tab:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.input-with-action { display: flex; gap: 8px; align-items: center; }
+.input-with-action input { flex: 1; }
+.file-btn { cursor: pointer; white-space: nowrap; flex: none; }
+
+.visually-hidden {
+  position: absolute;
+  clip-path: inset(50%);
+  overflow: hidden;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  white-space: nowrap;
+}
+
 .copy-row { display: flex; gap: 8px; align-items: center; }
 .copy-row code {
   flex: 1; min-width: 0; background: var(--surface-2); border: 1px solid var(--border);

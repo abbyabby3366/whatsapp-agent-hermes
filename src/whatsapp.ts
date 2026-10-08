@@ -836,6 +836,156 @@ export class WhatsAppClient {
     }
   }
 
+  public async sendDocument(
+    recipient: string,
+    documentUrl: string,
+    opts: {
+      fileName?: string;
+      mimetype?: string;
+      caption?: string;
+      /** Inbound message to quote in the reply. */
+      quotedMessageId?: string;
+      /** Inbound message this reply answers (marks it "replied" in the dashboard). */
+      inReplyTo?: string;
+      source?: 'hermes' | 'api';
+    } = {}
+  ): Promise<SendResult> {
+    if (!this.sock || this.status !== 'connected') {
+      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
+    }
+
+    if (!recipient?.trim() || !documentUrl?.trim()) {
+      return { success: false, code: 400, error: 'Recipient and document URL are required' };
+    }
+
+    let jid = this.resolveJid(recipient);
+    if (!jid) {
+      return {
+        success: false,
+        code: 400,
+        error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789) or a WhatsApp ID.'
+      };
+    }
+
+    // For plain phone numbers, confirm the number is on WhatsApp so we can give a clear error.
+    if (jid.endsWith('@s.whatsapp.net')) {
+      try {
+        const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
+        if (match && !match.exists) {
+          return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
+        }
+        if (match?.exists && match.jid) jid = match.jid;
+      } catch {
+        // Lookup is best effort; try sending anyway.
+      }
+    }
+
+    const isGroup = jid.endsWith('@g.us');
+    const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+    const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
+    const cleanCaption = opts.caption?.trim();
+    const cleanFileName = opts.fileName?.trim();
+    const cleanUrl = documentUrl.trim();
+
+    // Determine filename if not provided
+    let resolvedFileName = cleanFileName;
+    if (!resolvedFileName) {
+      if (cleanUrl.startsWith('data:')) {
+        const mimeMatch = cleanUrl.match(/^data:([^;,]+)/)?.[1];
+        let ext = 'bin';
+        if (mimeMatch === 'application/pdf') ext = 'pdf';
+        else if (mimeMatch === 'text/plain') ext = 'txt';
+        else if (mimeMatch === 'application/json') ext = 'json';
+        else if (mimeMatch?.includes('/')) ext = mimeMatch.split('/')[1];
+        resolvedFileName = `document.${ext}`;
+      } else {
+        const candidate = cleanUrl.split('/').pop()?.split('?')[0]?.split('#')[0];
+        resolvedFileName = candidate && candidate.trim() ? candidate.trim() : 'document';
+      }
+    }
+
+    // Determine mimetype
+    let mimetype = opts.mimetype?.trim();
+    if (!mimetype && cleanUrl.startsWith('data:')) {
+      const match = cleanUrl.match(/^data:([^;,]+)/);
+      if (match && match[1]) {
+        mimetype = match[1];
+      }
+    }
+    if (!mimetype) {
+      mimetype = this.inferDocumentMimetype(resolvedFileName);
+    }
+
+    try {
+      const result = await this.sock.sendMessage(
+        jid,
+        {
+          document: { url: cleanUrl },
+          mimetype,
+          fileName: resolvedFileName,
+          ...(cleanCaption ? { caption: cleanCaption } : {})
+        },
+        quoted ? { quoted } : undefined
+      );
+      const messageId = result?.key?.id ?? undefined;
+
+      this.stats.sentCount++;
+      const summaryText = cleanCaption
+        ? `[Document: ${resolvedFileName}] ${cleanCaption}`
+        : `[Document: ${resolvedFileName}]`;
+      if (opts.source === 'hermes') {
+        this.linkHermesReply(jid, summaryText, opts.inReplyTo ?? opts.quotedMessageId);
+      }
+      this.addRecentMessage({
+        id: messageId || `sent-${Date.now()}`,
+        sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
+        recipient: displayRecipient,
+        content: summaryText,
+        timestamp: this.formatDateTime(),
+        fromMe: true,
+        isGroup,
+        messageType: 'document'
+      });
+
+      return { success: true, messageId };
+    } catch (err: unknown) {
+      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  private inferDocumentMimetype(filename: string): string {
+    const ext = filename.split('.').pop()?.toLowerCase();
+    switch (ext) {
+      case 'pdf':
+        return 'application/pdf';
+      case 'doc':
+        return 'application/msword';
+      case 'docx':
+        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      case 'xls':
+        return 'application/vnd.ms-excel';
+      case 'xlsx':
+        return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+      case 'ppt':
+        return 'application/vnd.ms-powerpoint';
+      case 'pptx':
+        return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+      case 'csv':
+        return 'text/csv';
+      case 'txt':
+        return 'text/plain';
+      case 'json':
+        return 'application/json';
+      case 'zip':
+        return 'application/zip';
+      case 'xml':
+        return 'application/xml';
+      default:
+        return 'application/pdf';
+    }
+  }
+
+
   /** Downloads the media of a recently received message (the last few hundred are kept in memory). */
   public async downloadMedia(
     messageId: string

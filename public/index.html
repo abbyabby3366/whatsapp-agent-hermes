@@ -99,21 +99,70 @@
         </div>
         <p id="sendDisabledNote" class="hint" hidden>Connect WhatsApp first to send messages.</p>
         <form id="sendForm" class="send-form" novalidate>
+          <div class="mode-tabs" role="tablist" aria-label="Message type">
+            <button type="button" role="tab" class="mode-tab active" id="tabText" aria-selected="true" aria-controls="panelText">Text</button>
+            <button type="button" role="tab" class="mode-tab" id="tabImage" aria-selected="false" aria-controls="panelImage">Image</button>
+            <button type="button" role="tab" class="mode-tab" id="tabDoc" aria-selected="false" aria-controls="panelDoc">Document</button>
+          </div>
+
           <div class="field">
             <label class="label" for="recipientInput">Phone number</label>
             <input id="recipientInput" name="recipient" type="tel" inputmode="tel" autocomplete="off" placeholder="60123456789" aria-describedby="recipientHint recipientError" required>
             <p class="hint" id="recipientHint">Include the country code, digits only (e.g. 60123456789 for Malaysia).</p>
             <p class="field-error" id="recipientError" role="alert" hidden></p>
           </div>
-          <div class="field">
-            <label class="label" for="messageInput">Message</label>
-            <textarea id="messageInput" name="message" rows="4" placeholder="Type your message…" aria-describedby="messageHint messageError" required></textarea>
-            <div class="hint-row">
-              <p class="hint" id="messageHint">Press Ctrl+Enter to send.</p>
-              <span id="charCount" class="hint">0</span>
+
+          <div id="panelText" role="tabpanel" aria-labelledby="tabText">
+            <div class="field">
+              <label class="label" for="messageInput">Message</label>
+              <textarea id="messageInput" name="message" rows="4" placeholder="Type your message…" aria-describedby="messageHint messageError"></textarea>
+              <div class="hint-row">
+                <p class="hint" id="messageHint">Press Ctrl+Enter to send.</p>
+                <span id="charCount" class="hint">0</span>
+              </div>
+              <p class="field-error" id="messageError" role="alert" hidden></p>
             </div>
-            <p class="field-error" id="messageError" role="alert" hidden></p>
           </div>
+
+          <div id="panelImage" role="tabpanel" aria-labelledby="tabImage" hidden>
+            <div class="field">
+              <label class="label" for="imageUrlInput">Image URL or file</label>
+              <div class="input-with-action">
+                <input id="imageUrlInput" name="imageUrl" type="text" placeholder="https://example.com/image.jpg or local path" aria-describedby="imageUrlHint imageUrlError">
+                <button type="button" id="imagePickBtn" class="btn btn-secondary btn-small file-btn">Choose file</button>
+                <input id="imageFileInput" type="file" accept="image/*" class="visually-hidden">
+              </div>
+              <p class="hint" id="imageUrlHint">Enter an image URL, data URI, local path, or select a file.</p>
+              <p class="field-error" id="imageUrlError" role="alert" hidden></p>
+            </div>
+            <div class="field">
+              <label class="label" for="imageCaptionInput">Caption (optional)</label>
+              <input id="imageCaptionInput" name="imageCaption" type="text" placeholder="Add an optional caption…">
+            </div>
+          </div>
+
+          <div id="panelDoc" role="tabpanel" aria-labelledby="tabDoc" hidden>
+            <div class="field">
+              <label class="label" for="docUrlInput">Document URL or file</label>
+              <div class="input-with-action">
+                <input id="docUrlInput" name="docUrl" type="text" placeholder="https://example.com/report.pdf or local path" aria-describedby="docUrlHint docUrlError">
+                <button type="button" id="docPickBtn" class="btn btn-secondary btn-small file-btn">Choose file</button>
+                <input id="docFileInput" type="file" class="visually-hidden">
+              </div>
+              <p class="hint" id="docUrlHint">Enter a document URL, data URI, local path, or select a file (PDF, DOCX, XLSX, etc.).</p>
+              <p class="field-error" id="docUrlError" role="alert" hidden></p>
+            </div>
+            <div class="field">
+              <label class="label" for="docFileNameInput">File name (optional)</label>
+              <input id="docFileNameInput" name="docFileName" type="text" placeholder="e.g. invoice.pdf">
+              <p class="hint">WhatsApp will display this filename and appropriate file icon.</p>
+            </div>
+            <div class="field">
+              <label class="label" for="docCaptionInput">Caption (optional)</label>
+              <input id="docCaptionInput" name="docCaption" type="text" placeholder="Add an optional caption…">
+            </div>
+          </div>
+
           <div class="form-actions">
             <button id="sendBtn" class="btn btn-primary" type="submit">Send message</button>
           </div>

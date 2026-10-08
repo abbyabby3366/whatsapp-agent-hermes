@@ -108,6 +108,51 @@ app.post('/api/send-image', async (req: Request, res: Response) => {
   res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
 });
 
+// Send a document (used by Hermes, dashboard, and external APIs).
+app.post('/api/send-document', async (req: Request, res: Response) => {
+  const { to, url, documentUrl, fileName, filename, mimetype, caption, replyToMessageId } = req.body ?? {};
+  const mediaUrl =
+    typeof url === 'string' && url.trim()
+      ? url.trim()
+      : typeof documentUrl === 'string' && documentUrl.trim()
+        ? documentUrl.trim()
+        : null;
+
+  if (!to || !mediaUrl) {
+    res.status(400).json({
+      success: false,
+      error: 'Both "to" (phone number or WhatsApp ID) and "url" (or "documentUrl") are required'
+    });
+    return;
+  }
+
+  const cleanFileName =
+    typeof fileName === 'string' && fileName.trim()
+      ? fileName.trim()
+      : typeof filename === 'string' && filename.trim()
+        ? filename.trim()
+        : undefined;
+
+  const result = await waClient.sendDocument(
+    String(to),
+    mediaUrl,
+    {
+      fileName: cleanFileName,
+      mimetype: typeof mimetype === 'string' && mimetype.trim() ? mimetype.trim() : undefined,
+      caption: typeof caption === 'string' && caption.trim() ? caption.trim() : undefined,
+      quotedMessageId: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
+      inReplyTo: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
+      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
+    }
+  );
+  if (!result.success) {
+    res.status(result.code).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
+});
+
 // Typing indicator etc.
 app.post('/api/presence', async (req: Request, res: Response) => {
   const { recipient, presence } = req.body ?? {};
