@@ -1,103 +1,126 @@
 /**
  * Hermes Agent Reference Server (Demo)
- * Run this with: npx tsx examples/hermes_agent_demo.ts
+ * Run with: npm run demo:hermes
  *
- * This server receives webhooks from the WhatsApp Agent Hermes gateway,
- * decides whether to reply, and returns a response or calls the outbound API.
+ * This server receives webhooks from the WhatsApp Agent Hermes gateway, decides whether to
+ * reply, and answers either synchronously (in the HTTP response) or asynchronously through
+ * the gateway's REST API. Replace the "REASONING LOGIC" section with your real Hermes agent.
  */
 
 import express, { Request, Response } from 'express';
 
 const app = express();
-const PORT = 5000;
-const SECRET_TOKEN = process.env.HERMES_SECRET_TOKEN || 'hermes_whatsapp_secret_key_2026';
-const WHATSAPP_GATEWAY_URL = 'http://localhost:3100';
+const PORT = parseInt(process.env.PORT || '5000', 10);
+const SECRET_TOKEN = process.env.HERMES_SECRET_TOKEN || 'change-me-to-a-long-random-string';
+const GATEWAY_URL = process.env.WHATSAPP_GATEWAY_URL || 'http://127.0.0.1:3100';
+const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || '';
 
 app.use(express.json());
+
+/** Calls the gateway REST API (adds the optional access key). */
+async function gateway(path: string, body: unknown): Promise<unknown> {
+  const res = await fetch(`${GATEWAY_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(GATEWAY_API_KEY ? { 'x-api-key': GATEWAY_API_KEY } : {}) },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+interface WebhookPayload {
+  event: 'message.received' | 'test.ping';
+  messageId: string;
+  sender: string | null; // phone number, or null when WhatsApp only exposed an anonymous ID
+  senderName: string | null;
+  senderJid: string;
+  chatJid: string; // always use this as "to" when replying
+  isGroup: boolean;
+  groupJid: string | null;
+  message: string;
+  messageType: string; // text | image | video | voice | audio | document | sticker | location | contact | other
+  hasMedia: boolean;
+  mimetype: string | null;
+  mentionsMe: boolean;
+  isReplyToMe: boolean;
+  quoted: { messageId: string; message: string | null } | null;
+  timestamp: string;
+  isoTimestamp: string;
+}
 
 // Inbound webhook from WhatsApp Agent Hermes
 app.post('/api/webhook', async (req: Request, res: Response) => {
   const token = req.headers['x-hermes-token'];
   if (SECRET_TOKEN && token !== SECRET_TOKEN) {
-    console.warn('⚠️ Unauthorized webhook call. Bad x-hermes-token.');
+    console.warn('⚠️  Unauthorized webhook call. Bad x-hermes-token.');
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
-  const { event, messageId, sender, senderName, message, isGroup } = req.body;
-  console.log(`\n📨 [Hermes] Incoming message from ${senderName || sender}: "${message}" (ID: ${messageId})`);
+  const p = req.body as WebhookPayload;
 
-  // Handle ping test from gateway dashboard
-  if (event === 'test.ping') {
+  // Health check triggered by the dashboard's "Test connection to Hermes" button.
+  if (p.event === 'test.ping') {
     res.json({ success: true, message: 'Hermes Agent received ping successfully!' });
     return;
   }
 
+  console.log(`\n📨 [Hermes] ${p.senderName || p.sender || p.senderJid}: "${p.message}" (${p.messageType}, id ${p.messageId})`);
+
   // --- REASONING LOGIC ---
-  // Here, Hermes decides whether to reply or ignore
-  const lowerMsg = (message || '').toLowerCase();
+  const text = (p.message || '').toLowerCase();
 
-  if (lowerMsg.includes('ping')) {
-    // Mode A: Immediate synchronous reply
-    res.json({
-      reply: `Pong! 🏓 (Hermes Agent running at GMT+8)`
-    });
+  // In groups, only answer when the bot is mentioned or someone replies to it.
+  if (p.isGroup && !p.mentionsMe && !p.isReplyToMe) {
+    res.json({ reply: null, ignored: true });
     return;
   }
 
-  if (lowerMsg.includes('help') || lowerMsg.includes('hello') || lowerMsg.includes('hi')) {
-    // Mode A: Immediate synchronous reply
-    res.json({
-      reply: `Hello ${senderName || 'there'}! 👋 I am your Hermes Agent connected to WhatsApp. How can I assist you today?`
-    });
+  if (text.includes('ping')) {
+    // Mode A: immediate synchronous reply, quoting the incoming message.
+    res.json({ reply: 'Pong! 🏓', quote: true });
     return;
   }
 
-  if (lowerMsg.includes('think')) {
-    // Mode B: Simulate deep agent reasoning / tool calls
-    // First, respond 200 OK immediately with no synchronous reply
+  if (/\b(hi|hello|help)\b/.test(text)) {
+    res.json({ reply: `Hello ${p.senderName || 'there'}! 👋 I am your Hermes agent. How can I help?` });
+    return;
+  }
+
+  if (p.hasMedia) {
+    // Media can be fetched from the gateway while the message is still cached (last ~300 messages).
+    const media = await fetch(`${GATEWAY_URL}/api/media/${p.messageId}`, {
+      headers: GATEWAY_API_KEY ? { 'x-api-key': GATEWAY_API_KEY } : {}
+    });
+    const bytes = media.ok ? (await media.arrayBuffer()).byteLength : 0;
+    res.json({ reply: `Got your ${p.messageType} (${p.mimetype || 'unknown type'}, ${bytes} bytes).` });
+    return;
+  }
+
+  if (text.includes('think')) {
+    // Mode C: long-running reasoning. Acknowledge now, answer later through the API.
     res.json({ reply: null, status: 'processing' });
 
-    console.log(`🤖 [Hermes] Deep thinking started for ${sender}...`);
+    await gateway('/api/read', { messageId: p.messageId }); // blue ticks
+    await gateway('/api/presence', { recipient: p.chatJid, presence: 'composing' });
 
-    // 1. Tell gateway to show "typing..." presence
-    await fetch(`${WHATSAPP_GATEWAY_URL}/api/presence`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recipient: sender, presence: 'composing' })
-    }).catch(() => null);
-
-    // 2. Simulate 3-second LLM tool execution
     setTimeout(async () => {
-      // 3. Stop typing presence
-      await fetch(`${WHATSAPP_GATEWAY_URL}/api/presence`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipient: sender, presence: 'paused' })
-      }).catch(() => null);
-
-      // 4. Send asynchronous reply via POST /api/send
-      const sendRes = await fetch(`${WHATSAPP_GATEWAY_URL}/api/send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: sender,
-          message: `🧠 [Hermes AI Reasoning Complete]\nI analyzed your query: "${message}". All systems operational!`
-        })
+      await gateway('/api/presence', { recipient: p.chatJid, presence: 'paused' });
+      const result = await gateway('/api/send', {
+        to: p.chatJid,
+        message: `🧠 Done thinking about: "${p.message}"`,
+        replyToMessageId: p.messageId
       });
-      const data = await sendRes.json();
-      console.log(`✅ [Hermes] Asynchronous reply sent to ${sender}:`, data);
+      console.log('✅ [Hermes] Asynchronous reply sent:', result);
     }, 3000);
-
     return;
   }
 
-  // Decision: Ignore message (no reply needed)
-  console.log(`🔇 [Hermes] Decided not to reply to message "${message}"`);
+  // Mode B: decide not to reply.
+  console.log('🔇 [Hermes] Not replying.');
   res.json({ reply: null, ignored: true });
 });
 
-app.listen(PORT, () => {
-  console.log(`🤖 Demo Hermes Agent server running on http://127.0.0.1:${PORT}`);
-  console.log(`📡 Listening for webhooks from WhatsApp Agent at http://127.0.0.1:${PORT}/api/webhook\n`);
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`🤖 Demo Hermes Agent listening on http://127.0.0.1:${PORT}/api/webhook`);
+  console.log(`📡 Gateway: ${GATEWAY_URL}\n`);
 });

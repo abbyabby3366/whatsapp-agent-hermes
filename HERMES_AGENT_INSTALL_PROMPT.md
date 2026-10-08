@@ -1,159 +1,81 @@
-# System Prompt for Hermes Agent: WhatsApp Integration Setup
+# Prompt for Hermes Agent: install the WhatsApp gateway
 
-> **Copy and paste the prompt below into your Hermes Agent or Autonomous Server Assistant.**
+> Copy the block below into your Hermes agent (or any autonomous server assistant) running on the server where Hermes lives.
 
 ---
 
 ```markdown
-You are an autonomous AI engineer tasked with deploying, configuring, and connecting the "WhatsApp Agent Hermes" gateway service on this server.
+You are an autonomous engineer. Install and connect the "WhatsApp Agent Hermes" gateway on this server so that WhatsApp messages reach this Hermes agent and Hermes can reply.
 
-Your objective is to install the WhatsApp gateway, run it alongside this Hermes agent, configure bidirectional webhook communication, and pair WhatsApp.
+### Step 1: Prerequisites
+Check: `node -v` (v20 or v22), `npm -v`, `git --version`.
 
-Follow these instructions step-by-step:
-
----
-
-### Step 1: Verify System Prerequisites
-Ensure that the following runtimes and tools are installed:
-1. Node.js (v20 or v22 recommended): `node -v`
-2. npm: `npm -v`
-3. Git: `git --version`
-
----
-
-### Step 2: Obtain the Codebase
-Navigate to your desired project directory:
-```bash
-# If cloning fresh from your git repository:
-git clone <YOUR_GIT_REPO_URL> whatsapp-agent-hermes
+### Step 2: Get the code
+git clone https://github.com/abbyabby3366/whatsapp-agent-hermes.git
 cd whatsapp-agent-hermes
+(if it already exists: cd whatsapp-agent-hermes && git pull)
 
-# Or if updating an existing local workspace:
-cd whatsapp-agent-hermes
-git pull
-```
-
----
-
-### Step 3: Install Dependencies
-Install all required packages. Note that this project uses a custom Baileys build (`github:JonathanChuahE-Jay/Baileys`):
-```bash
+### Step 3: Install
 npm install
-```
-Verify the installation by running a dry-run TypeScript check:
-```bash
-npx tsc --noEmit
-```
-Ensure it exits with code 0.
+npx tsc --noEmit        # must exit 0
 
----
-
-### Step 4: Configure Environment Variables
-Create the `.env` configuration file from `.env.example`:
-```bash
+### Step 4: Configure
 cp .env.example .env
-```
-Open `.env` and set the following values:
-```env
-# Gateway listening port (Default: 3100 to avoid conflicts with Docker)
-PORT=3100
-SESSIONS_DIR=./sessions
+Edit .env:
+- PORT=3100, HOST=127.0.0.1 (Hermes is on this machine; keep it loopback).
+- HERMES_WEBHOOK_URL = the HTTP endpoint where THIS Hermes agent will receive webhooks (e.g. http://127.0.0.1:5000/api/webhook).
+- HERMES_SECRET_TOKEN = generate a long random string; store the same value in Hermes's config.
+- Leave GATEWAY_API_KEY empty unless HOST is changed to 0.0.0.0.
 
-# Webhook endpoint where THIS Hermes agent listens for incoming WhatsApp messages
-HERMES_WEBHOOK_URL=http://127.0.0.1:5000/api/webhook
+### Step 5: Run the gateway
+Development:  npm run dev
+Production:   npm run build && npm install -g pm2 && pm2 start npm --name whatsapp-agent-hermes -- start && pm2 save
+Verify:       curl http://127.0.0.1:3100/api/health   -> {"success":true,"whatsapp":"qr_ready"|"connected",...}
 
-# Webhook timeout in milliseconds
-HERMES_WEBHOOK_TIMEOUT_MS=15000
+### Step 6: Pair WhatsApp
+Tell the human to open http://localhost:3100 (or an SSH tunnel: ssh -L 3100:127.0.0.1:3100 user@server) and scan the QR code with WhatsApp -> Linked devices -> Link a device. The dashboard turns to "Connected".
 
-# Secret authorization key shared between WhatsApp Gateway and Hermes
-HERMES_SECRET_TOKEN=hermes_whatsapp_secret_key_2026
-```
-*(Adjust `HERMES_WEBHOOK_URL` to match the exact host and port where Hermes's HTTP server is running).*
+### Step 7: Implement the webhook receiver in Hermes
+Listen for POST requests at HERMES_WEBHOOK_URL. Reject requests whose "x-hermes-token" header differs from HERMES_SECRET_TOKEN (HTTP 401).
 
----
-
-### Step 5: Start the WhatsApp Gateway Service
-
-#### For Local / Development Mode (with hot-reloading):
-```bash
-npm run dev
-```
-
-#### For Background / Production Mode (using PM2):
-```bash
-npm install -g pm2
-pm2 start npm --name "whatsapp-agent-hermes" -- run dev
-pm2 save
-```
-
-Confirm the service is alive by checking:
-```bash
-curl http://localhost:3100/api/status
-```
-It should return JSON with `"status": "qr_ready"` or `"status": "connected"`.
-
----
-
-### Step 6: Pair WhatsApp Account
-1. Open `http://localhost:3100` (or `http://<SERVER_IP>:3100`) in your web browser.
-2. A QR code will be displayed on screen.
-3. Open WhatsApp on your primary phone:
-   - Go to **Settings** (or 3 dots on Android) &rarr; **Linked Devices** &rarr; **Link a Device**.
-   - Scan the QR code shown on the dashboard.
-4. The dashboard will automatically update to **CONNECTED** and display your linked WhatsApp number.
-
----
-
-### Step 7: Implement Hermes Webhook Receiver (Your Integration Logic)
-
-In your Hermes agent code, listen for HTTP `POST` requests at `/api/webhook` with the following contract:
-
-#### 1. Inbound Webhook Payload (Gateway -> Hermes):
-```json
+Incoming body:
 {
-  "event": "message.received",
+  "event": "message.received" | "test.ping",
   "messageId": "3EB0ABC12345",
-  "sender": "60123456789",
-  "senderName": "Customer Name",
+  "sender": "60123456789" | null,        // phone number; null when WhatsApp hides it
+  "senderName": "Customer Name" | null,
   "senderJid": "60123456789@s.whatsapp.net",
+  "chatJid": "60123456789@s.whatsapp.net", // ALWAYS reply to this
   "isGroup": false,
-  "message": "Hello, I need help with my account",
-  "timestamp": "08-10-2026 20:15:30"
+  "groupJid": null,
+  "message": "Hello, I need help",
+  "messageType": "text" | "image" | "video" | "voice" | "audio" | "document" | "sticker" | "location" | "contact" | "other",
+  "hasMedia": false,
+  "mimetype": null,
+  "mentionsMe": false,
+  "isReplyToMe": false,
+  "quoted": null | { "messageId": "...", "message": "..." },
+  "timestamp": "08-10-2026 20:15:30",
+  "isoTimestamp": "2026-10-08T12:15:30.000Z"
 }
-```
 
-#### 2. Validate Security Header:
-Check that `req.headers['x-hermes-token']` matches `HERMES_SECRET_TOKEN`.
+For event "test.ping" answer HTTP 200 with any JSON.
 
-#### 3. Choose How to Handle the Message:
-- **Option A (Instant Reply)**:
-  Return HTTP 200 with JSON:
-  ```json
-  { "reply": "Hello! I am Hermes AI. How can I help you today?" }
-  ```
-- **Option B (Ignore / Silent)**:
-  Return HTTP 200 with JSON:
-  ```json
-  { "reply": null, "ignored": true }
-  ```
-- **Option C (Deep LLM Tool Reasoning / Long Chains)**:
-  1. Return HTTP 200 immediately: `{ "reply": null, "status": "processing" }`
-  2. (Optional) Show typing indicator:
-     `POST http://localhost:3100/api/presence` with `{ "recipient": sender, "presence": "composing" }`
-  3. Execute your reasoning tools/LLM.
-  4. (Optional) Turn off typing indicator:
-     `POST http://localhost:3100/api/presence` with `{ "recipient": sender, "presence": "paused" }`
-  5. Send the final response:
-     `POST http://localhost:3100/api/send` with `{ "to": sender, "message": "Here is the result..." }`
+For "message.received" decide and answer HTTP 200 with one of:
+A) Reply now:        { "reply": "text", "quote": true }
+B) Stay silent:      { "reply": null, "ignored": true }
+C) Think longer:     { "reply": null, "status": "processing" }  then later:
+   POST http://127.0.0.1:3100/api/presence  { "recipient": chatJid, "presence": "composing" }
+   ... run tools / LLM ...
+   POST http://127.0.0.1:3100/api/send      { "to": chatJid, "message": "result", "replyToMessageId": messageId }
 
----
+Optional helpers:
+   POST /api/read   { "messageId": "..." }   -> mark as read
+   GET  /api/media/<messageId>               -> download image / voice note / document bytes
 
-### Step 8: Verify End-to-End Connectivity
-1. Test ping from the gateway to Hermes:
-   ```bash
-   curl -X POST http://localhost:3100/api/webhook/test
-   ```
-   Ensure it returns `"success": true, "status": 200`.
-2. Send a test WhatsApp message from a different phone to your linked number.
-3. Check your Hermes agent logs to verify receipt and response.
+Answer the webhook within 15 seconds; if the task takes longer use option C.
+
+### Step 8: Verify
+curl -X POST http://127.0.0.1:3100/api/webhook/test      -> "success": true, "status": 200
+Ask the human to send a WhatsApp message to the linked number from another phone, then check Hermes's logs and the dashboard's "Recent activity" list.
 ```

@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>WhatsApp Agent for Hermes</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2325D366'/%3E%3Cpath d='M16 7a9 9 0 0 0-7.7 13.6L7 25l4.5-1.2A9 9 0 1 0 16 7z' fill='none' stroke='white' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <div class="container">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 0 0-7.7 13.6L3 21l4.5-1.2A9 9 0 1 0 12 3z"/></svg>
+        </div>
+        <div>
+          <h1>WhatsApp Agent for Hermes</h1>
+          <p>Receives your WhatsApp messages and lets Hermes decide whether to reply.</p>
+        </div>
+      </div>
+      <div id="statusPill" class="pill pill-muted" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="statusText">Checking…</span>
+      </div>
+    </header>
+
+    <div id="offlineBanner" class="banner banner-error" role="alert" hidden>
+      Can't reach the gateway server. Retrying automatically…
+    </div>
+
+    <main id="main">
+      <section class="stats" aria-label="Message statistics">
+        <div class="stat"><div id="statReceived" class="stat-num">0</div><div class="stat-label">Messages received</div></div>
+        <div class="stat"><div id="statForwarded" class="stat-num">0</div><div class="stat-label">Delivered to Hermes</div></div>
+        <div class="stat"><div id="statReplies" class="stat-num">0</div><div class="stat-label">Replies from Hermes</div></div>
+        <div class="stat"><div id="statSent" class="stat-num">0</div><div class="stat-label">Messages sent</div></div>
+      </section>
+
+      <div class="grid">
+        <!-- 1. WhatsApp connection -->
+        <section class="card" aria-labelledby="connTitle">
+          <div class="card-head">
+            <span class="step" aria-hidden="true">1</span>
+            <h2 id="connTitle">Connect WhatsApp</h2>
+          </div>
+          <div id="connBody" class="conn-body">
+            <p class="muted">Loading…</p>
+          </div>
+          <div class="card-actions">
+            <button id="connectBtn" class="btn btn-primary" type="button" hidden>Connect</button>
+            <button id="logoutBtn" class="btn btn-outline-danger" type="button" hidden>Log out…</button>
+          </div>
+        </section>
+
+        <!-- 2. Hermes webhook -->
+        <section class="card" aria-labelledby="hermesTitle">
+          <div class="card-head">
+            <span class="step" aria-hidden="true">2</span>
+            <h2 id="hermesTitle">Hermes agent</h2>
+          </div>
+
+          <div class="field">
+            <span class="label" id="webhookLabel">Webhook address</span>
+            <div class="copy-row">
+              <code id="webhookUrl" aria-labelledby="webhookLabel">—</code>
+              <button id="copyUrlBtn" class="btn btn-small btn-ghost" type="button" hidden>Copy</button>
+            </div>
+            <p class="hint" id="webhookHint">Every new WhatsApp message is sent here. Change it with <code>HERMES_WEBHOOK_URL</code> in <code>.env</code>.</p>
+          </div>
+
+          <div class="switch-row">
+            <div>
+              <div class="label" id="forwardLabel">Forward messages to Hermes</div>
+              <p class="hint" id="forwardHint">Turn off to pause the agent without disconnecting WhatsApp.</p>
+            </div>
+            <button id="forwardSwitch" class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="forwardLabel" aria-describedby="forwardHint">
+              <span class="switch-knob"></span>
+            </button>
+          </div>
+
+          <div id="filterInfo" class="hint" hidden></div>
+
+          <div class="card-actions">
+            <button id="testBtn" class="btn btn-secondary" type="button">Test connection to Hermes</button>
+          </div>
+          <div id="testResult" class="inline-result" role="status" aria-live="polite" hidden></div>
+        </section>
+      </div>
+
+      <!-- Send a message -->
+      <section class="card" aria-labelledby="sendTitle">
+        <div class="card-head">
+          <span class="step" aria-hidden="true">3</span>
+          <h2 id="sendTitle">Send a message</h2>
+        </div>
+        <p id="sendDisabledNote" class="hint" hidden>Connect WhatsApp first to send messages.</p>
+        <form id="sendForm" class="send-form" novalidate>
+          <div class="field">
+            <label class="label" for="recipientInput">Phone number</label>
+            <input id="recipientInput" name="recipient" type="tel" inputmode="tel" autocomplete="off" placeholder="60123456789" aria-describedby="recipientHint recipientError" required>
+            <p class="hint" id="recipientHint">Include the country code, digits only (e.g. 60123456789 for Malaysia).</p>
+            <p class="field-error" id="recipientError" role="alert" hidden></p>
+          </div>
+          <div class="field">
+            <label class="label" for="messageInput">Message</label>
+            <textarea id="messageInput" name="message" rows="4" placeholder="Type your message…" aria-describedby="messageHint messageError" required></textarea>
+            <div class="hint-row">
+              <p class="hint" id="messageHint">Press Ctrl+Enter to send.</p>
+              <span id="charCount" class="hint">0</span>
+            </div>
+            <p class="field-error" id="messageError" role="alert" hidden></p>
+          </div>
+          <div class="form-actions">
+            <button id="sendBtn" class="btn btn-primary" type="submit">Send message</button>
+          </div>
+          <div id="sendResult" class="inline-result" role="status" aria-live="polite" hidden></div>
+        </form>
+      </section>
+
+      <!-- Activity -->
+      <section class="card" aria-labelledby="activityTitle">
+        <div class="card-head">
+          <h2 id="activityTitle">Recent activity</h2>
+          <span class="muted small" id="activityNote">Updates automatically</span>
+        </div>
+        <ul id="activityList" class="activity" aria-live="polite">
+          <li class="empty">No messages yet. New WhatsApp messages and your replies will show up here.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <div id="toasts" class="toasts" role="region" aria-label="Notifications" aria-live="polite"></div>
+
+  <!-- Log out confirmation -->
+  <dialog id="logoutDialog" aria-labelledby="logoutTitle">
+    <form method="dialog" class="dialog-body" id="logoutForm">
+      <h3 id="logoutTitle">Log out of WhatsApp?</h3>
+      <p>This unlinks the phone from this server and deletes the saved session. Hermes will stop receiving messages until you scan a new QR code.</p>
+      <div class="dialog-actions">
+        <button class="btn btn-secondary" value="cancel" id="logoutCancel">Cancel</button>
+        <button class="btn btn-danger" value="confirm" id="logoutConfirm">Log out</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- API key prompt (only when GATEWAY_API_KEY is set) -->
+  <dialog id="authDialog" aria-labelledby="authTitle">
+    <form class="dialog-body" id="authForm">
+      <h3 id="authTitle">Access key required</h3>
+      <p>Enter the gateway access key (<code>GATEWAY_API_KEY</code> from <code>.env</code>) to use this dashboard.</p>
+      <div class="field">
+        <label class="label" for="authInput">Access key</label>
+        <input type="text" name="username" value="gateway" autocomplete="username" hidden aria-hidden="true" tabindex="-1">
+        <input id="authInput" type="password" autocomplete="current-password" required>
+        <p class="field-error" id="authError" role="alert" hidden>That key was not accepted. Try again.</p>
+      </div>
+      <div class="dialog-actions">
+        <button class="btn btn-primary" type="submit">Unlock</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

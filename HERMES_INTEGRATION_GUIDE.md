@@ -1,85 +1,78 @@
-# WhatsApp Agent Hermes &bull; Complete Integration Guide
+# WhatsApp Agent Hermes &bull; Integration Guide
 
-This guide details the architecture, webhook specification, API contract, and implementation steps for connecting your **Hermes Agent** with WhatsApp via this gateway (powered by [`github:JonathanChuahE-Jay/Baileys`](https://github.com/JonathanChuahE-Jay/Baileys)).
+How to connect your **Hermes agent** to WhatsApp through this gateway. Both services run on the same server; they talk over plain HTTP on localhost.
 
 ---
 
-## 1. Architecture Overview
-
-The system decouples the low-level WhatsApp Web protocol connection from your Hermes AI reasoning agent:
+## 1. How it works
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Customer as User on WhatsApp
-    participant GW as WhatsApp Gateway (Port 3100)
-    participant Hermes as Hermes Agent (Port 5000)
+    actor Customer as Person on WhatsApp
+    participant GW as Gateway (port 3100)
+    participant Hermes as Hermes agent (port 5000)
 
-    Customer->>GW: Sends WhatsApp message
-    GW->>Hermes: HTTP POST Webhook (event: "message.received")
-    alt Mode A: Hermes decides to reply synchronously
-        Hermes-->>GW: HTTP 200 { reply: "Hello from Hermes!" }
-        GW->>Customer: Delivers WhatsApp reply
-    else Mode B: Hermes decides to ignore
-        Hermes-->>GW: HTTP 200 { reply: null, ignored: true }
-        Note over GW: No message sent
-    else Mode C: Asynchronous tool / LLM reasoning
-        Hermes-->>GW: HTTP 200 { reply: null, status: "thinking" }
+    Customer->>GW: WhatsApp message
+    GW->>Hermes: POST webhook { event: "message.received", ... }
+    alt Reply now
+        Hermes-->>GW: 200 { reply: "Hello!" }
+        GW->>Customer: WhatsApp reply
+    else Stay silent
+        Hermes-->>GW: 200 { reply: null, ignored: true }
+    else Think longer
+        Hermes-->>GW: 200 { reply: null, status: "processing" }
         Hermes->>GW: POST /api/presence { presence: "composing" }
-        Note over Customer: Sees "typing..." in WhatsApp
-        Note over Hermes: Executes multi-step tools / LLM
-        Hermes->>GW: POST /api/send { to: sender, message: "Result..." }
-        GW->>Customer: Delivers final WhatsApp response
+        Note over Hermes: runs tools / LLM
+        Hermes->>GW: POST /api/send { to: chatJid, message: "Result" }
+        GW->>Customer: WhatsApp reply
     end
 ```
 
-### Key Benefits
-- **Zero WhatsApp Blocking**: Heavy LLM tool executions or API calls never block or desynchronize Baileys WebSockets.
-- **Decision Autonomy**: Hermes can choose to reply immediately, initiate complex agent loops, or stay completely silent.
-- **Message Deduplication**: WhatsApp reconnect frames are deduplicated automatically so Hermes is never triggered twice for the same message.
+- The gateway never blocks on Hermes: each webhook call runs in the background with a timeout and retries.
+- Reconnect duplicates are filtered, so Hermes sees each message once.
+- The dashboard shows what happened to every message (sent to Hermes / replied / no reply / failed) and lets you pause forwarding with one switch.
 
 ---
 
-## 2. Server & Port Strategy
+## 2. Ports and `.env`
 
-| Component | Default Port | Description |
-| :--- | :--- | :--- |
-| **WhatsApp Agent Gateway** | `3100` | Runs this Express + Baileys service and web dashboard. *(Port 3000 is reserved by local Docker services).* |
-| **Hermes Agent** | `5000` (or `8000`) | Your AI agent server listening for inbound webhooks. |
-
-### Environment Configuration (`.env`)
-
-Configure these variables in your root [`.env`](file:///c:/Users/desmo/Desktop/whatsapp-agent-hermes/.env) file:
+| Component | Port |
+| --- | --- |
+| Gateway + dashboard | `3100` |
+| Hermes agent webhook | `5000` (anything you like) |
 
 ```env
 PORT=3100
-SESSIONS_DIR=./sessions
+HOST=127.0.0.1
+GATEWAY_API_KEY=
 
-# URL where your Hermes agent is listening
 HERMES_WEBHOOK_URL=http://127.0.0.1:5000/api/webhook
-
-# Webhook request timeout in milliseconds
+HERMES_SECRET_TOKEN=change-me-to-a-long-random-string
 HERMES_WEBHOOK_TIMEOUT_MS=15000
+HERMES_WEBHOOK_RETRIES=2
 
-# Shared secret token sent in x-hermes-token HTTP header
-HERMES_SECRET_TOKEN=hermes_whatsapp_secret_key_2026
+DEFAULT_COUNTRY_CODE=60
+ALLOWED_NUMBERS=
+FORWARD_GROUPS=true
+TIMEZONE=Asia/Kuala_Lumpur
 ```
+
+Security notes:
+- Keep `HOST=127.0.0.1` when Hermes is on the same machine; nothing else can then reach the gateway.
+- If you must open the dashboard to the network (`HOST=0.0.0.0`), set `GATEWAY_API_KEY`. Without it, anyone reaching the port can send WhatsApp messages as you.
+- Hermes should check `x-hermes-token` equals `HERMES_SECRET_TOKEN` and reject anything else with 401.
 
 ---
 
-## 3. Webhook Specification (Gateway &rarr; Hermes)
+## 3. Webhook payload (gateway &rarr; Hermes)
 
-Whenever an incoming message is received on WhatsApp (excluding self-messages and WhatsApp status broadcasts), the gateway dispatches an HTTP `POST` request to `HERMES_WEBHOOK_URL`.
-
-### Headers
 ```http
 POST /api/webhook HTTP/1.1
-Host: 127.0.0.1:5000
 Content-Type: application/json
-x-hermes-token: hermes_whatsapp_secret_key_2026
+x-hermes-token: <HERMES_SECRET_TOKEN>
 ```
 
-### Inbound Payload Format
 ```json
 {
   "event": "message.received",
@@ -87,208 +80,153 @@ x-hermes-token: hermes_whatsapp_secret_key_2026
   "sender": "60123456789",
   "senderName": "John Doe",
   "senderJid": "60123456789@s.whatsapp.net",
-  "remoteJid": "60123456789@s.whatsapp.net",
-  "isGroup": false,
-  "message": "Hello, can you help me check status?",
+  "chatJid": "120363012345678@g.us",
+  "remoteJid": "120363012345678@g.us",
+  "isGroup": true,
+  "groupJid": "120363012345678@g.us",
+  "message": "@bot can you summarise this?",
+  "messageType": "text",
+  "hasMedia": false,
+  "mimetype": null,
+  "mentionsMe": true,
+  "isReplyToMe": false,
+  "quoted": { "messageId": "3EB0...", "message": "earlier text" },
   "timestamp": "08-10-2026 20:15:30",
+  "timezone": "Asia/Kuala_Lumpur",
+  "isoTimestamp": "2026-10-08T12:15:30.000Z",
   "rawTimestamp": 1791461730
 }
 ```
 
-#### Field Reference
-- `event`: String identifier (`"message.received"` for normal messages or `"test.ping"` for health checks).
-- `messageId`: Unique WhatsApp message ID (used for logging and deduplication).
-- `sender`: Normalized phone number (digits only, e.g. `60123456789`).
-- `senderName`: WhatsApp display name (push name) if provided by sender.
-- `remoteJid`: Full WhatsApp JID (`...s.whatsapp.net` or `...@g.us` for groups).
-- `isGroup`: `true` if received from a group chat; `false` if direct 1-to-1 chat.
-- `message`: Extracted plaintext or media caption.
-- `timestamp`: Formatted timestamp in GMT+8 (`DD-MM-YYYY HH:mm:ss`).
+| Field | Notes |
+| --- | --- |
+| `event` | `message.received`, or `test.ping` from the dashboard's **Test connection** button |
+| `messageId` | WhatsApp message ID; use it for `/api/read`, `/api/media/:id` and `replyToMessageId` |
+| `sender` | Phone number (digits only) or **`null`** when WhatsApp only exposes an anonymous "LID" |
+| `senderName` | Push name, may be `null` |
+| `chatJid` | **Where to reply.** A phone JID (`…@s.whatsapp.net`) or group JID (`…@g.us`). `remoteJid` is the same value (kept for compatibility). |
+| `messageType` | `text`, `image`, `video`, `voice`, `audio`, `document`, `sticker`, `location`, `contact`, `other` |
+| `message` | Text, caption, or a placeholder like `[Voice message]` |
+| `hasMedia` / `mimetype` | Download with `GET /api/media/:messageId` while the message is still cached (last ~300) |
+| `mentionsMe` / `isReplyToMe` | Useful in groups to only answer when addressed |
+| `quoted` | The message the person replied to, if any |
+
+Not forwarded: your own messages, status broadcasts, channels, reactions and other protocol events.
 
 ---
 
-## 4. Hermes Reply Protocol (3 Patterns)
+## 4. Hermes reply protocol
 
-### Pattern 1: Instant Synchronous Reply
-If Hermes generates an answer quickly (< 10 seconds), respond directly in the HTTP body:
+Hermes must answer the webhook with HTTP 200 within `HERMES_WEBHOOK_TIMEOUT_MS`.
 
+### A. Reply immediately
 ```json
-{
-  "reply": "Hello John! How can I assist you today?"
-}
+{ "reply": "Hello John! How can I help?", "quote": true }
 ```
-*The WhatsApp gateway will automatically send this text back to the customer.*
+`quote` (optional) makes the reply quote the incoming message; it defaults to `true` in groups and `false` in direct chats.
 
-### Pattern 2: Ignore / Do Not Reply
-If Hermes determines the message is spam, an announcement, or outside the agent's scope, return:
-
+### B. Stay silent
 ```json
-{
-  "reply": null,
-  "ignored": true
-}
+{ "reply": null, "ignored": true }
 ```
-*The gateway logs the status as `Ignored` and transmits nothing to WhatsApp.*
 
-### Pattern 3: Asynchronous Tool Reasoning & Presence
-If Hermes needs to query databases, search the web, or run long chains:
+### C. Think longer, answer later
+```json
+{ "reply": null, "status": "processing" }
+```
+Then, when ready:
+```bash
+curl -X POST http://127.0.0.1:3100/api/presence -H "Content-Type: application/json" \
+  -d '{"recipient": "<chatJid>", "presence": "composing"}'
 
-1. Return HTTP 200 immediately to acknowledge the webhook:
-   ```json
-   { "reply": null, "status": "processing" }
-   ```
-2. Trigger the "typing..." presence indicator:
-   ```bash
-   POST http://localhost:3100/api/presence
-   Content-Type: application/json
+curl -X POST http://127.0.0.1:3100/api/send -H "Content-Type: application/json" \
+  -d '{"to": "<chatJid>", "message": "Here is the result…", "replyToMessageId": "<messageId>"}'
+```
 
-   { "recipient": "60123456789", "presence": "composing" }
-   ```
-3. Complete the reasoning loop, then call the outbound endpoint:
-   ```bash
-   POST http://localhost:3100/api/send
-   Content-Type: application/json
-
-   {
-     "to": "60123456789",
-     "message": "Here is the result from my research..."
-   }
-   ```
+Anything else (non-JSON body, HTTP 4xx/5xx) is shown as **Failed** in the dashboard with the reason.
 
 ---
 
-## 5. Gateway REST API Reference
+## 5. Gateway REST API
 
-The WhatsApp Agent exposes these endpoints on `http://localhost:3100`:
+Base URL `http://127.0.0.1:3100`. When `GATEWAY_API_KEY` is set, send `x-api-key: <key>` (or `Authorization: Bearer <key>`) on every call except `/api/health`.
 
-### 1. `GET /api/status`
-Returns connection state, QR code (if pending scan), active WhatsApp user, stats, and recent messages.
+| Method & path | Body | Response |
+| --- | --- | --- |
+| `GET /api/health` | – | `{ success, whatsapp: "connected", uptimeSeconds }` |
+| `GET /api/status` | – | Full state: status, QR data URL, user, stats, recent messages, webhook config |
+| `POST /api/send` | `{ to, message, replyToMessageId? }` | `{ success: true, messageId }` |
+| `POST /api/presence` | `{ recipient, presence }` | `presence`: `composing`, `paused`, `recording`, `available`, `unavailable` |
+| `POST /api/read` | `{ messageId }` | Marks the message as read |
+| `GET /api/media/:messageId` | – | Raw file bytes with the right `Content-Type` |
+| `POST /api/forwarding` | `{ enabled }` | Pause/resume forwarding (persisted in `data/settings.json`) |
+| `POST /api/webhook/test` | – | Pings Hermes with `event: "test.ping"` |
+| `POST /api/connect` | – | Starts the WhatsApp connection (shows a QR if not linked) |
+| `POST /api/logout` | – | Unlinks the device and wipes the saved session |
 
-**Response (Sample):**
-```json
-{
-  "success": true,
-  "data": {
-    "status": "connected",
-    "user": { "id": "60123456789:12@s.whatsapp.net", "name": "Hermes Bot" },
-    "lastConnectedAt": "08-10-2026 20:10:00",
-    "stats": {
-      "receivedCount": 12,
-      "forwardedToHermesCount": 12,
-      "hermesRepliesCount": 8,
-      "sentCount": 10
-    }
-  }
-}
-```
+Error shape: `{ "success": false, "error": "…" }` with HTTP 400 (bad input), 401 (missing API key), 404 (number not on WhatsApp / message not cached), 502 (WhatsApp or Hermes failure), 503 (WhatsApp not connected).
 
-### 2. `POST /api/send`
-Sends an outbound WhatsApp text message.
-
-**Request Body:**
-```json
-{
-  "to": "60123456789",
-  "message": "Hello from Hermes Agent!"
-}
-```
-
-### 3. `POST /api/presence`
-Updates the WhatsApp presence indicator for a recipient.
-
-**Request Body:**
-```json
-{
-  "recipient": "60123456789",
-  "presence": "composing"
-}
-```
-*Supported presence values:* `"composing"` (typing), `"paused"`, `"available"`, `"unavailable"`.
-
-### 4. `POST /api/webhook/test`
-Sends a mock ping message to `HERMES_WEBHOOK_URL` to verify connectivity.
+`to` / `recipient` accept a phone number (`60123456789`, `0123456789` with `DEFAULT_COUNTRY_CODE`) or a JID (`…@s.whatsapp.net`, `…@g.us`, `…@lid`).
 
 ---
 
-## 6. Implementation Examples for Hermes Agent
+## 6. Example receivers
 
-### Python (FastAPI) Example
+### Python (FastAPI)
 ```python
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
 from typing import Optional
+from fastapi import FastAPI, Header, HTTPException, Request
 import httpx
 
 app = FastAPI()
-SECRET_TOKEN = "hermes_whatsapp_secret_key_2026"
-GATEWAY_URL = "http://localhost:3100"
-
-class WebhookPayload(BaseModel):
-    event: str
-    messageId: str
-    sender: str
-    senderName: Optional[str] = None
-    message: str
-    isGroup: bool
+SECRET_TOKEN = "change-me-to-a-long-random-string"
+GATEWAY = "http://127.0.0.1:3100"
 
 @app.post("/api/webhook")
-async def handle_whatsapp(payload: WebhookPayload, x_hermes_token: Optional[str] = Header(None)):
+async def whatsapp_webhook(req: Request, x_hermes_token: Optional[str] = Header(None)):
     if x_hermes_token != SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    p = await req.json()
 
-    text = payload.message.lower()
+    if p.get("event") == "test.ping":
+        return {"ok": True}
 
-    # Rule: Ignore messages containing "#ignore"
-    if "#ignore" in text:
+    text = (p.get("message") or "").lower()
+    if p["isGroup"] and not (p["mentionsMe"] or p["isReplyToMe"]):
         return {"reply": None, "ignored": True}
 
-    # Instant reply example
-    if "hello" in text or "hi" in text:
-        return {"reply": f"Hi {payload.senderName or 'there'}! I am Hermes AI."}
+    if "hello" in text:
+        return {"reply": f"Hi {p.get('senderName') or 'there'}! I am Hermes."}
 
-    # Asynchronous agent reasoning
-    # 1. Trigger typing indicator
+    # Long task: acknowledge, then reply through the API.
     async with httpx.AsyncClient() as client:
-        await client.post(f"{GATEWAY_URL}/api/presence", json={
-            "recipient": payload.sender,
-            "presence": "composing"
-        })
-
-    # 2. Return HTTP 200 to acknowledge webhook
+        await client.post(f"{GATEWAY}/api/presence", json={"recipient": p["chatJid"], "presence": "composing"})
+        # ... run your agent ...
+        await client.post(f"{GATEWAY}/api/send", json={"to": p["chatJid"], "message": "Done!", "replyToMessageId": p["messageId"]})
     return {"reply": None, "status": "processing"}
 ```
 
-### Node.js (Express / TypeScript) Example
-A fully working demo agent is included directly in this repository:
-[`examples/hermes_agent_demo.ts`](file:///c:/Users/desmo/Desktop/whatsapp-agent-hermes/examples/hermes_agent_demo.ts).
-
-Run it with:
-```bash
-npm run demo:hermes
-```
+### Node.js (Express)
+A complete demo lives in [`examples/hermes_agent_demo.ts`](examples/hermes_agent_demo.ts). Run it with `npm run demo:hermes`.
 
 ---
 
-## 7. How to Run Everything
+## 7. Run everything
 
-### Step 1: Start the WhatsApp Agent Gateway
-In the `whatsapp-agent-hermes` folder:
-```bash
-npm run dev
-```
-The server will start on [http://localhost:3001](http://localhost:3001) with live hot-reloading (`tsx watch`).
+1. `npm run dev` (or `npm run build && npm start`) in this folder.
+2. Open [http://localhost:3100](http://localhost:3100) and scan the QR code: WhatsApp &rarr; **Linked devices** &rarr; **Link a device**.
+3. Start Hermes (or `npm run demo:hermes`).
+4. Press **Test connection to Hermes** on the dashboard. It must report HTTP 200.
+5. Send a WhatsApp message to the linked number from another phone and watch it appear in **Recent activity** with Hermes's decision.
 
-### Step 2: Connect Your WhatsApp Account
-1. Open [http://localhost:3001](http://localhost:3001) in your browser.
-2. If this is the first run, a QR code will be displayed on screen.
-3. Open WhatsApp on your phone &rarr; **Settings** / **Menu** &rarr; **Linked Devices** &rarr; **Link a Device**.
-4. Scan the QR code.
-5. The dashboard will automatically update to **CONNECTED** and show your WhatsApp user ID.
+### Troubleshooting
 
-### Step 3: Start Your Hermes Agent
-Start your Hermes agent on port `5000` (or test with `npm run demo:hermes`).
-
-### Step 4: Verify End-to-End
-- Click **Test Ping** on the [http://localhost:3001](http://localhost:3001) dashboard.
-- Send a WhatsApp message from a different phone to your linked number.
-- Watch the message appear in real-time in the activity table with its webhook status (`Forwarded`, `Replied`, or `Ignored`).
+| Symptom | Fix |
+| --- | --- |
+| "Could not reach Hermes" | Hermes is not listening on `HERMES_WEBHOOK_URL`, or the URL/port is wrong |
+| "Hermes rejected the secret token" | `HERMES_SECRET_TOKEN` differs between the two `.env` files |
+| Message shows **Not forwarded** | `HERMES_WEBHOOK_URL` is empty; restart the gateway after editing `.env` |
+| Message shows **Paused** | Forwarding switch on the dashboard is off |
+| Message shows **Filtered** | Blocked by `ALLOWED_NUMBERS` or `FORWARD_GROUPS=false` |
+| QR code keeps expiring | Press **Reconnect**; the gateway stops after a few QR cycles when nobody scans |
+| "Port 3100 is already in use" | Change `PORT` or stop the other process |
