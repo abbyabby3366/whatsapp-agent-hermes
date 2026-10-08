@@ -72,6 +72,42 @@ app.post('/api/send', async (req: Request, res: Response) => {
   res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
 });
 
+// Send an image (used by Hermes and external APIs).
+app.post('/api/send-image', async (req: Request, res: Response) => {
+  const { to, url, imageUrl, caption, replyToMessageId } = req.body ?? {};
+  const mediaUrl =
+    typeof url === 'string' && url.trim()
+      ? url.trim()
+      : typeof imageUrl === 'string' && imageUrl.trim()
+        ? imageUrl.trim()
+        : null;
+
+  if (!to || !mediaUrl) {
+    res.status(400).json({
+      success: false,
+      error: 'Both "to" (phone number or WhatsApp ID) and "url" (or "imageUrl") are required'
+    });
+    return;
+  }
+
+  const result = await waClient.sendImage(
+    String(to),
+    mediaUrl,
+    typeof caption === 'string' ? caption : undefined,
+    {
+      quotedMessageId: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
+      inReplyTo: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
+      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
+    }
+  );
+  if (!result.success) {
+    res.status(result.code).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
+});
+
 // Typing indicator etc.
 app.post('/api/presence', async (req: Request, res: Response) => {
   const { recipient, presence } = req.body ?? {};

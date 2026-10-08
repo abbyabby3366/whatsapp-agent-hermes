@@ -759,6 +759,83 @@ export class WhatsAppClient {
     }
   }
 
+  public async sendImage(
+    recipient: string,
+    imageUrl: string,
+    caption?: string,
+    opts: {
+      /** Inbound message to quote in the reply. */
+      quotedMessageId?: string;
+      /** Inbound message this reply answers (marks it "replied" in the dashboard). */
+      inReplyTo?: string;
+      source?: 'hermes' | 'api';
+    } = {}
+  ): Promise<SendResult> {
+    if (!this.sock || this.status !== 'connected') {
+      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
+    }
+
+    if (!recipient?.trim() || !imageUrl?.trim()) {
+      return { success: false, code: 400, error: 'Recipient and image URL are required' };
+    }
+
+    let jid = this.resolveJid(recipient);
+    if (!jid) {
+      return {
+        success: false,
+        code: 400,
+        error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789) or a WhatsApp ID.'
+      };
+    }
+
+    // For plain phone numbers, confirm the number is on WhatsApp so we can give a clear error.
+    if (jid.endsWith('@s.whatsapp.net')) {
+      try {
+        const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
+        if (match && !match.exists) {
+          return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
+        }
+        if (match?.exists && match.jid) jid = match.jid;
+      } catch {
+        // Lookup is best effort; try sending anyway.
+      }
+    }
+
+    const isGroup = jid.endsWith('@g.us');
+    const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+    const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
+    const cleanCaption = caption?.trim();
+
+    try {
+      const result = await this.sock.sendMessage(
+        jid,
+        { image: { url: imageUrl.trim() }, ...(cleanCaption ? { caption: cleanCaption } : {}) },
+        quoted ? { quoted } : undefined
+      );
+      const messageId = result?.key?.id ?? undefined;
+
+      this.stats.sentCount++;
+      const summaryText = cleanCaption ? `[Image] ${cleanCaption}` : `[Image] ${imageUrl.trim()}`;
+      if (opts.source === 'hermes') {
+        this.linkHermesReply(jid, summaryText, opts.inReplyTo ?? opts.quotedMessageId);
+      }
+      this.addRecentMessage({
+        id: messageId || `sent-${Date.now()}`,
+        sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
+        recipient: displayRecipient,
+        content: summaryText,
+        timestamp: this.formatDateTime(),
+        fromMe: true,
+        isGroup,
+        messageType: 'image'
+      });
+
+      return { success: true, messageId };
+    } catch (err: unknown) {
+      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   /** Downloads the media of a recently received message (the last few hundred are kept in memory). */
   public async downloadMedia(
     messageId: string

@@ -70,6 +70,7 @@ C) Think longer:     { "reply": null, "status": "processing" }  then later:
    POST http://127.0.0.1:3100/api/send      { "to": chatJid, "message": "result", "replyToMessageId": messageId }
 
 Optional helpers:
+   POST /api/send-image  { "to": chatJid, "url": "https://...", "caption": "..." } -> send image
    POST /api/read   { "messageId": "..." }   -> mark as read
    GET  /api/media/<messageId>               -> download image / voice note / document bytes
 
