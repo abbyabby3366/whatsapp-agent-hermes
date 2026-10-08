@@ -61,6 +61,7 @@ app.post('/api/send', async (req: Request, res: Response) => {
 
   const result = await waClient.sendMessage(String(to), message, {
     quotedMessageId: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
+    inReplyTo: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
     source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
   });
   if (!result.success) {

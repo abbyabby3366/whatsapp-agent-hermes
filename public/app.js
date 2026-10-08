@@ -21,8 +21,10 @@
   try { apiKey = sessionStorage.getItem('gatewayApiKey') || ''; } catch (_) { /* storage unavailable */ }
   let lastState = null;
   let lastRenderedKey = '';
+  let lastActivityHtml = '';
   let offline = false;
   let authPending = false;
+  let switchBusy = false;
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -139,7 +141,7 @@
 
   function renderConnection(state) {
     const connected = state.status === 'connected';
-    el.sendBtn.disabled = !connected;
+    if (!el.sendBtn.dataset.label) el.sendBtn.disabled = !connected; // leave a busy button alone
     el.recipientInput.disabled = !connected;
     el.messageInput.disabled = !connected;
     el.sendDisabledNote.hidden = connected;
@@ -189,15 +191,18 @@
       el.webhookUrl.classList.toggle('muted', !url);
     }
     el.copyUrlBtn.hidden = !url;
-    el.testBtn.disabled = !url;
+    if (!el.testBtn.dataset.label) el.testBtn.disabled = !url;
     if (!url) {
       el.webhookHint.textContent = 'Set HERMES_WEBHOOK_URL in .env and restart the gateway. Until then, messages are only shown here.';
     }
 
-    if (el.forwardSwitch.getAttribute('aria-checked') !== String(cfg.forwardingEnabled)) {
-      el.forwardSwitch.setAttribute('aria-checked', String(cfg.forwardingEnabled));
+    // While a toggle request is in flight, keep the optimistic state instead of the server's old one.
+    if (!switchBusy) {
+      if (el.forwardSwitch.getAttribute('aria-checked') !== String(cfg.forwardingEnabled)) {
+        el.forwardSwitch.setAttribute('aria-checked', String(cfg.forwardingEnabled));
+      }
+      el.forwardSwitch.disabled = !url;
     }
-    el.forwardSwitch.disabled = !url;
 
     const filters = [];
     if (cfg.allowedNumbersCount > 0) filters.push('only ' + cfg.allowedNumbersCount + ' allowed number' + (cfg.allowedNumbersCount === 1 ? '' : 's'));
@@ -219,7 +224,8 @@
 
   function renderActivity(messages) {
     if (!messages.length) {
-      el.activityList.innerHTML = '<li class="empty">No messages yet. New WhatsApp messages and your replies will show up here.</li>';
+      const empty = '<li class="empty">No messages yet. New WhatsApp messages and your replies will show up here.</li>';
+      if (lastActivityHtml !== empty) { el.activityList.innerHTML = empty; lastActivityHtml = empty; }
       return;
     }
     const html = messages.map((m) => {
@@ -245,7 +251,8 @@
         '<div class="meta">' + tag + extra + '</div>' +
         '</li>';
     }).join('');
-    if (el.activityList.innerHTML !== html) el.activityList.innerHTML = html;
+    // Only touch the DOM when something changed, so text selection survives the 3 s poll.
+    if (html !== lastActivityHtml) { el.activityList.innerHTML = html; lastActivityHtml = html; }
   }
 
   // ---------------------------------------------------------------------------
@@ -295,6 +302,7 @@
     const enabled = el.forwardSwitch.getAttribute('aria-checked') !== 'true';
     el.forwardSwitch.setAttribute('aria-checked', String(enabled));
     el.forwardSwitch.disabled = true;
+    switchBusy = true;
     try {
       const { data } = await api('/api/forwarding', { method: 'POST', body: { enabled: enabled } });
       if (!data.success) throw new Error(data.error || 'Request failed');
@@ -303,6 +311,7 @@
       el.forwardSwitch.setAttribute('aria-checked', String(!enabled));
       toast('Could not change forwarding: ' + err.message, true);
     } finally {
+      switchBusy = false;
       el.forwardSwitch.disabled = false;
     }
   });

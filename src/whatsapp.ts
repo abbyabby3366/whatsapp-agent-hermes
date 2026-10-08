@@ -42,6 +42,8 @@ export interface RecentMessage {
   timestamp: string;
   fromMe: boolean;
   isGroup: boolean;
+  /** JID of the chat an inbound message came from (where a reply must go). */
+  chatJid?: string;
   messageType?: string;
   webhookStatus?: WebhookStatus;
   webhookError?: string;
@@ -123,6 +125,7 @@ export class WhatsAppClient {
     sentCount: 0
   };
 
+  private waVersion: [number, number, number] | undefined;
   private reconnectAttempts = 0;
   private readonly maxReconnectAttempts = 5;
   private reconnectTimeout: NodeJS.Timeout | null = null;
@@ -174,17 +177,20 @@ export class WhatsAppClient {
     try {
       const { state, saveCreds } = await useMultiFileAuthState(this.sessionDir);
       this.registered = Boolean(state.creds.registered);
-      let version: [number, number, number] | undefined;
-
-      try {
-        const fetched = await fetchLatestBaileysVersion();
-        version = fetched.version;
-      } catch (err: unknown) {
-        console.warn('Could not fetch latest Baileys version; using default Baileys version.', err);
+      // Looked up once per process; reconnects should not depend on GitHub being reachable.
+      if (!this.waVersion) {
+        try {
+          this.waVersion = (await fetchLatestBaileysVersion()).version;
+        } catch (err: unknown) {
+          console.warn(
+            '[WhatsApp] Could not fetch the latest WhatsApp Web version; using the bundled default.',
+            err instanceof Error ? err.message : err
+          );
+        }
       }
 
       const sock = makeWASocket({
-        version,
+        version: this.waVersion,
         auth: {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, this.logger)
@@ -252,9 +258,6 @@ export class WhatsAppClient {
 
   private async handleClose(error: unknown): Promise<void> {
     const statusCode = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
-    const loggedOut = statusCode === DisconnectReason.loggedOut;
-    const replaced = statusCode === DisconnectReason.connectionReplaced;
-    const needsRestart = statusCode === DisconnectReason.restartRequired;
 
     console.log(`[WhatsApp] Connection closed (code ${statusCode}).`);
     this.cleanupSocket();
@@ -262,23 +265,36 @@ export class WhatsAppClient {
 
     if (this.shuttingDown) return;
 
-    if (loggedOut) {
+    // Cases where the saved session is no longer usable: wipe it and ask for a new QR scan.
+    const sessionDead: Partial<Record<number, string>> = {
+      [DisconnectReason.loggedOut]: 'Logged out from WhatsApp. Please scan the QR code again.',
+      [DisconnectReason.badSession]: 'The saved WhatsApp session is corrupted. Please scan the QR code again.',
+      [DisconnectReason.multideviceMismatch]: 'WhatsApp rejected the saved session. Please scan the QR code again.'
+    };
+    const deadMessage = statusCode !== undefined ? sessionDead[statusCode] : undefined;
+    if (deadMessage) {
       this.status = 'disconnected';
-      this.lastError = 'Logged out from WhatsApp. Please scan the QR code again.';
+      this.lastError = deadMessage;
       this.user = null;
       this.registered = false;
       await this.clearSavedSession();
       return;
     }
 
-    if (replaced) {
+    if (statusCode === DisconnectReason.connectionReplaced) {
       this.status = 'disconnected';
       this.lastError = 'This WhatsApp session was opened somewhere else. Press "Reconnect" to take it back.';
       return;
     }
 
+    if (statusCode === DisconnectReason.forbidden) {
+      this.status = 'disconnected';
+      this.lastError = 'WhatsApp refused the connection (403). The account may be blocked from using linked devices.';
+      return;
+    }
+
     // WhatsApp asks for an immediate restart right after a QR scan; that is not a failure.
-    if (needsRestart) {
+    if (statusCode === DisconnectReason.restartRequired) {
       this.status = 'connecting';
       this.scheduleReconnect(500);
       return;
@@ -522,6 +538,7 @@ export class WhatsAppClient {
       timestamp: this.formatDateTime(eventDate),
       fromMe: false,
       isGroup,
+      chatJid,
       messageType: parsed.type,
       webhookStatus: 'disabled'
     };
@@ -585,13 +602,15 @@ export class WhatsAppClient {
       const reply = typeof result.json?.reply === 'string' ? result.json.reply.trim() : '';
 
       if (reply) {
-        record.webhookStatus = 'replied';
         record.hermesReply = reply;
         const quote = typeof result.json?.quote === 'boolean' ? result.json.quote : isGroup;
-        const sent = await this.sendMessage(chatJid, reply, { quotedMessageId: quote ? id : undefined, source: 'hermes' });
-        if (sent.success) {
-          this.stats.hermesRepliesCount++;
-        } else {
+        // On success sendMessage() marks this record as "replied" (see linkHermesReply).
+        const sent = await this.sendMessage(chatJid, reply, {
+          quotedMessageId: quote ? id : undefined,
+          inReplyTo: id,
+          source: 'hermes'
+        });
+        if (!sent.success) {
           record.webhookStatus = 'failed';
           record.webhookError = `Reply could not be sent: ${sent.error}`;
         }
@@ -610,6 +629,21 @@ export class WhatsAppClient {
     if (this.recentMessages.length > 50) {
       this.recentMessages.pop();
     }
+  }
+
+  /**
+   * Marks the inbound message a Hermes reply answers as "replied", so asynchronous replies
+   * (sent later through POST /api/send) close the loop in the dashboard and the stats.
+   */
+  private linkHermesReply(chatJid: string, replyText: string, inReplyTo?: string): void {
+    const target =
+      (inReplyTo && this.recentMessages.find((m) => !m.fromMe && m.id === inReplyTo)) ||
+      this.recentMessages.find((m) => !m.fromMe && m.chatJid === chatJid && m.webhookStatus === 'processing');
+    if (!target || target.webhookStatus === 'replied') return;
+    target.webhookStatus = 'replied';
+    target.hermesReply = replyText;
+    delete target.webhookError;
+    this.stats.hermesRepliesCount++;
   }
 
   // ---------------------------------------------------------------------------
@@ -659,7 +693,13 @@ export class WhatsAppClient {
   public async sendMessage(
     recipient: string,
     messageText: string,
-    opts: { quotedMessageId?: string; source?: 'hermes' | 'api' } = {}
+    opts: {
+      /** Inbound message to quote in the reply. */
+      quotedMessageId?: string;
+      /** Inbound message this reply answers (marks it "replied" in the dashboard). */
+      inReplyTo?: string;
+      source?: 'hermes' | 'api';
+    } = {}
   ): Promise<SendResult> {
     if (!this.sock || this.status !== 'connected') {
       return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
@@ -700,6 +740,9 @@ export class WhatsAppClient {
       const messageId = result?.key?.id ?? undefined;
 
       this.stats.sentCount++;
+      if (opts.source === 'hermes') {
+        this.linkHermesReply(jid, messageText, opts.inReplyTo ?? opts.quotedMessageId);
+      }
       this.addRecentMessage({
         id: messageId || `sent-${Date.now()}`,
         sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
