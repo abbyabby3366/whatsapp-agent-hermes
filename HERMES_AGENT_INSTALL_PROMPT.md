@@ -7,6 +7,13 @@
 ```markdown
 You are an autonomous engineer. Install and connect the "WhatsApp Agent Hermes" gateway on this server so that WhatsApp messages reach this Hermes agent and Hermes can reply.
 
+### Step 0: Immediate User Input (Master Credentials)
+**Immediately ask the user for:**
+1. **Master Phone Number** (`MASTER_PHONE`): Their personal WhatsApp phone number with country code and digits only (e.g. `60123456789`). This is required for escalations (`@@FLAG@@`), master command authority, and direct emergency notifications.
+2. **Master Operator Name** (`MASTER_NAME`): Their name (e.g. `Alex`, `Desmond`) so the agent speaks on their behalf in the first person ("I", "my") without exposing bot intermediaries.
+
+Do NOT proceed with `.env` configuration using blank or placeholder credentials. Prompt the user for these two values immediately up-front and use them to fill `.env`.
+
 ### Step 1: Prerequisites
 Check: `node -v` (v20 or v22), `npm -v`, `git --version`.
 
@@ -19,15 +26,13 @@ cd whatsapp-agent-hermes
 npm install
 npx tsc --noEmit        # must exit 0
 
-### Step 4: Configure
-cp .env.example .env
-Edit .env:
-- PORT=3100, HOST=127.0.0.1 (Hermes is on this machine; keep it loopback).
-- HERMES_WEBHOOK_URL = the HTTP endpoint where THIS Hermes agent will receive webhooks (e.g. http://127.0.0.1:5000/api/webhook).
-- HERMES_SECRET_TOKEN = generate a long random string; store the same value in Hermes's config.
-- MASTER_PHONE = your WhatsApp phone number with country code (e.g. 60123456789) for escalations and master commands.
-- MASTER_NAME = your name (e.g. Alex) so the bot speaks on your behalf in the first person.
-- Leave GATEWAY_API_KEY empty unless HOST is changed to 0.0.0.0.
+### Step 4: Configure (Automatic - no manual human file editing)
+Do NOT ask the human to edit or paste `.env` manually. As an autonomous engineer, write `.env` programmatically:
+- Generate a secure random token for `HERMES_SECRET_TOKEN` (e.g. `openssl rand -hex 24`).
+- Set `HERMES_WEBHOOK_URL` to the local endpoint where this agent listens (e.g. `http://127.0.0.1:5000/api/webhook`).
+- Populate `MASTER_PHONE` and `MASTER_NAME` with the values collected from the human in Step 0.
+- Keep `PORT=3100`, `HOST=127.0.0.1`, and leave `GATEWAY_API_KEY` empty.
+- Write these values into `.env` (and sync `HERMES_SECRET_TOKEN`, `MASTER_PHONE`, and `MASTER_NAME` into Hermes's own receiver config/`receiver.env`).
 
 ### Step 5: Install and learn the operational skill
 Install `wa-agent-SKILL.md` into Hermes's skill directory so this agent permanently retains these operational rules:
