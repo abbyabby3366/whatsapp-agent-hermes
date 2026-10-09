@@ -25,18 +25,28 @@ Edit .env:
 - PORT=3100, HOST=127.0.0.1 (Hermes is on this machine; keep it loopback).
 - HERMES_WEBHOOK_URL = the HTTP endpoint where THIS Hermes agent will receive webhooks (e.g. http://127.0.0.1:5000/api/webhook).
 - HERMES_SECRET_TOKEN = generate a long random string; store the same value in Hermes's config.
+- MASTER_PHONE = your WhatsApp phone number with country code (e.g. 60123456789) for escalations and master commands.
+- MASTER_NAME = your name (e.g. Alex) so the bot speaks on your behalf in the first person.
 - Leave GATEWAY_API_KEY empty unless HOST is changed to 0.0.0.0.
 
-### Step 5: Run the gateway
+### Step 5: Install and learn the operational skill
+Install `wa-agent-SKILL.md` into Hermes's skill directory so this agent permanently retains these operational rules:
+```bash
+mkdir -p ~/.hermes/skills/whatsapp-agent-hermes-gateway
+cp wa-agent-SKILL.md ~/.hermes/skills/whatsapp-agent-hermes-gateway/SKILL.md
+```
+Study `wa-agent-SKILL.md` carefully: it contains the complete production receiver architecture, voice standards (speaking as `${MASTER_NAME}` in first person), master chat command authority, burst grouping, contact flow store (`flow.py`), and error 463 handling.
+
+### Step 6: Run the gateway
 Development:  npm run dev
 Production:   npm run build && npm install -g pm2 && pm2 start npm --name whatsapp-agent-hermes -- start && pm2 save
 Verify:       curl http://127.0.0.1:3100/api/health   -> {"success":true,"whatsapp":"qr_ready"|"connected",...}
 
-### Step 6: Pair WhatsApp
+### Step 7: Pair WhatsApp
 Tell the human to open http://localhost:3100 (or an SSH tunnel: ssh -L 3100:127.0.0.1:3100 user@server) and scan the QR code with WhatsApp -> Linked devices -> Link a device. The dashboard turns to "Connected".
 
-### Step 7: Implement the webhook receiver in Hermes
-Listen for POST requests at HERMES_WEBHOOK_URL. Reject requests whose "x-hermes-token" header differs from HERMES_SECRET_TOKEN (HTTP 401).
+### Step 8: Implement the webhook receiver in Hermes
+Listen for POST requests at HERMES_WEBHOOK_URL. Reject requests whose "x-hermes-token" header differs from HERMES_SECRET_TOKEN (HTTP 401). Refer to `wa-agent-SKILL.md` for the full implementation (SQLite history injection, burst coalescing, and quote-replies).
 
 Incoming body:
 {
@@ -80,7 +90,7 @@ Optional helpers (if GATEWAY_API_KEY is configured in .env, add header `x-api-ke
 
 Answer the webhook within 15 seconds; if the task takes longer use option C.
 
-### Step 8: Verify
+### Step 9: Verify
 curl -X POST http://127.0.0.1:3100/api/webhook/test      -> "success": true, "status": 200
 Ask the human to send a WhatsApp message to the linked number from another phone, then check Hermes's logs and the dashboard's "Recent activity" list.
 ```
