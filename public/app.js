@@ -10,11 +10,12 @@
     forwardSwitch: $('forwardSwitch'), filterInfo: $('filterInfo'), testBtn: $('testBtn'), testResult: $('testResult'),
     sendForm: $('sendForm'), sendBtn: $('sendBtn'), sendResult: $('sendResult'), sendDisabledNote: $('sendDisabledNote'),
     recipientInput: $('recipientInput'), recipientError: $('recipientError'),
-    tabText: $('tabText'), tabImage: $('tabImage'), tabDoc: $('tabDoc'),
-    panelText: $('panelText'), panelImage: $('panelImage'), panelDoc: $('panelDoc'),
+    tabText: $('tabText'), tabImage: $('tabImage'), tabDoc: $('tabDoc'), tabSticker: $('tabSticker'),
+    panelText: $('panelText'), panelImage: $('panelImage'), panelDoc: $('panelDoc'), panelSticker: $('panelSticker'),
     messageInput: $('messageInput'), messageError: $('messageError'), charCount: $('charCount'),
     imageUrlInput: $('imageUrlInput'), imageUrlError: $('imageUrlError'), imageFileInput: $('imageFileInput'), imagePickBtn: $('imagePickBtn'), imageCaptionInput: $('imageCaptionInput'),
     docUrlInput: $('docUrlInput'), docUrlError: $('docUrlError'), docFileInput: $('docFileInput'), docPickBtn: $('docPickBtn'), docFileNameInput: $('docFileNameInput'), docCaptionInput: $('docCaptionInput'),
+    stickerUrlInput: $('stickerUrlInput'), stickerUrlError: $('stickerUrlError'), stickerFileInput: $('stickerFileInput'), stickerPickBtn: $('stickerPickBtn'), stickerPackInput: $('stickerPackInput'), stickerAuthorInput: $('stickerAuthorInput'),
     activityList: $('activityList'), toasts: $('toasts'),
     logoutDialog: $('logoutDialog'), logoutForm: $('logoutForm'), logoutConfirm: $('logoutConfirm'),
     authDialog: $('authDialog'), authForm: $('authForm'), authInput: $('authInput'), authError: $('authError')
@@ -147,17 +148,12 @@
   function renderConnection(state) {
     const connected = state.status === 'connected';
     if (!el.sendBtn.dataset.label) el.sendBtn.disabled = !connected; // leave a busy button alone
-    el.recipientInput.disabled = !connected;
-    el.messageInput.disabled = !connected;
-    el.imageUrlInput.disabled = !connected;
-    el.imageFileInput.disabled = !connected;
-    el.imagePickBtn.disabled = !connected;
-    el.imageCaptionInput.disabled = !connected;
-    el.docUrlInput.disabled = !connected;
-    el.docFileInput.disabled = !connected;
-    el.docPickBtn.disabled = !connected;
-    el.docFileNameInput.disabled = !connected;
-    el.docCaptionInput.disabled = !connected;
+    const formFields = [
+      el.recipientInput, el.messageInput, el.imageUrlInput, el.imageFileInput, el.imagePickBtn, el.imageCaptionInput,
+      el.docUrlInput, el.docFileInput, el.docPickBtn, el.docFileNameInput, el.docCaptionInput,
+      el.stickerUrlInput, el.stickerFileInput, el.stickerPickBtn, el.stickerPackInput, el.stickerAuthorInput
+    ];
+    formFields.forEach((field) => { field.disabled = !connected; });
     el.sendDisabledNote.hidden = connected;
 
     // Avoid re-rendering identical content so the QR image and focus do not flicker.
@@ -348,56 +344,46 @@
   });
 
   // Send mode switching
+  const MODES = {
+    text: { tab: el.tabText, panel: el.panelText, label: 'Send message' },
+    image: { tab: el.tabImage, panel: el.panelImage, label: 'Send image' },
+    doc: { tab: el.tabDoc, panel: el.panelDoc, label: 'Send document' },
+    sticker: { tab: el.tabSticker, panel: el.panelSticker, label: 'Send sticker' }
+  };
+
   function setSendMode(mode) {
     currentSendMode = mode;
-    el.tabText.classList.toggle('active', mode === 'text');
-    el.tabText.setAttribute('aria-selected', String(mode === 'text'));
-    el.panelText.hidden = mode !== 'text';
-
-    el.tabImage.classList.toggle('active', mode === 'image');
-    el.tabImage.setAttribute('aria-selected', String(mode === 'image'));
-    el.panelImage.hidden = mode !== 'image';
-
-    el.tabDoc.classList.toggle('active', mode === 'doc');
-    el.tabDoc.setAttribute('aria-selected', String(mode === 'doc'));
-    el.panelDoc.hidden = mode !== 'doc';
-
-    el.sendBtn.textContent = mode === 'text' ? 'Send message' : (mode === 'image' ? 'Send image' : 'Send document');
+    for (const [key, item] of Object.entries(MODES)) {
+      const active = key === mode;
+      item.tab.classList.toggle('active', active);
+      item.tab.setAttribute('aria-selected', String(active));
+      item.panel.hidden = !active;
+    }
+    el.sendBtn.textContent = MODES[mode].label;
     el.sendResult.hidden = true;
   }
+  for (const [key, item] of Object.entries(MODES)) item.tab.addEventListener('click', () => setSendMode(key));
 
-  el.tabText.addEventListener('click', () => setSendMode('text'));
-  el.tabImage.addEventListener('click', () => setSendMode('image'));
-  el.tabDoc.addEventListener('click', () => setSendMode('doc'));
+  function bindFilePicker(btn, fileInput, textInput, errNode, onSelected) {
+    btn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      if (onSelected) onSelected(file);
+      const reader = new FileReader();
+      reader.onload = () => {
+        textInput.value = reader.result;
+        setFieldError(textInput, errNode, '');
+      };
+      reader.readAsDataURL(file);
+    });
+  }
 
-  // Local file attachment handlers
-  el.imagePickBtn.addEventListener('click', () => el.imageFileInput.click());
-  el.docPickBtn.addEventListener('click', () => el.docFileInput.click());
-
-  el.imageFileInput.addEventListener('change', () => {
-    const file = el.imageFileInput.files && el.imageFileInput.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      el.imageUrlInput.value = reader.result;
-      setFieldError(el.imageUrlInput, el.imageUrlError, '');
-    };
-    reader.readAsDataURL(file);
+  bindFilePicker(el.imagePickBtn, el.imageFileInput, el.imageUrlInput, el.imageUrlError);
+  bindFilePicker(el.docPickBtn, el.docFileInput, el.docUrlInput, el.docUrlError, (file) => {
+    if (!el.docFileNameInput.value.trim()) el.docFileNameInput.value = file.name;
   });
-
-  el.docFileInput.addEventListener('change', () => {
-    const file = el.docFileInput.files && el.docFileInput.files[0];
-    if (!file) return;
-    if (!el.docFileNameInput.value.trim()) {
-      el.docFileNameInput.value = file.name;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      el.docUrlInput.value = reader.result;
-      setFieldError(el.docUrlInput, el.docUrlError, '');
-    };
-    reader.readAsDataURL(file);
-  });
+  bindFilePicker(el.stickerPickBtn, el.stickerFileInput, el.stickerUrlInput, el.stickerUrlError);
 
   function validateSend() {
     const recipient = el.recipientInput.value.trim();
@@ -465,6 +451,29 @@
         : null;
     }
 
+    if (currentSendMode === 'sticker') {
+      const url = el.stickerUrlInput.value.trim();
+      if (!url) {
+        setFieldError(el.stickerUrlInput, el.stickerUrlError, 'Enter a sticker image URL or choose a file.');
+        valid = false;
+      } else {
+        setFieldError(el.stickerUrlInput, el.stickerUrlError, '');
+      }
+      const pack = el.stickerPackInput.value.trim();
+      const author = el.stickerAuthorInput.value.trim();
+      return valid
+        ? {
+            endpoint: '/api/send-sticker',
+            body: {
+              to: recipient,
+              url: url,
+              ...(pack ? { pack: pack } : {}),
+              ...(author ? { author: author } : {})
+            }
+          }
+        : null;
+    }
+
     return null;
   }
 
@@ -481,6 +490,7 @@
   });
   el.imageUrlInput.addEventListener('input', () => setFieldError(el.imageUrlInput, el.imageUrlError, ''));
   el.docUrlInput.addEventListener('input', () => setFieldError(el.docUrlInput, el.docUrlError, ''));
+  el.stickerUrlInput.addEventListener('input', () => setFieldError(el.stickerUrlInput, el.stickerUrlError, ''));
 
   const onCtrlEnter = (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !el.sendBtn.disabled) {
@@ -491,6 +501,8 @@
   el.messageInput.addEventListener('keydown', onCtrlEnter);
   el.imageCaptionInput.addEventListener('keydown', onCtrlEnter);
   el.docCaptionInput.addEventListener('keydown', onCtrlEnter);
+  el.stickerPackInput.addEventListener('keydown', onCtrlEnter);
+  el.stickerAuthorInput.addEventListener('keydown', onCtrlEnter);
 
   el.sendForm.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -505,28 +517,27 @@
         el.imageUrlInput.focus();
       } else if (currentSendMode === 'doc') {
         el.docUrlInput.focus();
+      } else if (currentSendMode === 'sticker') {
+        el.stickerUrlInput.focus();
       }
       return;
     }
 
-    const actionName = currentSendMode === 'text' ? 'message' : (currentSendMode === 'image' ? 'image' : 'document');
+    const actionName = currentSendMode === 'text' ? 'message' : (currentSendMode === 'image' ? 'image' : (currentSendMode === 'doc' ? 'document' : 'sticker'));
     setBusy(el.sendBtn, true, 'Sending…');
     try {
       const { data } = await api(payload.endpoint, { method: 'POST', body: payload.body });
       if (data.success) {
-        showResult(el.sendResult, (currentSendMode === 'text' ? 'Message' : (currentSendMode === 'image' ? 'Image' : 'Document')) + ' sent.', true);
+        showResult(el.sendResult, (currentSendMode === 'text' ? 'Message' : (currentSendMode === 'image' ? 'Image' : (currentSendMode === 'doc' ? 'Document' : 'Sticker'))) + ' sent.', true);
         if (currentSendMode === 'text') {
           el.messageInput.value = '';
           el.charCount.textContent = '0';
         } else if (currentSendMode === 'image') {
-          el.imageUrlInput.value = '';
-          el.imageCaptionInput.value = '';
-          el.imageFileInput.value = '';
+          el.imageUrlInput.value = el.imageCaptionInput.value = el.imageFileInput.value = '';
         } else if (currentSendMode === 'doc') {
-          el.docUrlInput.value = '';
-          el.docFileNameInput.value = '';
-          el.docCaptionInput.value = '';
-          el.docFileInput.value = '';
+          el.docUrlInput.value = el.docFileNameInput.value = el.docCaptionInput.value = el.docFileInput.value = '';
+        } else if (currentSendMode === 'sticker') {
+          el.stickerUrlInput.value = el.stickerPackInput.value = el.stickerAuthorInput.value = el.stickerFileInput.value = '';
         }
         fetchStatus();
       } else {

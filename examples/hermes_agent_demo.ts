@@ -86,6 +86,16 @@ app.post('/api/webhook', async (req: Request, res: Response) => {
     return;
   }
 
+  if (text.includes('sticker')) {
+    // Reply with a sticker: gateway converts to 512x512 WebP and adds EXIF pack metadata
+    res.json({
+      sticker: 'https://raw.githubusercontent.com/WhatsApp/stickers/master/Android/app/src/main/assets/1/01_Cuppy_smile.webp',
+      pack: 'Hermes Demo Pack',
+      author: 'Hermes Agent'
+    });
+    return;
+  }
+
   if (p.hasMedia) {
     // Media can be fetched from the gateway while the message is still cached (last ~300 messages).
     const media = await fetch(`${GATEWAY_URL}/api/media/${p.messageId}`, {

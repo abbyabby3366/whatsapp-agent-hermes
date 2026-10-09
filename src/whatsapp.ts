@@ -22,6 +22,7 @@ import fs from 'fs';
 import path from 'path';
 import { config, loadSettings, saveSettings, type RuntimeSettings } from './config.js';
 import { postToHermes } from './hermes.js';
+import { prepareSticker } from './sticker.js';
 
 export type WebhookStatus =
   | 'forwarded' // delivery to Hermes in progress
@@ -600,6 +601,12 @@ export class WhatsAppClient {
 
       this.stats.forwardedToHermesCount++;
       const reply = typeof result.json?.reply === 'string' ? result.json.reply.trim() : '';
+      const stickerReply =
+        typeof result.json?.sticker === 'string' && (result.json.sticker as string).trim()
+          ? (result.json.sticker as string).trim()
+          : typeof result.json?.stickerUrl === 'string' && (result.json.stickerUrl as string).trim()
+            ? (result.json.stickerUrl as string).trim()
+            : null;
 
       if (reply) {
         record.hermesReply = reply;
@@ -613,6 +620,21 @@ export class WhatsAppClient {
         if (!sent.success) {
           record.webhookStatus = 'failed';
           record.webhookError = `Reply could not be sent: ${sent.error}`;
+        }
+      } else if (stickerReply) {
+        record.hermesReply = '[Sticker]';
+        const quote = typeof result.json?.quote === 'boolean' ? result.json.quote : isGroup;
+        const sent = await this.sendSticker(chatJid, stickerReply, {
+          quotedMessageId: quote ? id : undefined,
+          inReplyTo: id,
+          source: 'hermes',
+          isAnimated: typeof result.json?.isAnimated === 'boolean' ? result.json.isAnimated : undefined,
+          pack: typeof result.json?.pack === 'string' ? result.json.pack : undefined,
+          author: typeof result.json?.author === 'string' ? result.json.author : undefined
+        });
+        if (!sent.success) {
+          record.webhookStatus = 'failed';
+          record.webhookError = `Sticker reply could not be sent: ${sent.error}`;
         }
       } else {
         record.webhookStatus = result.json?.status === 'processing' ? 'processing' : 'ignored';
@@ -982,6 +1004,100 @@ export class WhatsAppClient {
         return 'application/xml';
       default:
         return 'application/pdf';
+    }
+  }
+
+  public async sendSticker(
+    recipient: string,
+    sticker: string | Buffer,
+    opts: {
+      pack?: string;
+      author?: string;
+      categories?: string[];
+      isAnimated?: boolean;
+      /** Inbound message to quote in the reply. */
+      quotedMessageId?: string;
+      /** Inbound message this reply answers (marks it "replied" in the dashboard). */
+      inReplyTo?: string;
+      source?: 'hermes' | 'api';
+    } = {}
+  ): Promise<SendResult> {
+    if (!this.sock || this.status !== 'connected') {
+      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
+    }
+
+    if (!recipient?.trim() || !sticker || (typeof sticker === 'string' && !sticker.trim())) {
+      return { success: false, code: 400, error: 'Recipient and sticker (URL, file path, base64, or Buffer) are required' };
+    }
+
+    let jid = this.resolveJid(recipient);
+    if (!jid) {
+      return {
+        success: false,
+        code: 400,
+        error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789) or a WhatsApp ID.'
+      };
+    }
+
+    // For plain phone numbers, confirm the number is on WhatsApp so we can give a clear error.
+    if (jid.endsWith('@s.whatsapp.net')) {
+      try {
+        const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
+        if (match && !match.exists) {
+          return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
+        }
+        if (match?.exists && match.jid) jid = match.jid;
+      } catch {
+        // Lookup is best effort; try sending anyway.
+      }
+    }
+
+    const isGroup = jid.endsWith('@g.us');
+    const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+    const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
+
+    let stickerBuffer: Buffer;
+    try {
+      stickerBuffer = await prepareSticker(sticker, {
+        pack: opts.pack,
+        author: opts.author,
+        categories: opts.categories,
+        isAnimated: opts.isAnimated
+      });
+    } catch (err: unknown) {
+      return { success: false, code: 400, error: `Failed to prepare sticker: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    try {
+      const result = await this.sock.sendMessage(
+        jid,
+        {
+          sticker: stickerBuffer,
+          ...(typeof opts.isAnimated === 'boolean' ? { isAnimated: opts.isAnimated } : {})
+        },
+        quoted ? { quoted } : undefined
+      );
+      const messageId = result?.key?.id ?? undefined;
+
+      this.stats.sentCount++;
+      const summaryText = '[Sticker]';
+      if (opts.source === 'hermes') {
+        this.linkHermesReply(jid, summaryText, opts.inReplyTo ?? opts.quotedMessageId);
+      }
+      this.addRecentMessage({
+        id: messageId || `sent-${Date.now()}`,
+        sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
+        recipient: displayRecipient,
+        content: summaryText,
+        timestamp: this.formatDateTime(),
+        fromMe: true,
+        isGroup,
+        messageType: 'sticker'
+      });
+
+      return { success: true, messageId };
+    } catch (err: unknown) {
+      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
     }
   }
 

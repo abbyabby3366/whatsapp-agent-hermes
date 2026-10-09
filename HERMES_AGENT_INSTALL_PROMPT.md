@@ -72,6 +72,7 @@ C) Think longer:     { "reply": null, "status": "processing" }  then later:
 Optional helpers:
    POST /api/send-image    { "to": chatJid, "url": "https://...", "caption": "..." } -> send image
    POST /api/send-document { "to": chatJid, "url": "https://...", "fileName": "...", "caption": "..." } -> send document (PDF, doc, xls, etc.)
+   POST /api/send-sticker  { "to": chatJid, "url": "https://...", "pack": "...", "author": "..." } -> send sticker (auto-formatted to 512x512 WebP)
    POST /api/read   { "messageId": "..." }   -> mark as read
    GET  /api/media/<messageId>               -> download image / voice note / document bytes
 

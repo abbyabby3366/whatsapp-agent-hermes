@@ -103,6 +103,7 @@
             <button type="button" role="tab" class="mode-tab active" id="tabText" aria-selected="true" aria-controls="panelText">Text</button>
             <button type="button" role="tab" class="mode-tab" id="tabImage" aria-selected="false" aria-controls="panelImage">Image</button>
             <button type="button" role="tab" class="mode-tab" id="tabDoc" aria-selected="false" aria-controls="panelDoc">Document</button>
+            <button type="button" role="tab" class="mode-tab" id="tabSticker" aria-selected="false" aria-controls="panelSticker">Sticker</button>
           </div>
 
           <div class="field">
@@ -160,6 +161,27 @@
             <div class="field">
               <label class="label" for="docCaptionInput">Caption (optional)</label>
               <input id="docCaptionInput" name="docCaption" type="text" placeholder="Add an optional caption…">
+            </div>
+          </div>
+
+          <div id="panelSticker" role="tabpanel" aria-labelledby="tabSticker" hidden>
+            <div class="field">
+              <label class="label" for="stickerUrlInput">Sticker image URL or file</label>
+              <div class="input-with-action">
+                <input id="stickerUrlInput" name="stickerUrl" type="text" placeholder="https://example.com/sticker.webp, png, or local path" aria-describedby="stickerUrlHint stickerUrlError">
+                <button type="button" id="stickerPickBtn" class="btn btn-secondary btn-small file-btn">Choose file</button>
+                <input id="stickerFileInput" type="file" accept="image/*,.webp" class="visually-hidden">
+              </div>
+              <p class="hint" id="stickerUrlHint">Enter an image URL, data URI, local path, or select a file (WebP, PNG, JPG, GIF). Formatted to 512x512 WebP.</p>
+              <p class="field-error" id="stickerUrlError" role="alert" hidden></p>
+            </div>
+            <div class="field">
+              <label class="label" for="stickerPackInput">Pack name (optional)</label>
+              <input id="stickerPackInput" name="stickerPack" type="text" placeholder="e.g. Hermes Pack">
+            </div>
+            <div class="field">
+              <label class="label" for="stickerAuthorInput">Author (optional)</label>
+              <input id="stickerAuthorInput" name="stickerAuthor" type="text" placeholder="e.g. Hermes Agent">
             </div>
           </div>
 

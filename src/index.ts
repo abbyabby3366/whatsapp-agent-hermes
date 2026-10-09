@@ -153,6 +153,53 @@ app.post('/api/send-document', async (req: Request, res: Response) => {
   res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
 });
 
+// Send a sticker (used by Hermes, dashboard, and external APIs).
+app.post('/api/send-sticker', async (req: Request, res: Response) => {
+  const { to, url, stickerUrl, sticker, pack, author, categories, isAnimated, replyToMessageId } = req.body ?? {};
+  const stickerData =
+    typeof url === 'string' && url.trim()
+      ? url.trim()
+      : typeof stickerUrl === 'string' && stickerUrl.trim()
+        ? stickerUrl.trim()
+        : typeof sticker === 'string' && sticker.trim()
+          ? sticker.trim()
+          : null;
+
+  if (!to || !stickerData) {
+    res.status(400).json({
+      success: false,
+      error: 'Both "to" (phone number or WhatsApp ID) and "url" (or "sticker" / "stickerUrl") are required'
+    });
+    return;
+  }
+
+  const cleanPack = typeof pack === 'string' && pack.trim() ? pack.trim() : undefined;
+  const cleanAuthor = typeof author === 'string' && author.trim() ? author.trim() : undefined;
+  const cleanCategories = Array.isArray(categories)
+    ? categories.filter((c): c is string => typeof c === 'string')
+    : undefined;
+
+  const result = await waClient.sendSticker(
+    String(to),
+    stickerData,
+    {
+      pack: cleanPack,
+      author: cleanAuthor,
+      categories: cleanCategories,
+      isAnimated: typeof isAnimated === 'boolean' ? isAnimated : undefined,
+      quotedMessageId: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
+      inReplyTo: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
+      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
+    }
+  );
+  if (!result.success) {
+    res.status(result.code).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
+});
+
 // Typing indicator etc.
 app.post('/api/presence', async (req: Request, res: Response) => {
   const { recipient, presence } = req.body ?? {};
