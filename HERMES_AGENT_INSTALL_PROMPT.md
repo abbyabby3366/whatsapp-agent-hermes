@@ -69,7 +69,9 @@ C) Think longer:     { "reply": null, "status": "processing" }  then later:
    ... run tools / LLM ...
    POST http://127.0.0.1:3100/api/send      { "to": chatJid, "message": "result", "replyToMessageId": messageId }
 
-Optional helpers:
+Group chats: If "isGroup": true and neither "mentionsMe" nor "isReplyToMe" is true, choose option B (stay silent) so the bot doesn't spam groups.
+
+Optional helpers (if GATEWAY_API_KEY is configured in .env, add header `x-api-key: <key>` to all requests):
    POST /api/send-image    { "to": chatJid, "url": "https://...", "caption": "..." } -> send image
    POST /api/send-document { "to": chatJid, "url": "https://...", "fileName": "...", "caption": "..." } -> send document (PDF, doc, xls, etc.)
    POST /api/send-sticker  { "to": chatJid, "url": "https://...", "pack": "...", "author": "..." } -> send sticker (auto-formatted to 512x512 WebP)
