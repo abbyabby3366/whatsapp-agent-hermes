@@ -29,6 +29,7 @@ This architecture decouples WhatsApp from the core Hermes process. WhatsApp conn
 - `handled.json`: Idempotency ledger of terminal message outcomes.
 - `chat_map.json`: Phone number to WhatsApp JID/LID lookup map.
 - `sessions.json`: WhatsApp chat key to active Hermes session mapping.
+- `state.json`: Persisted runtime state (approval mode, global on/off, paused contact timers).
 - `contacts.json`: Per-contact briefs, personas, notes, and auto-reply toggles.
 - `prompt_template.txt`: Live behavior brief (hot-reloaded per message without service restart).
 - `prompt_template_owner.txt`: Behavior brief applied exclusively when chatting with the master operator.
@@ -76,6 +77,7 @@ sequenceDiagram
     participant GW as Gateway (:3100)
     participant Recv as Receiver (:5000)
     participant Agent as Hermes Core
+    actor Master as Master Operator
 
     User->>GW: Inbound WhatsApp message
     GW->>Recv: POST /api/webhook (x-hermes-token)
@@ -86,6 +88,12 @@ sequenceDiagram
     Recv->>Agent: Run Hermes with injected conversation history
     alt Agent replies with text
         Agent-->>Recv: Structured reply plan (1 to 5 messages)
+        alt Draft Approval Mode is ON
+            Recv->>GW: POST /api/send { to: MASTER_PHONE, message: "[DRAFT] For Contact..." }
+            Master->>GW: Reply: SEND | SKIP | Quote-edit
+            GW->>Recv: Webhook with master decision
+            Note over Recv: Dispatches approved text or drops draft
+        end
         Recv->>GW: POST /api/send { to, message: part1 }
         loop For subsequent split parts (2..N)
             Recv->>GW: POST /api/presence { recipient, presence: "composing" }
@@ -101,6 +109,7 @@ sequenceDiagram
 
 - Webhook responses must arrive within 15 seconds. The receiver answers immediately with `status: "processing"`, releasing the gateway webhook while processing asynchronously.
 - **Silent First Draft**: While drafting the first reply, do **NOT** show a typing indicator. Only display the typing indicator (`presence: "composing"`) between subsequent split messages (~2s apart).
+- **Approval Interception**: When draft approval is active, outgoing replies to contacts are paused until confirmed by `MASTER_PHONE`.
 - Conversations maintain dedicated Hermes sessions per chat (tracked in `sessions.json`).
 - Group messages without a direct mention or quote reply are automatically ignored.
 
@@ -171,9 +180,10 @@ python3 history.py search "keyword"
 ## Multi-Message Replies 💬
 
 - One reply turn can be split into up to **5 separate WhatsApp messages**.
+- **Split Delimiter**: When the agent outputs multiple messages, separate them using `===MSG===` (e.g. `First message===MSG===Second message`). This ensures `receiver.py` never splits standard paragraphs, bullet lists, or intentional Enter linebreaks accidentally.
 - Messages are dispatched **~2s apart** with a typing indicator between them.
 - **Typing Indicator Rule**: While drafting the initial reply, **do not** show a typing indicator. Only show the typing indicator (`presence: "composing"`) between subsequent split messages.
-- **Question Placement**: If asking a question, place the question **only in the last message**.
+- **Question Placement**: Place at most **one question per turn**, and strictly in the **last message** of the sequence. Earlier split messages share context/information only.
 - **Atomic Content**: Forms, structured data blocks, and bullet lists must **never be split** across separate messages.
 
 ## Tone & Language 🇲🇾
@@ -218,18 +228,28 @@ Draft approval mode prevents automated messages from reaching contacts without o
 - **Operator Actions**:
   - `SEND` — Dispatches the pending draft as-is to the contact.
   - `SKIP` — Drops the pending draft entirely.
-  - **Quote-Reply with Own Text** — Sends the operator's specific text instead of the draft. The escalation alert should guide the operator on this syntax where applicable.
+  - **Quote-Reply with Own Text** — Sends the operator's specific text instead of the draft.
+- **Guidance Alert Format**: The receiver forwards drafts to `MASTER_PHONE` with clear guidance:
+  ```text
+  [DRAFT APPROVAL] For +60123456789:
+  "Draft message text here..."
+
+  Options:
+  • Reply SEND to send as-is
+  • Reply SKIP to drop
+  • Quote-reply this message with your edits to send your text instead
+  ```
 - **WhatsApp Toggle**: Toggle the mode directly via WhatsApp: `"approval on"` / `"approval off"`.
 
 ## Commands from Your Phone 🎛️
 
-The master operator can administer the agent directly from their personal WhatsApp (`MASTER_PHONE`):
+The master operator can administer the agent directly from their personal WhatsApp (`MASTER_PHONE`). Commands are case-insensitive and numbers accept full international digits (e.g. `60123456789`):
 
 | Command | Action |
 |---|---|
 | `status` | Reports system health, active sessions, approval state, and message queue |
 | `off` / `on` | Disables or re-enables automated bot responses globally |
-| `pause <number> 4h` | Pauses auto-replies for a specific phone number for a duration (e.g. 4 hours) |
+| `pause <number> 4h` | Pauses auto-replies for a specific phone number for a duration (e.g. `4h`, `1d`, `30m`) |
 | `resume <number>` | Resumes auto-replies for that specific phone number immediately |
 | `approval on` \| `approval off` | Enables or disables draft approval testing mode |
 | `SEND` | Approves and sends the active pending draft to the contact |
@@ -259,9 +279,10 @@ WhatsApp restricts unofficial clients (Baileys) from initiating cold 1:1 chats w
 
 Send media programmatically using `wa_send.py`:
 ```bash
-wa_send.py text  <recipient_jid> "Message content"
-wa_send.py image <recipient_jid> "http://127.0.0.1:8099/photo.jpg" "Caption"
-wa_send.py doc   <recipient_jid> /path/to/document.pdf "Caption"
+wa_send.py text    <recipient_jid> "Message content"
+wa_send.py image   <recipient_jid> "http://127.0.0.1:8099/photo.jpg" "Caption"
+wa_send.py doc     <recipient_jid> /path/to/document.pdf "Caption"
+wa_send.py sticker <recipient_jid> "http://127.0.0.1:8099/sticker.webp" "Pack" "Author"
 ```
 
 - Media URLs must be served over HTTP/1.1 with valid `Content-Length` headers (e.g. via `media_server.py`). Do not use Python's built-in `http.server` as its HTTP/1.0 truncation can crash the gateway parser.
@@ -377,6 +398,11 @@ https://gateway.example.com -> Reverse Proxy (Nginx + TLS) -> SSH Remote Tunnel 
 | `DRAIN_SECONDS` | `120` | Grace period on shutdown for active runs |
 | `STARTUP_REPLAY` | `true` | Re-evaluates unanswered messages on boot |
 | `HISTORY_LIMIT` | `30` | Number of previous messages injected into prompt |
+| `DAILY_REPLY_LIMIT_PER_PERSON` | `25` | Maximum automated replies per person per day |
+| `HOURLY_GLOBAL_REPLY_LIMIT` | `60` | Maximum automated replies across all chats per hour |
+| `DRAFT_APPROVAL_DEFAULT` | `false` | Default draft approval state on boot |
+| `SPLIT_MESSAGE_DELAY_SECONDS` | `2.0` | Pause duration between split multi-messages |
+| `MAX_MESSAGES_PER_TURN` | `5` | Maximum messages sent in a single turn |
 | `DRY_RUN` | `false` | When true, records decisions without dispatching sends |
 
 ## Operational Pitfalls
