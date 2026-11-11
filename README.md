@@ -38,7 +38,7 @@ pm2 start npm --name whatsapp-agent-hermes -- start
 | --- | --- | --- |
 | `PORT` | `3100` | Gateway port |
 | `HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` to open the dashboard to other machines (then set `GATEWAY_API_KEY`). |
-| `GATEWAY_API_KEY` | *(empty)* | Optional key required on every `/api/*` call (`x-api-key` header). The dashboard asks for it. |
+| `GATEWAY_API_KEY` | *(empty)* | Shared key required on every `/api/*` call (`x-api-key` header, except `/api/health`). Recommended even on `127.0.0.1` to block local SSRF. |
 | `HERMES_WEBHOOK_URL` | *(empty)* | Where incoming messages are posted. Empty = messages are only shown in the dashboard. |
 | `HERMES_SECRET_TOKEN` | *(empty)* | Sent to Hermes as `x-hermes-token` so Hermes can reject other callers. |
 | `HERMES_WEBHOOK_TIMEOUT_MS` | `15000` | Wait time per webhook call |
@@ -118,4 +118,4 @@ curl -X POST http://127.0.0.1:3100/api/send \
   -d '{"to": "60123456789", "message": "Hello from Hermes!"}'
 ```
 
-See [HERMES_AGENT_INSTALL_PROMPT.md](HERMES_AGENT_INSTALL_PROMPT.md) for the complete prompt to set up Hermes, and [examples/hermes_agent_demo.ts](examples/hermes_agent_demo.ts) for a working Node.js agent.
+See [HERMES_AGENT_INSTALL_PROMPT.md](HERMES_AGENT_INSTALL_PROMPT.md) for the complete prompt to set up Hermes, [wa-agent-SKILL.md](wa-agent-SKILL.md) (plus companion templates/references in [`skill/`](skill/)) for the operational Hermes skill, and [examples/hermes_agent_demo.ts](examples/hermes_agent_demo.ts) for a working Node.js demo receiver.
