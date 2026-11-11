@@ -12,12 +12,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "baileys": "github:JonathanChuahE-Jay/Baileys",
+    "baileys": "git+https://github.com/JonathanChuahE-Jay/Baileys.git",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4",
-    "sharp": "^0.33.5"
+    "sharp": "^0.35.5"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",

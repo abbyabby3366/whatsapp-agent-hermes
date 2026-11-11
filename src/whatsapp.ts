@@ -198,6 +198,7 @@ export class WhatsAppClient {
         },
         browser: Browsers.macOS('Desktop App'),
         logger: this.logger,
+        markOnlineOnConnect: false,
         syncFullHistory: false,
         generateHighQualityLinkPreview: false,
         defaultQueryTimeoutMs: 60_000
@@ -837,7 +838,12 @@ export class WhatsAppClient {
       const messageId = result?.key?.id ?? undefined;
 
       this.stats.sentCount++;
-      const summaryText = cleanCaption ? `[Image] ${cleanCaption}` : `[Image] ${imageUrl.trim()}`;
+      const cleanImageUrl = imageUrl.trim();
+      const summaryText = cleanCaption
+        ? `[Image] ${cleanCaption}`
+        : cleanImageUrl.startsWith('data:')
+          ? '[Image]'
+          : `[Image] ${cleanImageUrl}`;
       if (opts.source === 'hermes') {
         this.linkHermesReply(jid, summaryText, opts.inReplyTo ?? opts.quotedMessageId);
       }
