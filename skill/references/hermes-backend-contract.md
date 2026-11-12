@@ -63,6 +63,7 @@ messages (count=1):
 ## 3. Hermes Subprocess Invocation & Stdout/Stderr Split
 
 - Invoke `hermes chat -Q` in its own POSIX process group (`start_new_session=True`) so superseding bursts can cleanly terminate in-flight runs via `os.killpg(proc.pid, signal.SIGTERM)`.
+- **Subprocess Secret Hygiene**: Construct a sanitized `env` dict when spawning `hermes chat -Q` — strip receiver-only credentials (`GEMINI_API_KEY`, `GATEWAY_API_KEY`, `HERMES_SECRET_TOKEN`) so untrusted contact turns never inherit secrets.
 - **Stdout vs. Stderr Invariant**:
   - `stdout`: Raw assistant reply text only.
   - `stderr`: Diagnostics and `session_id: <id>`. Parse `session_id` exclusively from `stderr` and persist in `sessions.json` keyed by canonical phone/chat key.
@@ -70,16 +71,130 @@ messages (count=1):
 
 ---
 
-## 4. Voice Note Pipeline (Gemini Audio — Never Whisper)
+## 4. Voice Note Pipeline (Gemini Audio via Secret Vault, or Local `faster-whisper` Out of the Box)
 
 - Download `.ogg` / `audio` payloads immediately via `GET /api/media/<messageId>` (with header `x-api-key: <GATEWAY_API_KEY>`) into `media/`.
-- **Do NOT use local Whisper / `faster-whisper`**, which mangles Malaysian accents and Mandarin/Malay/English (Manglish) code-switching.
-- Pass the audio file to **Gemini Audio** (`gemini-2.5-flash` / `gemini-3-flash-preview` with `LOW` or `MEDIUM` thinking level) requesting:
-  1. Verbatim multilingual transcript preserving English, Chinese, Malay, and Manglish terms.
-  2. Detected speaker vibe (`casual`, `polite`, `funny`, `serious`, `urgent`, or `unclear`).
-- Inject into `<untrusted_inbound_message>` as:
-  `[voice note | vibe: polite | transcript: "..."]`
-- If audio quality is garbled or `unclear`, note `[voice note | vibe: unclear | transcript: "(inaudible/muffled)"]` so the agent asks the sender to type it out rather than guessing.
+- **Dynamic Engine Selection via Secret Vault** (`load_gemini_api_key()`):
+  1. Check `$CREDENTIALS_DIRECTORY/gemini_api_key` (`systemd-creds`), then `GEMINI_API_KEY_FILE` (default `~/.hermes/vault/gemini_api_key`, `0600`), then `hermes hvault get GEMINI_API_KEY` if `hermesvault` is active (or `GEMINI_API_KEY` env var if injected).
+  2. **If a non-empty Gemini API key is present -> Use Gemini Audio (`google-genai >= 2.30.1`)**:
+     - Call `gemini-3.8-flash` (`GEMINI_AUDIO_MODEL`) via `client.interactions.create(..., generation_config={"thinking_level": GEMINI_THINKING_LEVEL}, store=False)` (`low` or `medium` thinking) requesting JSON `{"vibe": "casual|polite|funny|serious|urgent|unclear", "transcript": "..."}` preserving verbatim English, Chinese, Malay, and Manglish code-switching.
+     - Inject into `<untrusted_inbound_message>` (after `clean_untrusted()`) as:
+       `[voice note | vibe: polite | transcript: "..."]`
+     - **Explicit Error Visibility (No Silent Masking)**: If a configured Gemini API key fails authentication or quota (HTTP 400/401/403/429), log the error clearly in `hermes-wa-receiver` and alert `MASTER_PHONE` so the owner knows their configured Gemini key needs attention rather than silently hiding a broken key.
+  3. **Else (no Gemini API key configured — user skipped/ignored it) -> Use Local `faster-whisper` Out of the Box**:
+     - Lazily initialize a process-wide thread-safe `faster_whisper.WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)` singleton (default `WHISPER_MODEL="base"`, `device="cpu"`, `compute_type="int8"`, decoded natively via bundled PyAV with zero external API keys required).
+     - Run `model.transcribe(str(audio_path), beam_size=5, vad_filter=True)`.
+     - If speech segments are present, inject (after `clean_untrusted()`):
+       `[voice note | engine: faster-whisper | lang: {info.language} | transcript: "..."]`
+     - If no speech is detected or average log-probability indicates garbled audio (`avg_logprob < -1.0`), mark `unclear`:
+       `[voice note | engine: faster-whisper | quality: unclear | transcript: "(inaudible/muffled)"]`
+- Whenever a transcript is marked `unclear`, `prompt_template.txt` instructs the agent to ask the sender to type it out rather than guessing:
+
+```python
+import base64
+import json
+import os
+import subprocess
+import threading
+from pathlib import Path
+
+_whisper_lock = threading.Lock()
+_whisper_model = None
+
+
+def load_gemini_api_key() -> str | None:
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    candidates: list[Path] = []
+    if cred_dir:
+        candidates.append(Path(cred_dir) / "gemini_api_key")
+    vault_file = os.environ.get("GEMINI_API_KEY_FILE", "~/.hermes/vault/gemini_api_key")
+    candidates.append(Path(vault_file).expanduser())
+
+    for path in candidates:
+        if path.is_file():
+            key = path.read_text(encoding="utf-8").strip()
+            if key:
+                return key
+
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key.startswith("hv:"):
+        proc = subprocess.run(
+            ["hermes", "hvault", "get", env_key.removeprefix("hv:")],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    elif env_key:
+        return env_key
+
+    return None
+
+
+def transcribe_with_gemini(audio_path: Path, mime_type: str, api_key: str) -> str:
+    from google import genai
+
+    model = os.environ.get("GEMINI_AUDIO_MODEL", "gemini-3.8-flash")
+    thinking_level = os.environ.get("GEMINI_THINKING_LEVEL", "low").lower()
+    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
+
+    client = genai.Client(api_key=api_key)
+    interaction = client.interactions.create(
+        model=model,
+        input=[
+            {
+                "type": "text",
+                "text": (
+                    'Transcribe this WhatsApp voice note verbatim (preserving English, Chinese, Malay, and Manglish) '
+                    'and classify speaker vibe as one of: casual, polite, funny, serious, urgent, unclear. '
+                    'Respond strictly as JSON: {"vibe": "...", "transcript": "..."}. '
+                    'If muffled or inaudible, set vibe to "unclear" and transcript to "(inaudible/muffled)".'
+                ),
+            },
+            {
+                "type": "audio",
+                "data": audio_b64,
+                "mime_type": mime_type.split(";")[0].strip() or "audio/ogg",
+            },
+        ],
+        generation_config={"thinking_level": thinking_level},
+        store=False,
+    )
+    raw = (interaction.output_text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").removeprefix("json").strip()
+    parsed = json.loads(raw)
+    vibe = clean_untrusted(str(parsed.get("vibe") or "unclear")).lower()
+    transcript = clean_untrusted(str(parsed.get("transcript") or "(inaudible/muffled)"))
+    return f'[voice note | vibe: {vibe} | transcript: "{transcript}"]'
+
+
+def transcribe_with_faster_whisper(audio_path: Path) -> str:
+    global _whisper_model
+    from faster_whisper import WhisperModel
+
+    with _whisper_lock:
+        if _whisper_model is None:
+            _whisper_model = WhisperModel(
+                os.environ.get("WHISPER_MODEL", "base"),
+                device=os.environ.get("WHISPER_DEVICE", "cpu"),
+                compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
+            )
+        segments_iter, info = _whisper_model.transcribe(str(audio_path), beam_size=5, vad_filter=True)
+        segments = list(segments_iter)
+
+    text = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
+    if not text:
+        return '[voice note | engine: faster-whisper | quality: unclear | transcript: "(inaudible/muffled)"]'
+
+    avg_logprob = sum(seg.avg_logprob for seg in segments) / len(segments)
+    clean_text = clean_untrusted(text)
+    if avg_logprob < -1.0:
+        return f'[voice note | engine: faster-whisper | lang: {info.language} | quality: unclear | transcript: "{clean_text}"]'
+    return f'[voice note | engine: faster-whisper | lang: {info.language} | transcript: "{clean_text}"]'
+```
 
 ---
 

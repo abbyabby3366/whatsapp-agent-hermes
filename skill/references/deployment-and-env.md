@@ -30,7 +30,7 @@ WantedBy=default.target
 ```
 
 ### `~/.config/systemd/user/hermes-wa-receiver.service`
-*(Include `%h/.local/bin` and `%h/.hermes/hermes-agent/venv/bin` in `PATH` so `receiver.py` always finds the `hermes` CLI under `systemd --user`.)*
+*(Run `receiver.py` using its dedicated `%h/whatsapp-hermes-receiver/.venv/bin/python` virtualenv where `faster-whisper` and `google-genai` are installed, while keeping `%h/.local/bin` and `%h/.hermes/hermes-agent/venv/bin` in `PATH` so `receiver.py` always finds the `hermes` CLI under `systemd --user`.)*
 ```ini
 [Unit]
 Description=Hermes WhatsApp Webhook Receiver
@@ -41,7 +41,7 @@ Type=simple
 WorkingDirectory=%h/whatsapp-hermes-receiver
 Environment="PATH=%h/.local/bin:%h/.hermes/hermes-agent/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=%h/whatsapp-hermes-receiver/receiver.env
-ExecStart=/usr/bin/env python3 %h/whatsapp-hermes-receiver/receiver.py
+ExecStart=%h/whatsapp-hermes-receiver/.venv/bin/python %h/whatsapp-hermes-receiver/receiver.py
 KillMode=control-group
 TimeoutStopSec=130
 Restart=always
@@ -56,6 +56,22 @@ Enable and start both:
 systemctl --user daemon-reload
 systemctl --user enable --now whatsapp-agent-hermes hermes-wa-receiver
 ```
+
+### Secret Vault for Optional Gemini API Key (`~/.hermes/vault/` & `hermes hvault`)
+Voice-note transcription works **out of the box** via local `faster-whisper` (`WHISPER_MODEL=base`) with zero external API keys. When the user opts in and pastes a Gemini API key (at install time or later via 1:1 Master DM / CLI), never store the raw key in `.env` or `receiver.env` — save it in the secret vault:
+
+```bash
+# 1. Restricted local secret vault file (0700 dir, 0600 file; hot-reloaded per voice note)
+mkdir -p -m 700 ~/.hermes/vault
+(umask 077 && printf '%s' "$RAW_GEMINI_API_KEY" > ~/.hermes/vault/gemini_api_key)
+chmod 600 ~/.hermes/vault/gemini_api_key
+
+# 2. Also store in Hermes's native encrypted vault if hermesvault (hvault) is initialized
+if hermes hvault list >/dev/null 2>&1; then
+  hermes hvault set GEMINI_API_KEY "$RAW_GEMINI_API_KEY"
+fi
+```
+*(Optional hardening on hosts with `systemd-creds`: encrypt into `~/.hermes/vault/gemini_api_key.cred` and add `LoadCredentialEncrypted=gemini_api_key:%h/.hermes/vault/gemini_api_key.cred` to `hermes-wa-receiver.service`; `receiver.py` checks `$CREDENTIALS_DIRECTORY/gemini_api_key` first, then `GEMINI_API_KEY_FILE`.)*
 
 ---
 
@@ -101,7 +117,12 @@ https://gateway.example.com -> Nginx (TLS) -> SSH Remote Tunnel (127.0.0.1:3101)
 | `MASTER_LID` | `""` | Optional 15-digit WhatsApp LID for Master 1:1 DM recognition |
 | `MASTER_NAME` | *(required)* | Principal's real name for first-person voice |
 | `TIMEZONE` | `Asia/Kuala_Lumpur` | Timezone (`GMT+8`) for `DD-MM-YY` formatted timestamps |
-| `GEMINI_API_KEY` | *(required for voice)* | API key for Gemini Audio voice-note transcription (`LOW`/`MEDIUM` thinking) |
+| `GEMINI_API_KEY_FILE` | `~/.hermes/vault/gemini_api_key` | Optional `0600` secret-vault file holding the Gemini API key; if present & non-empty, uses Gemini Audio, else uses local `faster-whisper` out of the box |
+| `GEMINI_AUDIO_MODEL` | `gemini-3.8-flash` | Gemini model used for voice-note transcription + vocal vibe analysis when a Gemini key is stored in the secret vault |
+| `GEMINI_THINKING_LEVEL` | `low` | Thinking level (`low` or `medium`) passed to Gemini Audio |
+| `WHISPER_MODEL` | `base` | Local `faster-whisper` model (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) used automatically when no Gemini key is configured |
+| `WHISPER_DEVICE` | `cpu` | Execution device for local `faster-whisper` (`cpu` or `cuda`) |
+| `WHISPER_COMPUTE_TYPE` | `int8` | Quantization type for local `faster-whisper` (`int8` on CPU, `float16` on CUDA) |
 | `AGENT_TOOLSETS` | `web,vision` | Restricted read-only toolsets for external contacts |
 | `AGENT_TOOLSETS_OWNER` | `terminal,file,web,vision` | Elevated toolsets exclusively for 1:1 Master DM |
 | `AGENT_TIMEOUT_SECONDS` | `300` | Max execution time per Hermes turn |

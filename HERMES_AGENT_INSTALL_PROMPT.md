@@ -7,15 +7,18 @@
 ````markdown
 You are an autonomous engineer. Install and connect the "WhatsApp Agent Hermes" gateway and its Hermes webhook receiver on this server so that WhatsApp messages reach this Hermes agent and Hermes can reply safely in the owner's voice.
 
-### Step 0: Immediate User Input (Master Credentials)
+### Step 0: Immediate User Input (Master Credentials & Optional Gemini Voice Transcription)
 **Immediately ask the user for:**
 1. **Master Phone Number** (`MASTER_PHONE`): Their personal WhatsApp phone number with country code and digits only (e.g. `60123456789`). Required for escalations (`@@FLAG@@`), 1:1 Master DM command authority, and urgent alerts.
 2. **Master Operator Name** (`MASTER_NAME`): Their real name (e.g. `Alex`, `Desmond`) so the agent speaks on their behalf in the first person ("I", "my") without exposing bot intermediaries.
+3. **Gemini API Key for Voice-Note Transcription? (Optional)**: Ask whether they want to use a **Gemini API key** for voice-note transcription (higher accuracy on multilingual / Mandarin / Malay / Manglish + vocal vibe detection) **or skip/ignore it** to use **local `faster-whisper` out of the box** (works locally on CPU with zero API keys):
+   - **If they want Gemini**: Ask them to paste their Gemini API key directly (if they did not already include it), and store it strictly in the **secret vault** in Step 4 (never echo the raw key back in chat and never write it into plaintext `.env` files).
+   - **If they skip, decline, or ignore this question**: Do **not** block — proceed with local `faster-whisper` as the active transcription engine.
 
-Do NOT proceed with `.env` or `receiver.env` configuration using blank or placeholder credentials. Collect these two values up-front.
+Do NOT proceed with `.env` or `receiver.env` configuration using blank or placeholder values for `MASTER_PHONE` or `MASTER_NAME`. Collect those up-front alongside their voice transcription choice.
 
 ### Step 1: Prerequisites
-Check: `node -v` (v20 or v22+), `npm -v`, `python3 --version`, `git --version`, and `systemctl --user --version`.
+Check: `node -v` (v20 or v22+), `npm -v`, `python3 --version` (with `python3 -m venv`), `git --version`, and `systemctl --user --version`.
 
 ### Step 2: Get the code
 ```bash
@@ -35,20 +38,37 @@ npx tsc --noEmit        # must exit 0
 npm run build           # compiles dist/ for production systemd execution
 ```
 
-### Step 4: Configure Secrets & Environment (Automatic — no manual human file editing)
-Do NOT ask the human to edit `.env` files manually. Programmatically generate strong secrets and write both configs:
+### Step 4: Configure Secrets, Secret Vault & Environment (Automatic — no manual human file editing)
+Do NOT ask the human to edit `.env` files manually. Programmatically generate strong secrets, store any optional Gemini API key inside the secret vault, and write both configs:
 1. Generate **two** distinct 48-hex-character secrets (`openssl rand -hex 24`):
    - `HERMES_SECRET_TOKEN`: Sent by the gateway as `x-hermes-token` so the receiver rejects unauthorized webhook callers.
    - `GATEWAY_API_KEY`: **Mandatory even on `127.0.0.1`**. Protects `/api/status`, `/api/send*`, `/api/media/*`, and `/api/logout` (`x-api-key` header) so untrusted contacts running with `web` tools cannot read private chats via loopback SSRF.
-2. Write `~/whatsapp-agent-hermes/.env`:
+2. **Store Optional Gemini API Key in the Secret Vault (if provided in Step 0)**:
+   - **Never** write the raw `GEMINI_API_KEY` into `~/whatsapp-agent-hermes/.env`, `~/whatsapp-hermes-receiver/receiver.env`, or echo it back in chat/logs.
+   - If the user pasted a Gemini API key in Step 0:
+     - Create the restricted vault directory `mkdir -p -m 700 ~/.hermes/vault` and write the key with `umask 077` into `~/.hermes/vault/gemini_api_key` (`chmod 600 ~/.hermes/vault/gemini_api_key`).
+     - Also store it in Hermes's native encrypted vault if `hermes hvault` (`hermesvault`) is active/initialized on this host (`hermes hvault --help`).
+   - If the user skipped or ignored the Gemini API key in Step 0: leave `~/.hermes/vault/gemini_api_key` absent so `receiver.py` automatically uses local `faster-whisper` out of the box.
+3. Write `~/whatsapp-agent-hermes/.env`:
    - `PORT=3100`, `HOST=127.0.0.1`, `GATEWAY_API_KEY=<generated_api_key>`
    - `HERMES_WEBHOOK_URL=http://127.0.0.1:5000/api/webhook`, `HERMES_SECRET_TOKEN=<generated_webhook_token>`
    - `TIMEZONE=Asia/Kuala_Lumpur`, `DEFAULT_COUNTRY_CODE=60`, `FORWARD_GROUPS=true`
    - Mirror `MASTER_PHONE` and `MASTER_NAME` for operator reference (consumed at runtime by `receiver.env`).
-3. Create `~/whatsapp-hermes-receiver/` and write `~/whatsapp-hermes-receiver/receiver.env` (`chmod 600` on both `.env` files):
-   - `RECEIVER_PORT=5000`, `WHATSAPP_GATEWAY_URL=http://127.0.0.1:3100`
-   - Same `HERMES_SECRET_TOKEN` and `GATEWAY_API_KEY`
-   - `MASTER_PHONE=<from Step 0>`, `MASTER_LID=` (populate automatically once observed on first Master 1:1 DM), `MASTER_NAME=<from Step 0>`, `TIMEZONE=Asia/Kuala_Lumpur`
+4. Create `~/whatsapp-hermes-receiver/`, its Python virtualenv (`python3 -m venv ~/whatsapp-hermes-receiver/.venv`), install transcription dependencies so **both** engines are ready out of the box, and write `~/whatsapp-hermes-receiver/receiver.env` (`chmod 600` on both `.env` files):
+   - Install audio packages inside `~/whatsapp-hermes-receiver/.venv`:
+     ```bash
+     ~/whatsapp-hermes-receiver/.venv/bin/pip install --upgrade pip faster-whisper "google-genai>=2.30.1"
+     ```
+   - If no Gemini API key was provided, pre-download the default `faster-whisper` model (`base`, `int8` CPU) now so the very first voice note transcribes immediately without cold-start download delay:
+     ```bash
+     ~/whatsapp-hermes-receiver/.venv/bin/python -c 'from faster_whisper import WhisperModel; WhisperModel("base", device="cpu", compute_type="int8")'
+     ```
+   - Write `~/whatsapp-hermes-receiver/receiver.env`:
+     - `RECEIVER_PORT=5000`, `WHATSAPP_GATEWAY_URL=http://127.0.0.1:3100`
+     - Same `HERMES_SECRET_TOKEN` and `GATEWAY_API_KEY`
+     - `MASTER_PHONE=<from Step 0>`, `MASTER_LID=` (populate automatically once observed on first Master 1:1 DM), `MASTER_NAME=<from Step 0>`, `TIMEZONE=Asia/Kuala_Lumpur`
+     - `GEMINI_API_KEY_FILE=/home/<user>/.hermes/vault/gemini_api_key`, `GEMINI_AUDIO_MODEL=gemini-3.8-flash`, `GEMINI_THINKING_LEVEL=low`
+     - `WHISPER_MODEL=base`, `WHISPER_DEVICE=cpu`, `WHISPER_COMPUTE_TYPE=int8`
 
 ### Step 5: Install the Hermes Skills & Seed Live Templates
 Install `wa-agent-SKILL.md` (with its companion `assets/`, `references/`, and `scripts/` directories) and the single-file `skill-crafter-SKILL.md` into Hermes's global skill directory, initialize the user-owned `whatsapp-agent-rules/SKILL.md` if not yet present (never overwrite existing learned rules), and seed the live hot-reloadable templates into `~/whatsapp-hermes-receiver/`:
@@ -141,7 +161,9 @@ Implement the receiver modules in `~/whatsapp-hermes-receiver/` (`receiver.py`, 
      - Coalesce rapid bursts (`2.5s` window) and supersede in-flight drafts on new arrivals.
      - **Do NOT** call `/api/read` or `presence: "composing"` while drafting the first reply.
      - Enforce strict principal gating: `AGENT_TOOLSETS_OWNER` + `prompt_template_owner.txt` ONLY when `isGroup == false` AND sender matches `MASTER_PHONE` / `MASTER_LID`. Wrap untrusted contact messages in `<untrusted_inbound_message>` tags, and hot-load Section 2 (plus only the matching contact's `###` block from Section 3) of `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` into `[Trusted Operator Context]` so owner-taught rules take effect live without exposing Section 1 or other contacts' notes.
-     - Transcribe voice notes using **Gemini Audio** (`LOW` or `MEDIUM` thinking — never Whisper).
+     - Transcribe voice notes dynamically based on the secret vault (`$CREDENTIALS_DIRECTORY/gemini_api_key` -> `GEMINI_API_KEY_FILE` `~/.hermes/vault/gemini_api_key` -> `hermes hvault` if active):
+       - **If a Gemini API key is present**: Use **Gemini Audio** (`gemini-3.8-flash`, `thinking_level: "low"` or `"medium"`, `store=False`) to extract accurate multilingual/Manglish transcript + vocal vibe (`[voice note | vibe: polite | transcript: "..."]`). Never pass the key into `hermes chat -Q` subprocess environments, and if a configured Gemini key fails authentication/quota, log the error visibly and alert `MASTER_PHONE`.
+       - **Else (no Gemini API key configured)**: Use local **`faster-whisper`** (`WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)`, `vad_filter=True`, lazy singleton) so voice transcription works out of the box with zero API keys (`[voice note | engine: faster-whisper | lang: ... | transcript: "..."]`).
      - Strip and forward `@@FLAG@@` lines first, then evaluate `NO_REPLY`, then run `sanitize_reply()` (ensuring WhatsApp `*bold*`, never Markdown `**bold**`).
      - Right before dispatching an approved reply: call `POST /api/read {"messageId": messageId}`, send chunk 1 via `POST /api/send`, and for split chunks `2..N` (`===MSG===`) show `presence: "composing"` for `~2.0s` between chunks before pausing presence.
 4. **Gateway REST Helpers** (all require header `x-api-key: <GATEWAY_API_KEY>`; `to` accepts phone digits, `chatJid`, `@username`, or `@username#1234` with 4-digit PIN):
