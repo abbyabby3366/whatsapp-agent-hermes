@@ -1,17 +1,17 @@
 /**
- * Hermes Agent Reference Server (Demo)
- * Run with: npm run demo:hermes
+ * WhatsApp AI Agent Reference Webhook Receiver (Demo)
+ * Run with: npm run demo:agent
  *
- * This server receives webhooks from the WhatsApp Agent Hermes gateway, decides whether to
+ * This server receives webhooks from the WhatsApp AI Agent gateway, decides whether to
  * reply, and answers either synchronously (in the HTTP response) or asynchronously through
- * the gateway's REST API. Replace the "REASONING LOGIC" section with your real Hermes agent.
+ * the gateway's REST API. Replace the "REASONING LOGIC" section with your AI agent / LLM.
  */
 
 import express, { Request, Response } from 'express';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '5000', 10);
-const SECRET_TOKEN = process.env.HERMES_SECRET_TOKEN || 'change-me-to-a-long-random-string';
+const SECRET_TOKEN = process.env.AGENT_SECRET_TOKEN || 'change-me-to-a-long-random-string';
 const GATEWAY_URL = process.env.WHATSAPP_GATEWAY_URL || 'http://127.0.0.1:3100';
 const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || '';
 
@@ -48,24 +48,24 @@ interface WebhookPayload {
   isoTimestamp: string;
 }
 
-// Inbound webhook from WhatsApp Agent Hermes
+// Inbound webhook from WhatsApp AI Agent gateway
 app.post('/api/webhook', async (req: Request, res: Response) => {
-  const token = req.headers['x-hermes-token'];
+  const token = req.headers['x-agent-token'];
   if (SECRET_TOKEN && token !== SECRET_TOKEN) {
-    console.warn('⚠️  Unauthorized webhook call. Bad x-hermes-token.');
+    console.warn('⚠️  Unauthorized webhook call. Bad x-agent-token.');
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
   const p = req.body as WebhookPayload;
 
-  // Health check triggered by the dashboard's "Test connection to Hermes" button.
+  // Health check triggered by the dashboard's "Test connection to agent" button.
   if (p.event === 'test.ping') {
-    res.json({ success: true, message: 'Hermes Agent received ping successfully!' });
+    res.json({ success: true, message: 'AI Agent webhook received ping successfully!' });
     return;
   }
 
-  console.log(`\n📨 [Hermes] ${p.senderName || p.sender || p.senderJid}: "${p.message}" (${p.messageType}, id ${p.messageId})`);
+  console.log(`\n📨 [Agent] ${p.senderName || p.sender || p.senderJid}: "${p.message}" (${p.messageType}, id ${p.messageId})`);
 
   // --- REASONING LOGIC ---
   const text = (p.message || '').toLowerCase();
@@ -83,7 +83,7 @@ app.post('/api/webhook', async (req: Request, res: Response) => {
   }
 
   if (/\b(hi|hello|help)\b/.test(text)) {
-    res.json({ reply: `Hello ${p.senderName || 'there'}! 👋 I am your Hermes agent. How can I help?` });
+    res.json({ reply: `Hello ${p.senderName || 'there'}! 👋 I am your WhatsApp AI agent. How can I help?` });
     return;
   }
 
@@ -91,8 +91,8 @@ app.post('/api/webhook', async (req: Request, res: Response) => {
     // Reply with a sticker: gateway converts to 512x512 WebP and adds EXIF pack metadata
     res.json({
       sticker: 'https://raw.githubusercontent.com/WhatsApp/stickers/master/Android/app/src/main/assets/1/01_Cuppy_smile.webp',
-      pack: 'Hermes Demo Pack',
-      author: 'Hermes Agent'
+      pack: 'WhatsApp Agent Demo Pack',
+      author: 'WhatsApp AI Agent'
     });
     return;
   }
@@ -121,17 +121,17 @@ app.post('/api/webhook', async (req: Request, res: Response) => {
         message: `🧠 Done thinking about: "${p.message}"`,
         replyToMessageId: p.messageId
       });
-      console.log('✅ [Hermes] Asynchronous reply sent:', result);
+      console.log('✅ [Agent] Asynchronous reply sent:', result);
     }, 3000);
     return;
   }
 
   // Mode B: decide not to reply.
-  console.log('🔇 [Hermes] Not replying.');
+  console.log('🔇 [Agent] Not replying.');
   res.json({ reply: null, ignored: true });
 });
 
 app.listen(PORT, '127.0.0.1', () => {
-  console.log(`🤖 Demo Hermes Agent listening on http://127.0.0.1:${PORT}/api/webhook`);
+  console.log(`🤖 Demo WhatsApp AI Agent listening on http://127.0.0.1:${PORT}/api/webhook`);
   console.log(`📡 Gateway: ${GATEWAY_URL}\n`);
 });

@@ -1,12 +1,12 @@
-# Hermes Backend & Receiver Implementation Contract
+# WhatsApp AI Receiver & Brain Implementation Contract
 
-This reference specifies the exact runtime invariants between the Node/Baileys gateway (`whatsapp-agent-hermes`, port `3100`), the Python webhook receiver (`~/whatsapp-hermes-receiver/receiver.py`, port `5000`), and the `hermes` CLI subprocess.
+This reference specifies the exact runtime invariants between the Node/Baileys gateway (`~/whatsapp-agent-gateway`, port `3100`), the Python webhook receiver (`~/whatsapp-agent-receiver/receiver.py`, port `5000`), and the AI brain (matching the host AI agent's provider via either CLI or direct HTTP API).
 
 ---
 
 ## 1. Principal Verification (Master vs. Contact Routing)
 
-Elevated owner privileges (`AGENT_TOOLSETS_OWNER=terminal,file,web,vision` and `prompt_template_owner.txt`) MUST only activate when **all three** conditions hold:
+Elevated owner privileges (`prompt_template_owner.txt` + shell/file operator tools + phone admin commands) MUST only activate when **all three** conditions hold:
 
 1. `payload["isGroup"] is False` (NEVER elevate inside a group chat, even if `sender == MASTER_PHONE`, to prevent leaking internal outputs to group members or executing group-injected quoted text).
 2. `chat_jid` is a 1:1 user JID (`@s.whatsapp.net` or `@lid`).
@@ -16,7 +16,7 @@ Elevated owner privileges (`AGENT_TOOLSETS_OWNER=terminal,file,web,vision` and `
 
 Whenever an inbound payload carries `senderUsername` (normalized lowercase WhatsApp `@username` without `@`), persist the `@username <-> chatJid` (and `sender` phone digits if known) mapping in `chat_map.json` so outbound instructions to `@username` immediately map to the canonical thread key (`sessions.json`, `flows.json`, `contacts.json`). When `wa_send.py` or `receiver.py` dispatches to a `@username` not yet in `chat_map.json`, pass `"to": "@username"` (plus optional `"pin": "1234"` or `"@username#1234"`) directly to `/api/send*` (or pre-resolve via `GET /api/resolve?target=@username` with `x-api-key`) and store the returned `jid` in `chat_map.json`.
 
-All other turns (including every group turn) MUST run in the restricted contact sandbox (`AGENT_TOOLSETS=web,vision` with `prompt_template.txt`), and outbound local loopback access (`127.0.0.1`, `localhost`, `[::1]`) remains protected by requiring `GATEWAY_API_KEY` on all gateway `/api/*` endpoints.
+All other turns (including every group turn) MUST run in the restricted external-contact sandbox (`prompt_template.txt`, zero shell/file-write tools), and outbound local loopback access (`127.0.0.1`, `localhost`, `[::1]`) remains protected by requiring `GATEWAY_API_KEY` on all gateway `/api/*` endpoints.
 
 ---
 
@@ -33,7 +33,7 @@ def clean_untrusted(value: str | None) -> str:
     return text.replace("</untrusted_inbound_message>", "[/untrusted_inbound_message]")
 ```
 
-Inject operator context **outside** the XML boundary (including hot-reloaded `## 2. Global Contact Reply Rules & Business Facts` and **only** the current contact's matching `### <phone | @username | Name>` block under `## 3. Contact-Specific Rules` from `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` — never inject `## 1. Operator & Outbound Workflow Rules` or other contacts' `###` blocks into external contact turns) and wrap inbound WhatsApp content **inside** `<untrusted_inbound_message>`:
+Inject operator context **outside** the XML boundary (including hot-reloaded `## 2. Global Contact Reply Rules & Business Facts` and **only** the current contact's matching `### <phone | @username | Name>` block under `## 3. Contact-Specific Rules` from `~/.whatsapp-agent/skills/whatsapp-agent-rules/SKILL.md` — never inject `## 1. Operator & Outbound Workflow Rules` or other contacts' `###` blocks into external contact turns) and wrap inbound WhatsApp content **inside** `<untrusted_inbound_message>`:
 
 ```text
 [Trusted Operator Context]
@@ -60,27 +60,60 @@ messages (count=1):
 
 ---
 
-## 3. Hermes Subprocess Invocation & Stdout/Stderr Split
+## 3. AI Brain Adapter (Reuse Host AI Provider — Never Deploy `brain: none`)
 
-- Invoke `hermes chat -Q` in its own POSIX process group (`start_new_session=True`) so superseding bursts can cleanly terminate in-flight runs via `os.killpg(proc.pid, signal.SIGTERM)`.
-- **Subprocess Secret Hygiene**: Construct a sanitized `env` dict when spawning `hermes chat -Q` — strip receiver-only credentials (`GEMINI_API_KEY`, `GATEWAY_API_KEY`, `HERMES_SECRET_TOKEN`) so untrusted contact turns never inherit secrets.
-- **Stdout vs. Stderr Invariant**:
-  - `stdout`: Raw assistant reply text only.
-  - `stderr`: Diagnostics and `session_id: <id>`. Parse `session_id` exclusively from `stderr` and persist in `sessions.json` keyed by canonical phone/chat key.
-- Pass `--resume <session_id>` when an active session exists for that canonical chat key, and `--image <local_path>` when an inbound image was downloaded from `GET /api/media/<messageId>`.
+The receiver supports two brain modes configured in `receiver.env` so it always uses the **same AI provider as the host AI agent** without depending on any single framework CLI:
+
+### Mode A: `BRAIN_MODE=api` (Direct HTTP / SDK Provider — Works Everywhere)
+Calls the active LLM provider directly from Python (`httpx` / `google-genai`) using the key stored in `~/.whatsapp-agent/vault/llm_api_key` (`LLM_API_KEY_FILE`):
+- **`LLM_PROVIDER=openai`**: Any OpenAI-compatible Chat Completions endpoint (`{LLM_BASE_URL}/chat/completions`, default `https://api.openai.com/v1` or `https://openrouter.ai/api/v1`) with `Authorization: Bearer <key>`. Attach inbound images as `image_url` (`data:image/jpeg;base64,...`).
+- **`LLM_PROVIDER=anthropic`**: Anthropic Messages API (`https://api.anthropic.com/v1/messages` or `{LLM_BASE_URL}/v1/messages`) with `x-api-key: <key>` and `anthropic-version: 2023-06-01`. Attach inbound images as base64 `image` blocks.
+- **`LLM_PROVIDER=gemini`**: Official `google-genai >= 2.30.1` (`genai.Client(api_key=key)` -> `client.interactions.create(model=LLM_MODEL, system_instruction=..., input=..., store=False)`).
+- **Tool Gating in `api` Mode**:
+  - **External Contact Turns (`is_owner=False`)**: Pass `tools=[]` (pure text/vision generation — zero shell or filesystem access).
+  - **Verified 1:1 Master DM Turns (`is_owner=True`)**: Expose restricted operator function tools (`run_shell`, `read_file`, `write_file`, `wa_send`) executed inside `~/whatsapp-agent-receiver/` (up to 8 tool-call iterations) so the owner can manage `contacts.json`, `flows.json`, `whatsapp-agent-rules/SKILL.md`, and outbound messages directly from WhatsApp.
+- **Burst Cancellation**: Track an `asyncio.Task` / `threading.Event` per chat key so superseding messages cancel any in-flight HTTP stream/request before dispatching the combined burst.
+
+### Mode B: `BRAIN_MODE=cli` (Authenticated Host Agent CLI)
+Invokes the verified host AI agent CLI (`AGENT_CLI_BIN`, e.g. `claude`, `codex`, `gemini`) in its own POSIX process group (`start_new_session=True`) so superseding bursts can terminate in-flight runs via `os.killpg(proc.pid, signal.SIGTERM)`:
+- **Subprocess Secret Hygiene**: Strip `GATEWAY_API_KEY`, `AGENT_SECRET_TOKEN`, and raw vault secrets from the child `env` on external contact turns (`is_owner=False`).
+- **Sandbox Separation**:
+  - **`claude` (`AGENT_CLI_TYPE=claude`)**:
+    - Contact turn: `[AGENT_CLI_BIN, "-p", prompt, "--system-prompt", system_prompt, "--tools", "WebSearch,WebFetch"]` in an isolated temp directory (`/tmp/wa-contact-sandbox`).
+    - Owner 1:1 DM turn: `[AGENT_CLI_BIN, "-p", prompt, "--system-prompt", system_prompt, "--dangerously-skip-permissions"]` in `~/whatsapp-agent-receiver`.
+  - **`codex` (`AGENT_CLI_TYPE=codex`)**:
+    - Contact turn: `[AGENT_CLI_BIN, "exec", "--skip-git-repo-check", "--sandbox", "read-only", full_prompt]` in `/tmp/wa-contact-sandbox` (with `-i <image_path>` when an image is attached).
+    - Owner 1:1 DM turn: `[AGENT_CLI_BIN, "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", full_prompt]` in `~/whatsapp-agent-receiver`.
+  - **`gemini` (`AGENT_CLI_TYPE=gemini`)**:
+    - Contact turn: `[AGENT_CLI_BIN, "-p", full_prompt]` in `/tmp/wa-contact-sandbox`.
+    - Owner 1:1 DM turn: `[AGENT_CLI_BIN, "-p", full_prompt, "--yolo"]` in `~/whatsapp-agent-receiver`.
+
+### Mandatory Health & Live Readiness Check (`GET /health`)
+`GET http://127.0.0.1:5000/health` MUST return:
+```json
+{
+  "ok": true,
+  "brain_mode": "api",
+  "brain_provider": "openai:gpt-4.1",
+  "brain_ready": true,
+  "voice_engine": "gemini-audio" | "faster-whisper",
+  "turns_active": 0
+}
+```
+Never ignore HTTP `401`/`402`/`403` provider errors silently — log them clearly, alert `MASTER_PHONE`, and leave the inbound turn unledgered (`no-answer`) so `replay_orphans()` retries once credentials/quota are restored.
 
 ---
 
 ## 4. Voice Note Pipeline (Gemini Audio via Secret Vault, or Local `faster-whisper` Out of the Box)
 
 - Download `.ogg` / `audio` payloads immediately via `GET /api/media/<messageId>` (with header `x-api-key: <GATEWAY_API_KEY>`) into `media/`.
-- **Dynamic Engine Selection via Secret Vault** (`load_gemini_api_key()`):
-  1. Check `$CREDENTIALS_DIRECTORY/gemini_api_key` (`systemd-creds`), then `GEMINI_API_KEY_FILE` (default `~/.hermes/vault/gemini_api_key`, `0600`), then `hermes hvault get GEMINI_API_KEY` if `hermesvault` is active (or `GEMINI_API_KEY` env var if injected).
+- **Dynamic Engine Selection via Secret Vault** (`load_vault_secret("gemini_api_key", "GEMINI_API_KEY_FILE")`):
+  1. Check `$CREDENTIALS_DIRECTORY/gemini_api_key` (`systemd-creds`), then `GEMINI_API_KEY_FILE` (default `~/.whatsapp-agent/vault/gemini_api_key`, `0600`).
   2. **If a non-empty Gemini API key is present -> Use Gemini Audio (`google-genai >= 2.30.1`)**:
      - Call `gemini-3.8-flash` (`GEMINI_AUDIO_MODEL`) via `client.interactions.create(..., generation_config={"thinking_level": GEMINI_THINKING_LEVEL}, store=False)` (`low` or `medium` thinking) requesting JSON `{"vibe": "casual|polite|funny|serious|urgent|unclear", "transcript": "..."}` preserving verbatim English, Chinese, Malay, and Manglish code-switching.
      - Inject into `<untrusted_inbound_message>` (after `clean_untrusted()`) as:
        `[voice note | vibe: polite | transcript: "..."]`
-     - **Explicit Error Visibility (No Silent Masking)**: If a configured Gemini API key fails authentication or quota (HTTP 400/401/403/429), log the error clearly in `hermes-wa-receiver` and alert `MASTER_PHONE` so the owner knows their configured Gemini key needs attention rather than silently hiding a broken key.
+     - **Explicit Error Visibility (No Silent Masking)**: If a configured Gemini API key fails authentication or quota (HTTP 400/401/403/429), log the error clearly in `whatsapp-agent-receiver` and alert `MASTER_PHONE` so the owner knows their configured Gemini key needs attention rather than silently hiding a broken key.
   3. **Else (no Gemini API key configured — user skipped/ignored it) -> Use Local `faster-whisper` Out of the Box**:
      - Lazily initialize a process-wide thread-safe `faster_whisper.WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)` singleton (default `WHISPER_MODEL="base"`, `device="cpu"`, `compute_type="int8"`, decoded natively via bundled PyAV with zero external API keys required).
      - Run `model.transcribe(str(audio_path), beam_size=5, vad_filter=True)`.
@@ -88,13 +121,11 @@ messages (count=1):
        `[voice note | engine: faster-whisper | lang: {info.language} | transcript: "..."]`
      - If no speech is detected or average log-probability indicates garbled audio (`avg_logprob < -1.0`), mark `unclear`:
        `[voice note | engine: faster-whisper | quality: unclear | transcript: "(inaudible/muffled)"]`
-- Whenever a transcript is marked `unclear`, `prompt_template.txt` instructs the agent to ask the sender to type it out rather than guessing:
 
 ```python
 import base64
 import json
 import os
-import subprocess
 import threading
 from pathlib import Path
 
@@ -102,12 +133,12 @@ _whisper_lock = threading.Lock()
 _whisper_model = None
 
 
-def load_gemini_api_key() -> str | None:
+def load_vault_secret(cred_name: str, env_file_var: str, default_path: str) -> str | None:
     cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
     candidates: list[Path] = []
     if cred_dir:
-        candidates.append(Path(cred_dir) / "gemini_api_key")
-    vault_file = os.environ.get("GEMINI_API_KEY_FILE", "~/.hermes/vault/gemini_api_key")
+        candidates.append(Path(cred_dir) / cred_name)
+    vault_file = os.environ.get(env_file_var, default_path)
     candidates.append(Path(vault_file).expanduser())
 
     for path in candidates:
@@ -115,22 +146,15 @@ def load_gemini_api_key() -> str | None:
             key = path.read_text(encoding="utf-8").strip()
             if key:
                 return key
-
-    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if env_key.startswith("hv:"):
-        proc = subprocess.run(
-            ["hermes", "hvault", "get", env_key.removeprefix("hv:")],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout.strip()
-    elif env_key:
-        return env_key
-
     return None
+
+
+def load_gemini_api_key() -> str | None:
+    return load_vault_secret(
+        "gemini_api_key",
+        "GEMINI_API_KEY_FILE",
+        "~/.whatsapp-agent/vault/gemini_api_key",
+    )
 
 
 def transcribe_with_gemini(audio_path: Path, mime_type: str, api_key: str) -> str:
@@ -200,16 +224,16 @@ def transcribe_with_faster_whisper(audio_path: Path) -> str:
 
 ## 5. Output Parsing Order (`@@FLAG@@`, `NO_REPLY`, `===MSG===`, `sanitize_reply`)
 
-Process raw `stdout` in this exact deterministic order:
+Process raw AI reply text in this exact deterministic order:
 
-1. **Empty Check**: If `raw_stdout.strip() == ""`, treat as **`no-answer`** (process failure/timeout). Do **not** ledger in `handled.json` so `replay_orphans()` can retry.
+1. **Empty Check**: If `raw_output.strip() == ""`, treat as **`no-answer`** (process/API failure or timeout). Do **not** ledger in `handled.json` so `replay_orphans()` can retry.
 2. **Extract & Strip `@@FLAG@@` First**:
    ```python
    import re
 
    flags: list[str] = []
    kept_lines: list[str] = []
-   for line in raw_stdout.splitlines():
+   for line in raw_output.splitlines():
        m = re.match(r"^\s*@@FLAG@@\s*(.*)$", line)
        if m:
            flags.append(m.group(1).strip() or "Manual review requested")

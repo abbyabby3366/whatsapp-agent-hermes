@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { config, isLoopbackHost } from './config.js';
-import { postToHermes } from './hermes.js';
+import { postToWebhook } from './webhook.js';
 import { PRESENCE_VALUES, waClient, type PresenceValue } from './whatsapp.js';
 
 const app = express();
@@ -98,7 +98,7 @@ app.get('/api/usernames', (_req: Request, res: Response) => {
   res.json({ success: true, count: usernames.length, usernames });
 });
 
-// Send a message (used by Hermes for asynchronous replies, and by the dashboard form).
+// Send a message (used by the AI agent for asynchronous replies, and by the dashboard form).
 app.post('/api/send', async (req: Request, res: Response) => {
   const { to, message, pin, replyToMessageId } = req.body ?? {};
   if (!to || typeof message !== 'string' || !message.trim()) {
@@ -113,7 +113,7 @@ app.post('/api/send', async (req: Request, res: Response) => {
     pin: extractPin(pin),
     quotedMessageId: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
     inReplyTo: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
-    source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
+    source: req.headers['x-source'] === 'dashboard' ? 'api' : 'agent'
   });
   if (!result.success) {
     res.status(result.code).json({ success: false, error: result.error });
@@ -123,7 +123,7 @@ app.post('/api/send', async (req: Request, res: Response) => {
   res.json({ success: true, messageId: result.messageId, jid: result.jid, timestamp: new Date().toISOString() });
 });
 
-// Send an image (used by Hermes and external APIs).
+// Send an image (used by the AI agent and external APIs).
 app.post('/api/send-image', async (req: Request, res: Response) => {
   const { to, url, imageUrl, caption, pin, replyToMessageId } = req.body ?? {};
   const mediaUrl =
@@ -149,7 +149,7 @@ app.post('/api/send-image', async (req: Request, res: Response) => {
       pin: extractPin(pin),
       quotedMessageId: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
       inReplyTo: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
-      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
+      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'agent'
     }
   );
   if (!result.success) {
@@ -160,7 +160,7 @@ app.post('/api/send-image', async (req: Request, res: Response) => {
   res.json({ success: true, messageId: result.messageId, jid: result.jid, timestamp: new Date().toISOString() });
 });
 
-// Send a document (used by Hermes, dashboard, and external APIs).
+// Send a document (used by the AI agent, dashboard, and external APIs).
 app.post('/api/send-document', async (req: Request, res: Response) => {
   const { to, url, documentUrl, fileName, filename, mimetype, caption, pin, replyToMessageId } = req.body ?? {};
   const mediaUrl =
@@ -195,7 +195,7 @@ app.post('/api/send-document', async (req: Request, res: Response) => {
       caption: typeof caption === 'string' && caption.trim() ? caption.trim() : undefined,
       quotedMessageId: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
       inReplyTo: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
-      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
+      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'agent'
     }
   );
   if (!result.success) {
@@ -206,7 +206,7 @@ app.post('/api/send-document', async (req: Request, res: Response) => {
   res.json({ success: true, messageId: result.messageId, jid: result.jid, timestamp: new Date().toISOString() });
 });
 
-// Send a sticker (used by Hermes, dashboard, and external APIs).
+// Send a sticker (used by the AI agent, dashboard, and external APIs).
 app.post('/api/send-sticker', async (req: Request, res: Response) => {
   const { to, url, stickerUrl, sticker, pack, author, categories, isAnimated, pin, replyToMessageId } = req.body ?? {};
   const stickerData =
@@ -243,7 +243,7 @@ app.post('/api/send-sticker', async (req: Request, res: Response) => {
       isAnimated: typeof isAnimated === 'boolean' ? isAnimated : undefined,
       quotedMessageId: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
       inReplyTo: typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined,
-      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
+      source: req.headers['x-source'] === 'dashboard' ? 'api' : 'agent'
     }
   );
   if (!result.success) {
@@ -295,7 +295,7 @@ app.get('/api/media/:messageId', async (req: Request, res: Response) => {
   res.send(result.buffer);
 });
 
-// Pause / resume forwarding incoming messages to Hermes.
+// Pause / resume forwarding incoming messages to the AI agent.
 app.post('/api/forwarding', (req: Request, res: Response) => {
   if (typeof req.body?.enabled !== 'boolean') {
     res.status(400).json({ success: false, error: '"enabled" (true | false) is required' });
@@ -305,10 +305,10 @@ app.post('/api/forwarding', (req: Request, res: Response) => {
   res.json({ success: true, forwardingEnabled: req.body.enabled });
 });
 
-// Check that Hermes is reachable and accepts our token.
+// Check that the AI agent webhook receiver is reachable and accepts our token.
 app.post('/api/webhook/test', async (_req: Request, res: Response) => {
   if (!config.webhookUrl) {
-    res.status(400).json({ success: false, error: 'HERMES_WEBHOOK_URL is not set in .env' });
+    res.status(400).json({ success: false, error: 'AGENT_WEBHOOK_URL is not set in .env' });
     return;
   }
 
@@ -321,13 +321,13 @@ app.post('/api/webhook/test', async (_req: Request, res: Response) => {
     chatJid: '60120000000@s.whatsapp.net',
     remoteJid: '60120000000@s.whatsapp.net',
     isGroup: false,
-    message: 'Ping from WhatsApp Agent Hermes gateway',
+    message: 'Ping from WhatsApp AI Agent gateway',
     messageType: 'text',
     timestamp: new Date().toISOString()
   };
 
   try {
-    const result = await postToHermes(testPayload, { retries: 0, timeoutMs: 8000 });
+    const result = await postToWebhook(testPayload, { retries: 0, timeoutMs: 8000 });
     res.json({
       success: result.ok,
       status: result.status,
@@ -336,12 +336,12 @@ app.post('/api/webhook/test', async (_req: Request, res: Response) => {
       error: result.ok
         ? undefined
         : result.status === 401 || result.status === 403
-          ? `Hermes rejected the secret token (HTTP ${result.status}). Check HERMES_SECRET_TOKEN.`
-          : `Hermes answered HTTP ${result.status}`
+          ? `Webhook receiver rejected the secret token (HTTP ${result.status}). Check AGENT_SECRET_TOKEN.`
+          : `Webhook receiver answered HTTP ${result.status}`
     });
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    res.status(502).json({ success: false, error: `Could not reach Hermes at ${config.webhookUrl}: ${errMsg}` });
+    res.status(502).json({ success: false, error: `Could not reach webhook receiver at ${config.webhookUrl}: ${errMsg}` });
   }
 });
 
@@ -386,11 +386,11 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const server = app.listen(config.port, config.host, () => {
-  console.log(`[WhatsApp Agent Hermes] Dashboard: http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port}`);
-  console.log(`[WhatsApp Agent Hermes] Hermes webhook: ${config.webhookUrl || 'NOT SET (messages will not be forwarded)'}`);
+  console.log(`[WhatsApp AI Agent] Dashboard: http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port}`);
+  console.log(`[WhatsApp AI Agent] Agent webhook: ${config.webhookUrl || 'NOT SET (messages will not be forwarded)'}`);
   if (!isLoopbackHost(config.host) && !config.apiKey) {
     console.warn(
-      '[WhatsApp Agent Hermes] WARNING: listening on a public interface without GATEWAY_API_KEY. ' +
+      '[WhatsApp AI Agent] WARNING: listening on a public interface without GATEWAY_API_KEY. ' +
         'Anyone who can reach this port can send WhatsApp messages as you. Set GATEWAY_API_KEY in .env.'
     );
   }
@@ -400,15 +400,15 @@ const server = app.listen(config.port, config.host, () => {
 server.on('error', (err: NodeJS.ErrnoException) => {
   console.error(
     err.code === 'EADDRINUSE'
-      ? `[WhatsApp Agent Hermes] Port ${config.port} is already in use. Change PORT in .env or stop the other process.`
-      : `[WhatsApp Agent Hermes] Server error: ${err.message}`
+      ? `[WhatsApp AI Agent] Port ${config.port} is already in use. Change PORT in .env or stop the other process.`
+      : `[WhatsApp AI Agent] Server error: ${err.message}`
   );
   process.exit(1);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
-    console.log(`[WhatsApp Agent Hermes] ${signal} received, shutting down...`);
+    console.log(`[WhatsApp AI Agent] ${signal} received, shutting down...`);
     void waClient.shutdown().finally(() => server.close(() => process.exit(0)));
     setTimeout(() => process.exit(0), 3000).unref();
   });

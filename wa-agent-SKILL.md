@@ -1,22 +1,16 @@
 ---
-name: whatsapp-agent-hermes-gateway
-description: "Use when operating, diagnosing, configuring, or administering the WhatsApp Baileys gateway (`whatsapp-agent-hermes`) and Hermes webhook receiver (`hermes-wa-receiver`): pairing QR codes, checking service health/logs, managing per-contact briefs (`contacts.json`) and task/fact state (`flows.json` / `flow.py`), querying SQLite chat history (`wa_history.db` / `history.py`), toggling draft approval or per-contact pauses, sending outbound WhatsApp text/media/stickers to phone numbers, `@username` handles (with optional 4-digit PIN), or JIDs, resolving WhatsApp `@username`/LID-to-phone mappings, or troubleshooting Error 463, burst coalescing, and webhook delivery."
-version: 1.2.0
-author: Hermes Agent
+name: whatsapp-agent-gateway
+description: "Use when operating, diagnosing, configuring, or administering the WhatsApp Baileys gateway (`whatsapp-agent-gateway`) and AI webhook receiver (`whatsapp-agent-receiver`): pairing QR codes, checking service health/logs, managing per-contact briefs (`contacts.json`) and task/fact state (`flows.json` / `flow.py`), querying SQLite chat history (`wa_history.db` / `history.py`), toggling draft approval or per-contact pauses, sending outbound WhatsApp text/media/stickers to phone numbers, `@username` handles (with optional 4-digit PIN), or JIDs, resolving WhatsApp `@username`/LID-to-phone mappings, or troubleshooting Error 463, burst coalescing, AI brain configuration, and webhook delivery."
+version: 2.0.0
 license: MIT
-platforms: [linux]
-metadata:
-  hermes:
-    requires_toolsets: [terminal]
-    tags: [whatsapp, baileys, gateway, webhook, receiver, systemd, ops, messaging, username]
 ---
 
-# WhatsApp Agent Hermes — External Gateway + Hermes Receiver
+# WhatsApp AI Agent — External Gateway + AI Webhook Receiver
 
-This architecture decouples WhatsApp connectivity from the core Hermes process. WhatsApp sessions run inside an external Node/Express + Baileys gateway (`~/whatsapp-agent-hermes`), while Hermes operates as the reasoning backend through a dedicated webhook receiver (`~/whatsapp-hermes-receiver/receiver.py`).
+This architecture decouples WhatsApp connectivity from your AI agent runtime. WhatsApp sessions run inside an external Node/Express + Baileys gateway (`~/whatsapp-agent-gateway`), while an asynchronous Python webhook receiver (`~/whatsapp-agent-receiver/receiver.py`) orchestrates message coalescing, contact state, voice transcription, and AI replies using the **same AI provider as the host AI agent** (either via an authenticated host CLI or direct LLM HTTP API).
 
 **Key Architectural Invariants**:
-1. **Session Isolation**: Hermes never holds Baileys/WhatsApp credentials. The gateway owns session state and talks to Hermes strictly over authenticated loopback HTTP (`x-hermes-token` inbound, `x-api-key` outbound).
+1. **Session Isolation**: Your AI runtime never holds Baileys/WhatsApp credentials. The gateway owns session state and talks to the receiver strictly over authenticated loopback HTTP (`x-agent-token` inbound, `x-api-key` outbound).
 2. **Role & Context Separation**: Contact-facing turns do **not** load this DevOps `SKILL.md`. Instead, `receiver.py` injects the lean ghostwriter prompt (`assets/prompt_template.txt`) for external contacts and `assets/prompt_template_owner.txt` exclusively for verified 1:1 Master DMs.
 
 ## When to Use
@@ -26,13 +20,13 @@ Load and apply this skill whenever you need to:
 - Manage contact profiles (`contacts.json`), per-contact open items/facts (`flow.py` / `flows.json`), or search conversation history (`history.py` / `wa_history.db`).
 - Administer runtime controls (`approval on/off`, global `on/off`, `pause <number|@username> <duration>`, `resume <number|@username>`).
 - Send outbound WhatsApp text, images, documents, or stickers to phone numbers, `@username` handles (`@username` or `@username#1234` with 4-digit PIN), or JIDs via the gateway REST API (`/api/send*`, `/api/resolve`) or `wa_send.py`.
-- Implement, update, or debug `receiver.py`, prompt templates, `@username` & LID canonicalization, burst superseding, or WhatsApp Error 463 restrictions.
+- Implement, update, or debug `receiver.py`, AI brain provider settings (`BRAIN_MODE=api|cli`), prompt templates, `@username` & LID canonicalization, burst superseding, or WhatsApp Error 463 restrictions.
 
-For deep implementation schemas, subprocess contracts, systemd unit files, and Nginx tunnel configs, load the progressive-disclosure files in `SKILL_DIR`:
+For deep implementation schemas, AI brain contracts, systemd unit files, and Nginx tunnel configs, load the companion files in `SKILL_DIR`:
 - `SKILL_DIR/assets/prompt_template.txt` — Contact-facing first-person ghostwriter prompt.
 - `SKILL_DIR/assets/prompt_template_owner.txt` — Verified 1:1 Master DM operator prompt.
-- `SKILL_DIR/references/hermes-backend-contract.md` — Subprocess flags, XML untrusted-input wrapping, `@@FLAG@@`/`NO_REPLY` parser order, and `sanitize_reply()`.
-- `SKILL_DIR/references/deployment-and-env.md` — `systemd --user` units, Nginx + SSH tunnel setup, and full `receiver.env` tunables table.
+- `SKILL_DIR/references/receiver-backend-contract.md` — AI brain modes (`api` vs `cli`), XML untrusted-input wrapping, voice pipeline, `@@FLAG@@`/`NO_REPLY` parser order, and `sanitize_reply()`.
+- `SKILL_DIR/references/deployment-and-env.md` — `systemd --user` units, `~/.whatsapp-agent/vault/` secret vault, Nginx + SSH tunnel setup, and full `receiver.env` tunables table.
 - `SKILL_DIR/scripts/fetch-pairing-qr.sh` — Helper script to trigger `/api/connect` and export a fresh QR PNG.
 
 ---
@@ -41,15 +35,16 @@ For deep implementation schemas, subprocess contracts, systemd unit files, and N
 
 | Component | Path | Service (`systemd --user`) | Loopback Port |
 |---|---|---|---|
-| Gateway + Dashboard | `~/whatsapp-agent-hermes` | `whatsapp-agent-hermes.service` | `3100` |
-| Hermes Receiver | `~/whatsapp-hermes-receiver/` | `hermes-wa-receiver.service` | `5000` |
+| Gateway + Dashboard | `~/whatsapp-agent-gateway` | `whatsapp-agent-gateway.service` | `3100` |
+| AI Webhook Receiver | `~/whatsapp-agent-receiver/` | `whatsapp-agent-receiver.service` | `5000` |
+| Skills & Secret Vault | `~/.whatsapp-agent/` | *(symlinked into active host agent skills dir)* | — |
 
-### Receiver Working Files (`~/whatsapp-hermes-receiver/`)
-- `receiver.py`: Main webhook server, burst coalescer, and async worker dispatcher.
+### Receiver Working Files (`~/whatsapp-agent-receiver/`)
+- `receiver.py`: Main webhook server, burst coalescer, voice-note pipeline, and async AI worker dispatcher.
 - `history.py` + `wa_history.db`: SQLite conversation history store.
 - `handled.json`: Idempotency ledger of terminal message outcomes (`sent`, `silent`, `dry-run`).
-- `chat_map.json`: Canonical WhatsApp 15-digit LID (`...@lid`) <-> phone number <-> `@username` lookup map (gateway also persists `~/whatsapp-agent-hermes/data/usernames.json` from inbound messages, contacts sync, and USync lookups).
-- `sessions.json`: Canonical chat key -> active Hermes `session_id` mapping.
+- `chat_map.json`: Canonical WhatsApp 15-digit LID (`...@lid`) <-> phone number <-> `@username` lookup map (gateway also persists `~/whatsapp-agent-gateway/data/usernames.json` from inbound messages, contacts sync, and USync lookups).
+- `sessions.json`: Canonical chat key -> active conversation/session state mapping.
 - `state.json`: Persisted runtime toggles (approval mode, global on/off, per-contact pause timers).
 - `contacts.json`: Per-contact briefs, personas, notes, and `auto_reply` toggles (hot-reloaded per turn).
 - `prompt_template.txt`: Live contact ghostwriter brief (seeded from `SKILL_DIR/assets/prompt_template.txt`, hot-reloaded per turn).
@@ -57,12 +52,17 @@ For deep implementation schemas, subprocess contracts, systemd unit files, and N
 - `outbox.py` + `outbox.json`: Ledger of outbound escalations/drafts so Master quote-replies resolve back to the target contact `chatJid`.
 - `flow.py` + `flows.json`: Per-contact operational state (`open` items, `facts`, timestamped `events`).
 - `media/`: Local cache directory for inbound and outbound media.
-- `~/.hermes/skills/skill-crafter/SKILL.md` + `~/.hermes/skills/whatsapp-agent-rules/SKILL.md`: Companion single-file global meta-skill (`skill-crafter`) and reinstall-safe user-owned rules skill (`whatsapp-agent-rules`). Whenever the owner teaches or updates how to operate or reply with WhatsApp, `skill-crafter` merges it into `whatsapp-agent-rules/SKILL.md` (single `.md` file, zero subfolders, trivial 1-file export). `receiver.py` hot-loads Section 2 + only the matching contact's `###` block from Section 3 on contact turns while keeping Section 1 owner-only.
+- `~/.whatsapp-agent/skills/skill-crafter/SKILL.md` + `~/.whatsapp-agent/skills/whatsapp-agent-rules/SKILL.md`: Companion single-file global meta-skill (`skill-crafter`) and reinstall-safe user-owned rules skill (`whatsapp-agent-rules`), symlinked into whichever skill directory the host AI agent reads (`~/.agents/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, etc.). Whenever the owner teaches or updates how to operate or reply with WhatsApp, `skill-crafter` merges it into `whatsapp-agent-rules/SKILL.md` (single `.md` file, zero subfolders, trivial 1-file export). `receiver.py` hot-loads Section 2 + only the matching contact's `###` block from Section 3 on contact turns while keeping Section 1 owner-only.
 
-### Configuration & Loopback Auth
-- **Gateway `.env`**: `PORT=3100`, `HOST=127.0.0.1`, `GATEWAY_API_KEY=<48-hex-secret>`, `HERMES_WEBHOOK_URL=http://127.0.0.1:5000/api/webhook`, `HERMES_SECRET_TOKEN=<48-hex-secret>`, `TIMEZONE=Asia/Kuala_Lumpur`.
-- **Receiver `receiver.env` & Secret Vault**: Shared `HERMES_SECRET_TOKEN` and `GATEWAY_API_KEY`, `WHATSAPP_GATEWAY_URL=http://127.0.0.1:3100`, `MASTER_PHONE=<digits>` (alias: `OWNER_WHATSAPP`), optional `MASTER_LID=<15-digit-lid>`, `MASTER_NAME=<name>`, `GEMINI_API_KEY_FILE=~/.hermes/vault/gemini_api_key` (optional — raw Gemini API key lives in the restricted secret vault `~/.hermes/vault/` `0700`/`0600` + `hermes hvault` / `systemd-creds`, never in plaintext `.env`), and `WHISPER_MODEL=base` (local `faster-whisper` default when no Gemini key is stored in the vault).
-- **Mandatory `GATEWAY_API_KEY` (Even on `127.0.0.1`)**: Never leave `GATEWAY_API_KEY` blank. Because external contacts run with `AGENT_TOOLSETS=web,vision`, requiring `x-api-key` on all non-health `/api/*` endpoints prevents prompt-injected SSRF requests from reading `/api/status` (which contains recent messages across all chats) or calling `/api/send` / `/api/logout`.
+### Configuration, AI Brain & Loopback Auth
+- **Gateway `.env`**: `PORT=3100`, `HOST=127.0.0.1`, `GATEWAY_API_KEY=<48-hex-secret>`, `AGENT_WEBHOOK_URL=http://127.0.0.1:5000/api/webhook`, `AGENT_SECRET_TOKEN=<48-hex-secret>`, `TIMEZONE=Asia/Kuala_Lumpur`.
+- **Receiver `receiver.env` & Secret Vault (`~/.whatsapp-agent/vault/`)**:
+  - Shared `AGENT_SECRET_TOKEN` and `GATEWAY_API_KEY`, `WHATSAPP_GATEWAY_URL=http://127.0.0.1:3100`, `MASTER_PHONE=<digits>` (alias: `OWNER_WHATSAPP`), optional `MASTER_LID=<15-digit-lid>`, `MASTER_NAME=<name>`.
+  - **AI Brain (`BRAIN_MODE=api` or `BRAIN_MODE=cli`)**: Uses the **same AI provider as the host AI agent** (verified by a live test call before starting the service — never left unconfigured):
+    - `BRAIN_MODE=api`: `LLM_PROVIDER=openai|anthropic|gemini`, `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY_FILE=~/.whatsapp-agent/vault/llm_api_key` (`0600`).
+    - `BRAIN_MODE=cli`: `AGENT_CLI_TYPE=claude|codex|gemini|custom` and `AGENT_CLI_BIN=/abs/path/to/cli`.
+  - **Voice Transcription**: `GEMINI_API_KEY_FILE=~/.whatsapp-agent/vault/gemini_api_key` (optional `0600` vault file — never raw in `.env`) and `WHISPER_MODEL=base` (local `faster-whisper` default when no Gemini key is stored in the vault).
+- **Mandatory `GATEWAY_API_KEY` (Even on `127.0.0.1`)**: Never leave `GATEWAY_API_KEY` blank. Requiring `x-api-key` on all non-health `/api/*` endpoints prevents prompt-injected SSRF requests from reading `/api/status` (which contains recent messages across all chats) or calling `/api/send` / `/api/logout`.
 - **Single Process Manager (`systemd --user`)**: Always run both services under `systemd --user` with lingering enabled (`loginctl enable-linger`). Never mix `pm2` and `systemd` on the same server.
 
 ---
@@ -71,28 +71,28 @@ For deep implementation schemas, subprocess contracts, systemd unit files, and N
 
 ```bash
 # Load GATEWAY_API_KEY for authenticated gateway calls
-export GATEWAY_API_KEY="$(grep -E '^GATEWAY_API_KEY=' ~/whatsapp-agent-hermes/.env | cut -d= -f2-)"
+export GATEWAY_API_KEY="$(grep -E '^GATEWAY_API_KEY=' ~/whatsapp-agent-gateway/.env | cut -d= -f2-)"
 
 # Service status and live logs
-systemctl --user status whatsapp-agent-hermes hermes-wa-receiver
-journalctl --user -u hermes-wa-receiver -f              # Live receiver decision log
-journalctl --user -u whatsapp-agent-hermes -f           # Live Baileys gateway log
+systemctl --user status whatsapp-agent-gateway whatsapp-agent-receiver
+journalctl --user -u whatsapp-agent-receiver -f         # Live receiver & AI decision log
+journalctl --user -u whatsapp-agent-gateway -f          # Live Baileys gateway log
 
-# Restarts (prompt_template*.txt and contacts.json hot-reload without restart)
-systemctl --user restart hermes-wa-receiver             # Required after receiver.py edits
-systemctl --user restart whatsapp-agent-hermes          # Required after gateway TypeScript rebuild
+# Restarts (prompt_template*.txt, contacts.json, and vault keys hot-reload without restart)
+systemctl --user restart whatsapp-agent-receiver        # Required after receiver.py edits
+systemctl --user restart whatsapp-agent-gateway         # Required after gateway TypeScript rebuild
 
 # Health & end-to-end webhook checks
 curl -s http://127.0.0.1:3100/api/health                # Public liveness: {"success":true,"whatsapp":"connected",...}
-curl -s http://127.0.0.1:5000/health                    # Receiver health: {"ok":true,"turns_active":0}
+curl -s http://127.0.0.1:5000/health                    # Receiver health: {"ok":true,"brain_ready":true,"turns_active":0,...}
 curl -s -X POST http://127.0.0.1:3100/api/webhook/test \
   -H "x-api-key: $GATEWAY_API_KEY"                      # Authenticated gateway -> receiver ping
 
 # Export fresh pairing QR PNG (works via skill script or receiver copy)
-bash ~/.hermes/skills/whatsapp-agent-hermes-gateway/scripts/fetch-pairing-qr.sh /tmp/wa-qr.png
+bash ~/.whatsapp-agent/skills/whatsapp-agent-gateway/scripts/fetch-pairing-qr.sh /tmp/wa-qr.png
 
 # Updating gateway code
-cd ~/whatsapp-agent-hermes && git pull && npm install && npm run build && systemctl --user restart whatsapp-agent-hermes
+cd ~/whatsapp-agent-gateway && git pull && npm install && npm run build && systemctl --user restart whatsapp-agent-gateway
 ```
 
 ---
@@ -105,16 +105,16 @@ sequenceDiagram
     actor User as WhatsApp Contact
     participant GW as Gateway (:3100)
     participant Recv as Receiver (:5000)
-    participant Agent as Hermes Core
+    participant Brain as AI Provider (API / CLI)
     actor Master as Master Operator
 
     User->>GW: Inbound WhatsApp message
-    GW->>Recv: POST /api/webhook (x-hermes-token)
+    GW->>Recv: POST /api/webhook (x-agent-token)
     Recv-->>GW: HTTP 200 {"reply": null, "status": "processing"}
     Note over Recv: Coalesce burst (2.5s) & supersede any in-flight run
-    Note over Recv,Agent: Draft silently (NO /api/read yet, NO typing indicator)
-    Recv->>Agent: Run Hermes with XML-wrapped untrusted input + SQLite history
-    Agent-->>Recv: Raw output (optional @@FLAG@@ + reply chunks or NO_REPLY)
+    Note over Recv,Brain: Draft silently (NO /api/read yet, NO typing indicator)
+    Recv->>Brain: Invoke AI with XML-wrapped untrusted input + SQLite history
+    Brain-->>Recv: Raw output (optional @@FLAG@@ + reply chunks or NO_REPLY)
     Note over Recv: 1) Strip & send any @@FLAG@@ alert to MASTER_PHONE first
     alt Remaining body is NO_REPLY
         Note over Recv: Ledgered as "silent"; no /api/read, no send
@@ -140,18 +140,18 @@ sequenceDiagram
 - **Silent First Draft**: Never send `presence: "composing"` while generating the initial reply. Only show `"composing"` during the ~2s pause between split messages `2..N`.
 - **Bursts & Superseding**:
   1. Consecutive messages within `COALESCE_WINDOW_SECONDS` (`2.5s`) bundle into one turn.
-  2. If a new message arrives mid-generation for that chat, bump the chat's generation counter, kill the in-flight process group (`os.killpg`), discard its partial draft, and re-run once on the combined burst.
-  3. Cap parallel Hermes subprocesses with `MAX_CONCURRENT_RUNS` (`4`).
+  2. If a new message arrives mid-generation for that chat, bump the chat's generation counter, cancel/kill the in-flight run (`os.killpg` in CLI mode or cancel the in-flight HTTP request in API mode), discard its partial draft, and re-run once on the combined burst.
+  3. Cap parallel AI runs with `MAX_CONCURRENT_RUNS` (`4`).
 
 ---
 
 ## Media & Voice Note Handling
 
 - **Gateway Media Cache**: The gateway caches raw messages in memory for the last `300` messages. Download media immediately on webhook arrival via `GET /api/media/<messageId>` (with `x-api-key`). Never abort a turn if media download fails — note `[media download failed]` in context so the agent can ask the sender to resend.
-- **Images**: Saved into `media/` and passed to Hermes via `--image <path>`.
+- **Images**: Saved into `media/` and passed to the AI provider as a vision attachment (base64 image block in `api` mode, or image path flag in `cli` mode).
 - **Audio / Voice Notes (Gemini Audio via Secret Vault -> Local `faster-whisper` Out of the Box)**:
   - **Engine Selection (Hot-Reloaded per Voice Note)**:
-    1. **Gemini Audio (when a Gemini API key is present in the secret vault — `$CREDENTIALS_DIRECTORY/gemini_api_key`, `GEMINI_API_KEY_FILE` `~/.hermes/vault/gemini_api_key`, or `hermes hvault`)**: Pass the `.ogg` / audio file to **Gemini Audio** (`gemini-3.8-flash` with `low` or `medium` `thinking_level`, `store=False`) to extract both an accurate multilingual/Manglish transcript and vocal vibe (`[voice note | vibe: polite/casual/urgent/unclear | transcript: "..."]`). Never pass the Gemini API key into child `hermes chat -Q` subprocess environments, and if a configured Gemini key fails authentication or quota, log the error clearly and alert `MASTER_PHONE` rather than silently masking the broken key.
+    1. **Gemini Audio (when a Gemini API key is present in `~/.whatsapp-agent/vault/gemini_api_key` or `$CREDENTIALS_DIRECTORY/gemini_api_key`)**: Pass the `.ogg` / audio file to **Gemini Audio** (`gemini-3.8-flash` with `low` or `medium` `thinking_level`, `store=False`) to extract both an accurate multilingual/Manglish transcript and vocal vibe (`[voice note | vibe: polite/casual/urgent/unclear | transcript: "..."]`). Never pass secret vault keys into external-contact subprocess environments, and if a configured Gemini key fails authentication or quota, log the error clearly and alert `MASTER_PHONE` rather than silently masking the broken key.
     2. **Local `faster-whisper` (default when no Gemini API key is configured)**: Transcribe locally out of the box using `faster-whisper` (`WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)` — default `base`, `int8` CPU, `vad_filter=True`, lazy singleton, zero external API keys needed) and inject `[voice note | engine: faster-whisper | lang: <code> | transcript: "..."]` (or mark `unclear` when speech is absent/muffled).
   - If the audio is noisy or `unclear` on critical details (prices, dates, names), the agent must ask naturally (*"Sorry, your voice note broke up a bit, mind typing that out?"*) rather than guessing.
 
@@ -164,9 +164,9 @@ sequenceDiagram
 | `sent` | Reply successfully dispatched via `/api/send` | **Yes** | None |
 | `silent` | Agent emitted explicit `NO_REPLY` (after stripping `@@FLAG@@`) | **Yes** | None |
 | `dry-run` | `DRY_RUN=true` testing mode | **Yes** | None |
-| `no-answer` | Subprocess crashed, timed out, or returned empty stdout | **No** | Retried via `replay_orphans()` |
+| `no-answer` | AI call failed, returned HTTP 401/402/429/5xx, timed out, or returned empty output | **No** | Retried via `replay_orphans()` |
 | `send-failed` | `/api/send` failed after retries (e.g., HTTP 503 disconnect) | **No** | Retried + alert to `MASTER_PHONE` |
-| `superseded` | Killed and replaced by newer message in burst | **No** | Consolidated into next turn |
+| `superseded` | Cancelled and replaced by newer message in burst | **No** | Consolidated into next turn |
 
 - **Parser Order Invariant (`@@FLAG@@` Before `NO_REPLY`)**: Always extract and strip `@@FLAG@@ <summary>` lines **first** and forward those alerts to `MASTER_PHONE`. Only **after** stripping `@@FLAG@@` lines, check whether the remaining trimmed output equals `NO_REPLY` (or empty when a flag was present). Never send literal `"NO_REPLY"` to a contact.
 - **Startup Replay (`replay_orphans`)**: Unledgered inbound messages younger than `REPLAY_MAX_AGE_MIN` (evaluated via numeric `rawTimestamp` epoch seconds) are replayed on receiver startup.
@@ -179,9 +179,9 @@ sequenceDiagram
 - Persists `chat_key`, `message_id` (`out:<inbound_id>` for outbound), `direction` (`in`/`out`), `sender_name`, `sender_number`, `body`, `wa_timestamp` (ISO 8601), and `stored_at`.
 - Injects the last `HISTORY_LIMIT` (`30`) turns as read-only prior context formatted in `DD-MM-YY HH:MM` (`GMT+8`).
 ```bash
-python3 ~/whatsapp-hermes-receiver/history.py stats | chats
-python3 ~/whatsapp-hermes-receiver/history.py recent <chat_key> 30
-python3 ~/whatsapp-hermes-receiver/history.py search "keyword"
+~/whatsapp-agent-receiver/.venv/bin/python ~/whatsapp-agent-receiver/history.py stats | chats
+~/whatsapp-agent-receiver/.venv/bin/python ~/whatsapp-agent-receiver/history.py recent <chat_key> 30
+~/whatsapp-agent-receiver/.venv/bin/python ~/whatsapp-agent-receiver/history.py search "keyword"
 ```
 
 ### 2. Per-Contact Flow Store (`flow.py` / `flows.json`)
@@ -197,9 +197,9 @@ Tracks durable pending tasks, verified facts, and full ISO-timestamped milestone
 }
 ```
 ```bash
-python3 ~/whatsapp-hermes-receiver/flow.py contacts | show <key>
-python3 ~/whatsapp-hermes-receiver/flow.py open <key> "item" | close <key> "item"
-python3 ~/whatsapp-hermes-receiver/flow.py fact <key> "fact" | event <key> "event"
+~/whatsapp-agent-receiver/.venv/bin/python ~/whatsapp-agent-receiver/flow.py contacts | show <key>
+~/whatsapp-agent-receiver/.venv/bin/python ~/whatsapp-agent-receiver/flow.py open <key> "item" | close <key> "item"
+~/whatsapp-agent-receiver/.venv/bin/python ~/whatsapp-agent-receiver/flow.py fact <key> "fact" | event <key> "event"
 ```
 
 ### 3. Contact Profiles & Notes (`contacts.json`)
@@ -225,7 +225,7 @@ Hot-reloaded per turn to customize persona, relationship context, `@username` ha
 
 ## Contact Ghostwriter Rules Summary (`assets/prompt_template.txt`)
 
-When editing `~/whatsapp-hermes-receiver/prompt_template.txt`, preserve these core behavioral rules:
+When editing `~/whatsapp-agent-receiver/prompt_template.txt`, preserve these core behavioral rules:
 
 1. **First-Person Principal**: Speak strictly as `${MASTER_NAME}` ("I", "me", "my"). Never say *"I will check with `${MASTER_NAME}`"*. Use first-person holding lines (*"Give me a moment to verify that and get back to you."*) + `@@FLAG@@`.
 2. **WhatsApp-Native Formatting Only**:
@@ -251,18 +251,18 @@ When editing `~/whatsapp-hermes-receiver/prompt_template.txt`, preserve these co
 ## Security Boundaries, Draft Approval & Master Authority
 
 ### Untrusted Contact Sandbox & Anti-Injection
-- **Restricted Toolset**: External contacts run strictly with `AGENT_TOOLSETS=web,vision` (no terminal, no file write, no memory/config mutation).
+- **Restricted Sandbox**: External contacts run strictly with zero shell/terminal or file-write capabilities.
 - **XML Data Delimiters**: Strip `===MSG===` and `@@FLAG@@` from inbound contact strings (`senderName`, `quoted`, `message`) and wrap all inbound contact content inside `<untrusted_inbound_message>...</untrusted_inbound_message>` so contacts cannot spoof `[Known: ...]` operator tags or system rules.
 - **Safety Quotas**: Max **25 replies/person/day** (`DAILY_REPLY_LIMIT_PER_PERSON`) and **60 replies/hour globally** (`HOURLY_GLOBAL_REPLY_LIMIT`). Group messages without `@mention` or quote-reply to the linked account are ignored.
 
 ### Master 1:1 DM Authority & Phone Commands
-- **Strict 1:1 DM Gate (`isGroup == false`)**: Elevated Master mode (`AGENT_TOOLSETS_OWNER=terminal,file,web,vision` + `prompt_template_owner.txt` + administrative commands) activates **only** when `isGroup == false` AND the sender matches `MASTER_PHONE` or verified `MASTER_LID`. In group chats, even messages sent by `MASTER_PHONE` run under standard non-privileged group rules so internal outputs never leak into shared groups.
+- **Strict 1:1 DM Gate (`isGroup == false`)**: Elevated Master mode (`prompt_template_owner.txt` + operator tools + administrative commands) activates **only** when `isGroup == false` AND the sender matches `MASTER_PHONE` or verified `MASTER_LID`. In group chats, even messages sent by `MASTER_PHONE` run under standard non-privileged group rules so internal outputs never leak into shared groups.
 - **Phone Admin Commands** (case-insensitive in 1:1 Master DM):
-  - `status` — Health, active sessions, approval mode, paused contacts, quota counters.
-  - `on` / `off` — Enable or disable automated contact replies globally.
-  - `pause <number|@username> <duration>` / `resume <number|@username>` — Pause (e.g., `4h`, `30m`, `1d`) or resume auto-replies for a contact.
-  - `approval on` / `approval off` — Toggle Draft Approval testing mode.
-  - `SEND` / `SKIP` / **Quote-Reply with custom text** — Approve, drop, or replace a held `[DRAFT APPROVAL]` message.
+   - `status` — Health, active brain provider, approval mode, paused contacts, quota counters.
+   - `on` / `off` — Enable or disable automated contact replies globally.
+   - `pause <number|@username> <duration>` / `resume <number|@username>` — Pause (e.g., `4h`, `30m`, `1d`) or resume auto-replies for a contact.
+   - `approval on` / `approval off` — Toggle Draft Approval testing mode.
+   - `SEND` / `SKIP` / **Quote-Reply with custom text** — Approve, drop, or replace a held `[DRAFT APPROVAL]` message.
 
 ---
 
@@ -304,7 +304,7 @@ Serve local HTTP media over HTTP/1.1 with valid `Content-Length` headers (`media
 ## Operational Pitfalls
 
 1. **WhatsApp Error 463 (Cold Outreach Restriction)**: Baileys cannot initiate cold 1:1 chats (whether by phone number or `@username` -> `@lid`) without a privacy `tctoken`. Never auto-retry Error 463 sends in a loop (worsens account restrictions); initiate first contact manually from the primary phone or `wa.me/<number>`.
-2. **Stdout vs. Stderr Split**: `hermes chat -Q` writes reply text to `stdout` and `session_id: <id>` to `stderr`. Never parse `stdout` for session IDs.
+2. **Hosted Sandbox Proxy Trap (HTTP 401/402/403)**: Never point `receiver.py` at an unverified sandbox LLM proxy URL without a live completion smoke test first. Always verify `"brain_ready": true` on `/health`.
 3. **LID & `@username` vs. Phone Thread Splitting**: WhatsApp Web / privacy users often appear as `15-digit@lid` with `sender: null` (and optional `senderUsername`). Always canonicalize through `chat_map.json` (indexing LID, phone digits, and lowercase `senderUsername`) before looking up `sessions.json`, `flows.json`, or `contacts.json`, and reply to `chatJid`.
 4. **Disconnection 503s**: Sending during a brief Baileys reconnect returns HTTP 503. Retry with backoff (up to 6 attempts); if still down, leave unledgered for `replay_orphans()` and alert `MASTER_PHONE` once reconnected.
 5. **QR Code Rotation**: Pairing QR codes expire every ~60s. Always run `scripts/fetch-pairing-qr.sh` (which triggers `/api/connect` first) rather than reading stale cached screenshots.
@@ -314,7 +314,7 @@ Serve local HTTP media over HTTP/1.1 with valid `Content-Length` headers (`media
 ## Verification Checklist
 
 1. `curl -s http://127.0.0.1:3100/api/health` -> `"success": true`, `"whatsapp": "connected"`.
-2. `curl -s http://127.0.0.1:5000/health` -> `"ok": true`, `"turns_active": 0`.
+2. `curl -s http://127.0.0.1:5000/health` -> `"ok": true`, `"brain_ready": true`, `"turns_active": 0`.
 3. `curl -s -X POST http://127.0.0.1:3100/api/webhook/test -H "x-api-key: $GATEWAY_API_KEY"` -> `"success": true`, `"status": 200`.
 4. **Unauthenticated API Block Check**: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3100/api/status` -> returns `401` (verifying `GATEWAY_API_KEY` blocks local SSRF).
-5. **Burst & Supersede Check**: Send 3 rapid messages within 2s from a test contact -> verify `journalctl --user -u hermes-wa-receiver` coalesces/supersedes into a single turn with `*bold*` WhatsApp-native formatting and zero premature blue ticks.
+5. **Burst & Supersede Check**: Send 3 rapid messages within 2s from a test contact -> verify `journalctl --user -u whatsapp-agent-receiver` coalesces/supersedes into a single turn with `*bold*` WhatsApp-native formatting and zero premature blue ticks.

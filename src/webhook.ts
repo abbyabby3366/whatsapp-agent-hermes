@@ -1,34 +1,34 @@
 import { config } from './config.js';
 
-export interface HermesResult {
+export interface WebhookResult {
   ok: boolean;
   status: number;
   latencyMs: number;
   attempts: number;
   bodyText: string;
-  /** Parsed JSON body, or null when Hermes answered with something that is not a JSON object. */
+  /** Parsed JSON body, or null when the webhook receiver answered with something that is not a JSON object. */
   json: Record<string, unknown> | null;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * POSTs a payload to the Hermes webhook. Network errors, timeouts, HTTP 429 and 5xx are retried
+ * POSTs a payload to the AI agent webhook. Network errors, timeouts, HTTP 429 and 5xx are retried
  * with a short back-off; other 4xx responses are returned immediately. Throws if every attempt
  * failed at the network level.
  */
-export async function postToHermes(
+export async function postToWebhook(
   payload: unknown,
   opts: { retries?: number; timeoutMs?: number } = {}
-): Promise<HermesResult> {
+): Promise<WebhookResult> {
   if (!config.webhookUrl) {
-    throw new Error('HERMES_WEBHOOK_URL is not configured');
+    throw new Error('AGENT_WEBHOOK_URL is not configured');
   }
 
   const retries = opts.retries ?? config.webhookRetries;
   const timeoutMs = opts.timeoutMs ?? config.webhookTimeoutMs;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (config.webhookToken) headers['x-hermes-token'] = config.webhookToken;
+  if (config.webhookToken) headers['x-agent-token'] = config.webhookToken;
   const body = JSON.stringify(payload);
 
   let lastError: unknown = null;
@@ -39,7 +39,7 @@ export async function postToHermes(
     try {
       const res = await fetch(config.webhookUrl, { method: 'POST', headers, body, signal: controller.signal });
       const bodyText = await res.text();
-      const result: HermesResult = {
+      const result: WebhookResult = {
         ok: res.ok,
         status: res.status,
         latencyMs: Date.now() - started,

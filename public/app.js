@@ -136,12 +136,12 @@
 
   function render(state) {
     el.statReceived.textContent = state.stats.receivedCount;
-    el.statForwarded.textContent = state.stats.forwardedToHermesCount;
-    el.statReplies.textContent = state.stats.hermesRepliesCount;
+    el.statForwarded.textContent = state.stats.forwardedToAgentCount;
+    el.statReplies.textContent = state.stats.agentRepliesCount;
     el.statSent.textContent = state.stats.sentCount;
 
     renderConnection(state);
-    renderHermes(state);
+    renderAgent(state);
     renderActivity(state.recentMessages || []);
   }
 
@@ -193,7 +193,7 @@
     }
   }
 
-  function renderHermes(state) {
+  function renderAgent(state) {
     const cfg = state.webhookConfig || {};
     const url = cfg.url || '';
     if (el.webhookUrl.textContent !== (url || 'Not configured')) {
@@ -203,7 +203,7 @@
     el.copyUrlBtn.hidden = !url;
     if (!el.testBtn.dataset.label) el.testBtn.disabled = !url;
     if (!url) {
-      el.webhookHint.textContent = 'Set HERMES_WEBHOOK_URL in .env and restart the gateway. Until then, messages are only shown here.';
+      el.webhookHint.textContent = 'Set AGENT_WEBHOOK_URL in .env and restart the gateway. Until then, messages are only shown here.';
     }
 
     // While a toggle request is in flight, keep the optimistic state instead of the server's old one.
@@ -222,12 +222,12 @@
   }
 
   const STATUS_TAGS = {
-    forwarded: ['tag-purple', 'Sent to Hermes', 'Waiting for Hermes to answer'],
-    processing: ['tag-info', 'Hermes is working', 'Hermes will reply later through the API'],
-    replied: ['tag-ok', 'Replied by Hermes', ''],
-    ignored: ['tag', 'No reply', 'Hermes chose not to answer'],
+    forwarded: ['tag-purple', 'Sent to agent', 'Waiting for the AI agent to answer'],
+    processing: ['tag-info', 'Agent is working', 'The AI agent will reply later through the API'],
+    replied: ['tag-ok', 'Replied by agent', ''],
+    ignored: ['tag', 'No reply', 'The AI agent chose not to answer'],
     failed: ['tag-error', 'Failed', ''],
-    disabled: ['tag-warn', 'Not forwarded', 'HERMES_WEBHOOK_URL is not set'],
+    disabled: ['tag-warn', 'Not forwarded', 'AGENT_WEBHOOK_URL is not set'],
     paused: ['tag-warn', 'Paused', 'Forwarding is switched off'],
     filtered: ['tag', 'Filtered', 'Blocked by ALLOWED_NUMBERS / FORWARD_GROUPS']
   };
@@ -255,8 +255,8 @@
         const title = m.webhookError || t[2];
         tag = '<span class="tag ' + t[0] + '"' + (title ? ' title="' + escapeHtml(title) + '"' : '') + '>' + t[1] + '</span>';
       }
-      const extra = m.hermesReply
-        ? '<span class="reply">&#8618; ' + escapeHtml(m.hermesReply) + '</span>'
+      const extra = m.agentReply
+        ? '<span class="reply">&#8618; ' + escapeHtml(m.agentReply) + '</span>'
         : (m.webhookError ? '<span class="tag-error">' + escapeHtml(m.webhookError) + '</span>' : '');
       return '<li>' +
         '<div class="who">' + who + '</div>' +
@@ -320,7 +320,7 @@
     try {
       const { data } = await api('/api/forwarding', { method: 'POST', body: { enabled: enabled } });
       if (!data.success) throw new Error(data.error || 'Request failed');
-      toast(enabled ? 'Messages are being forwarded to Hermes.' : 'Forwarding paused. Hermes will not receive new messages.');
+      toast(enabled ? 'Messages are being forwarded to the AI agent.' : 'Forwarding paused. The AI agent will not receive new messages.');
     } catch (err) {
       el.forwardSwitch.setAttribute('aria-checked', String(!enabled));
       toast('Could not change forwarding: ' + err.message, true);
@@ -336,9 +336,9 @@
     try {
       const { data } = await api('/api/webhook/test', { method: 'POST' });
       if (data.success) {
-        showResult(el.testResult, 'Hermes is reachable (HTTP ' + data.status + ', ' + data.latencyMs + ' ms).', true);
+        showResult(el.testResult, 'Webhook receiver is reachable (HTTP ' + data.status + ', ' + data.latencyMs + ' ms).', true);
       } else {
-        showResult(el.testResult, data.error || ('Hermes answered HTTP ' + data.status), false);
+        showResult(el.testResult, data.error || ('Webhook receiver answered HTTP ' + data.status), false);
       }
     } catch (err) {
       showResult(el.testResult, 'Test failed: ' + err.message, false);

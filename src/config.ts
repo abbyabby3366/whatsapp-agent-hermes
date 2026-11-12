@@ -21,19 +21,19 @@ const listFromEnv = (name: string): string[] =>
 
 export const config = {
   port: intFromEnv('PORT', 3100),
-  /** Loopback by default: Hermes runs on the same server, so nothing else needs to reach the gateway. */
+  /** Loopback by default: the AI agent receiver runs on the same server, so nothing else needs to reach the gateway. */
   host: process.env.HOST?.trim() || '127.0.0.1',
   sessionsDir: process.env.SESSIONS_DIR || './sessions',
   dataDir: process.env.DATA_DIR || './data',
   /** Optional key protecting /api/* (except /api/health). Send as "Authorization: Bearer <key>" or "x-api-key". */
   apiKey: process.env.GATEWAY_API_KEY?.trim() || '',
-  webhookUrl: process.env.HERMES_WEBHOOK_URL?.trim() || '',
-  webhookToken: process.env.HERMES_SECRET_TOKEN || '',
-  webhookTimeoutMs: intFromEnv('HERMES_WEBHOOK_TIMEOUT_MS', 15000),
-  webhookRetries: intFromEnv('HERMES_WEBHOOK_RETRIES', 2),
+  webhookUrl: process.env.AGENT_WEBHOOK_URL?.trim() || '',
+  webhookToken: process.env.AGENT_SECRET_TOKEN || '',
+  webhookTimeoutMs: intFromEnv('WEBHOOK_TIMEOUT_MS', 15000),
+  webhookRetries: intFromEnv('WEBHOOK_RETRIES', 2),
   /** Digits only. A number starting with 0 gets this country code instead (e.g. 60 for Malaysia). Empty disables. */
   defaultCountryCode: (process.env.DEFAULT_COUNTRY_CODE ?? '60').replace(/[^0-9]/g, ''),
-  /** Comma-separated phone numbers. When set, only these senders are forwarded to Hermes. */
+  /** Comma-separated phone numbers. When set, only these senders are forwarded to the AI agent. */
   allowedNumbers: listFromEnv('ALLOWED_NUMBERS'),
   forwardGroups: boolFromEnv('FORWARD_GROUPS', true),
   /** IANA timezone used for the timestamps shown in the dashboard and sent in the webhook. */

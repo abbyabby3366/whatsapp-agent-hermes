@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light dark">
-  <title>WhatsApp Agent for Hermes</title>
+  <title>WhatsApp AI Agent</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2325D366'/%3E%3Cpath d='M16 7a9 9 0 0 0-7.7 13.6L7 25l4.5-1.2A9 9 0 1 0 16 7z' fill='none' stroke='white' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
 </head>
@@ -18,8 +18,8 @@
           <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 0 0-7.7 13.6L3 21l4.5-1.2A9 9 0 1 0 12 3z"/></svg>
         </div>
         <div>
-          <h1>WhatsApp Agent for Hermes</h1>
-          <p>Receives your WhatsApp messages and lets Hermes decide whether to reply.</p>
+          <h1>WhatsApp AI Agent</h1>
+          <p>Receives your WhatsApp messages and lets your AI agent decide whether to reply.</p>
         </div>
       </div>
       <div id="statusPill" class="pill pill-muted" role="status" aria-live="polite">
@@ -35,8 +35,8 @@
     <main id="main">
       <section class="stats" aria-label="Message statistics">
         <div class="stat"><div id="statReceived" class="stat-num">0</div><div class="stat-label">Messages received</div></div>
-        <div class="stat"><div id="statForwarded" class="stat-num">0</div><div class="stat-label">Delivered to Hermes</div></div>
-        <div class="stat"><div id="statReplies" class="stat-num">0</div><div class="stat-label">Replies from Hermes</div></div>
+        <div class="stat"><div id="statForwarded" class="stat-num">0</div><div class="stat-label">Delivered to agent</div></div>
+        <div class="stat"><div id="statReplies" class="stat-num">0</div><div class="stat-label">Replies from agent</div></div>
         <div class="stat"><div id="statSent" class="stat-num">0</div><div class="stat-label">Messages sent</div></div>
       </section>
 
@@ -56,11 +56,11 @@
           </div>
         </section>
 
-        <!-- 2. Hermes webhook -->
-        <section class="card" aria-labelledby="hermesTitle">
+        <!-- 2. AI agent webhook -->
+        <section class="card" aria-labelledby="agentTitle">
           <div class="card-head">
             <span class="step" aria-hidden="true">2</span>
-            <h2 id="hermesTitle">Hermes agent</h2>
+            <h2 id="agentTitle">AI agent</h2>
           </div>
 
           <div class="field">
@@ -69,12 +69,12 @@
               <code id="webhookUrl" aria-labelledby="webhookLabel">—</code>
               <button id="copyUrlBtn" class="btn btn-small btn-ghost" type="button" hidden>Copy</button>
             </div>
-            <p class="hint" id="webhookHint">Every new WhatsApp message is sent here. Change it with <code>HERMES_WEBHOOK_URL</code> in <code>.env</code>.</p>
+            <p class="hint" id="webhookHint">Every new WhatsApp message is sent here. Change it with <code>AGENT_WEBHOOK_URL</code> in <code>.env</code>.</p>
           </div>
 
           <div class="switch-row">
             <div>
-              <div class="label" id="forwardLabel">Forward messages to Hermes</div>
+              <div class="label" id="forwardLabel">Forward messages to AI agent</div>
               <p class="hint" id="forwardHint">Turn off to pause the agent without disconnecting WhatsApp.</p>
             </div>
             <button id="forwardSwitch" class="switch" type="button" role="switch" aria-checked="true" aria-labelledby="forwardLabel" aria-describedby="forwardHint">
@@ -85,7 +85,7 @@
           <div id="filterInfo" class="hint" hidden></div>
 
           <div class="card-actions">
-            <button id="testBtn" class="btn btn-secondary" type="button">Test connection to Hermes</button>
+            <button id="testBtn" class="btn btn-secondary" type="button">Test connection to agent</button>
           </div>
           <div id="testResult" class="inline-result" role="status" aria-live="polite" hidden></div>
         </section>
@@ -177,11 +177,11 @@
             </div>
             <div class="field">
               <label class="label" for="stickerPackInput">Pack name (optional)</label>
-              <input id="stickerPackInput" name="stickerPack" type="text" placeholder="e.g. Hermes Pack">
+              <input id="stickerPackInput" name="stickerPack" type="text" placeholder="e.g. WhatsApp Agent Pack">
             </div>
             <div class="field">
               <label class="label" for="stickerAuthorInput">Author (optional)</label>
-              <input id="stickerAuthorInput" name="stickerAuthor" type="text" placeholder="e.g. Hermes Agent">
+              <input id="stickerAuthorInput" name="stickerAuthor" type="text" placeholder="e.g. WhatsApp AI Agent">
             </div>
           </div>
 
@@ -211,7 +211,7 @@
   <dialog id="logoutDialog" aria-labelledby="logoutTitle">
     <form method="dialog" class="dialog-body" id="logoutForm">
       <h3 id="logoutTitle">Log out of WhatsApp?</h3>
-      <p>This unlinks the phone from this server and deletes the saved session. Hermes will stop receiving messages until you scan a new QR code.</p>
+      <p>This unlinks the phone from this server and deletes the saved session. Your AI agent will stop receiving messages until you scan a new QR code.</p>
       <div class="dialog-actions">
         <button class="btn btn-secondary" value="cancel" id="logoutCancel">Cancel</button>
         <button class="btn btn-danger" value="confirm" id="logoutConfirm">Log out</button>
