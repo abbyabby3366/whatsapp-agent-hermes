@@ -42,7 +42,7 @@ npm run build && npm start
 | `WEBHOOK_TIMEOUT_MS` | `15000` | Wait time per webhook call |
 | `WEBHOOK_RETRIES` | `2` | Retries on network errors / HTTP 5xx |
 | `DEFAULT_COUNTRY_CODE` | `60` | Prefix for numbers starting with `0` |
-| `ALLOWED_NUMBERS` | *(empty)* | Comma-separated senders allowed to reach the AI agent |
+| `ALLOWED_NUMBERS` | *(empty)* | Comma-separated phone numbers and/or `@usernames` allowed to reach the AI agent (e.g. `60123456789, @alex_tan`) |
 | `FORWARD_GROUPS` | `true` | Forward group chats to the AI agent |
 | `TIMEZONE` | `Asia/Kuala_Lumpur` | Timezone of timestamps |
 | `SESSIONS_DIR` / `DATA_DIR` | `./sessions` / `./data` | WhatsApp credentials / dashboard settings |

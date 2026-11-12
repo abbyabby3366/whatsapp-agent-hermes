@@ -110,6 +110,12 @@ https://gateway.example.com -> Nginx (TLS) -> SSH Remote Tunnel (127.0.0.1:3101)
 
 ---
 
+### Gateway Sender Filter (`ALLOWED_NUMBERS` in `~/whatsapp-agent-gateway/.env`)
+
+Optional comma-separated list of phone numbers and/or WhatsApp `@usernames` (e.g. `ALLOWED_NUMBERS=60123456789, 0123456789, @alex_tan`). When set, only matching senders are forwarded to the receiver. Numbers starting with `0` get `DEFAULT_COUNTRY_CODE`. `@usernames` are matched case-insensitively against the sender's handle, which the gateway learns from contacts sync, group metadata, messages sent from the primary phone, or a short lookup for unknown `@lid` senders. Leave empty to forward everyone.
+
+---
+
 ## 4. Complete `receiver.env` Tunables
 
 | Variable | Default | Purpose |

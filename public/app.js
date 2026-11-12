@@ -215,7 +215,7 @@
     }
 
     const filters = [];
-    if (cfg.allowedNumbersCount > 0) filters.push('only ' + cfg.allowedNumbersCount + ' allowed number' + (cfg.allowedNumbersCount === 1 ? '' : 's'));
+    if (cfg.allowedNumbersCount > 0) filters.push('only ' + cfg.allowedNumbersCount + ' allowed sender' + (cfg.allowedNumbersCount === 1 ? '' : 's'));
     if (cfg.forwardGroups === false) filters.push('group chats are skipped');
     el.filterInfo.hidden = filters.length === 0;
     el.filterInfo.textContent = filters.length ? 'Filters from .env: ' + filters.join(', ') + '.' : '';
@@ -242,7 +242,9 @@
       let who, tag;
       if (m.fromMe) {
         who = '<span>To ' + escapeHtml(m.recipient) + '</span><span class="sub">from ' + escapeHtml(m.sender) + '</span>';
-        tag = '<span class="tag tag-info">Sent</span>';
+        tag = m.deliveryError
+          ? '<span class="tag tag-error" title="' + escapeHtml(m.deliveryError) + '">Failed</span>'
+          : '<span class="tag tag-info">Sent</span>';
       } else {
         const handleLabel = m.senderUsername ? ('@' + m.senderUsername) : '';
         const subParts = [];
@@ -257,7 +259,9 @@
       }
       const extra = m.agentReply
         ? '<span class="reply">&#8618; ' + escapeHtml(m.agentReply) + '</span>'
-        : (m.webhookError ? '<span class="tag-error">' + escapeHtml(m.webhookError) + '</span>' : '');
+        : (m.webhookError || m.deliveryError
+          ? '<span class="tag-error">' + escapeHtml(m.webhookError || m.deliveryError) + '</span>'
+          : '');
       return '<li>' +
         '<div class="who">' + who + '</div>' +
         '<div class="when">' + escapeHtml(m.timestamp) + '</div>' +

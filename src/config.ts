@@ -13,11 +13,38 @@ const boolFromEnv = (name: string, fallback: boolean): boolean => {
   return ['1', 'true', 'yes', 'on'].includes(raw);
 };
 
-const listFromEnv = (name: string): string[] =>
-  (process.env[name] ?? '')
-    .split(',')
-    .map((v) => v.replace(/[^0-9]/g, ''))
-    .filter(Boolean);
+/**
+ * Parses ALLOWED_NUMBERS: phone numbers become digits (a leading 0 gets DEFAULT_COUNTRY_CODE),
+ * while WhatsApp @username handles are kept as lowercase "@handle" (including handles with digits, e.g. @john99).
+ * Entries containing letters are treated as handles even without the leading "@". Unusable entries are reported.
+ */
+const allowedSendersFromEnv = (name: string, defaultCountryCode: string): string[] => {
+  const parsed: string[] = [];
+  for (const rawEntry of (process.env[name] ?? '').split(',')) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    if (entry.startsWith('@') || /[a-z]/i.test(entry)) {
+      const handle = entry.replace(/^@+/, '').toLowerCase();
+      if (/^[a-z0-9._]{3,35}$/.test(handle) && /[a-z]/.test(handle)) {
+        parsed.push(`@${handle}`);
+        continue;
+      }
+    } else {
+      let digits = entry.replace(/[^0-9]/g, '');
+      if (digits.startsWith('0') && defaultCountryCode) {
+        digits = defaultCountryCode + digits.substring(1);
+      }
+      if (digits.length >= 8 && digits.length <= 15) {
+        parsed.push(digits);
+        continue;
+      }
+    }
+    console.warn(`[Config] Ignoring invalid ${name} entry "${entry}" (use a phone number like 60123456789 or a @username).`);
+  }
+  return parsed;
+};
+
+const defaultCountryCode = (process.env.DEFAULT_COUNTRY_CODE ?? '60').replace(/[^0-9]/g, '');
 
 export const config = {
   port: intFromEnv('PORT', 3100),
@@ -32,9 +59,12 @@ export const config = {
   webhookTimeoutMs: intFromEnv('WEBHOOK_TIMEOUT_MS', 15000),
   webhookRetries: intFromEnv('WEBHOOK_RETRIES', 2),
   /** Digits only. A number starting with 0 gets this country code instead (e.g. 60 for Malaysia). Empty disables. */
-  defaultCountryCode: (process.env.DEFAULT_COUNTRY_CODE ?? '60').replace(/[^0-9]/g, ''),
-  /** Comma-separated phone numbers. When set, only these senders are forwarded to the AI agent. */
-  allowedNumbers: listFromEnv('ALLOWED_NUMBERS'),
+  defaultCountryCode,
+  /**
+   * Comma-separated phone numbers and/or @usernames (e.g. "60123456789, @alex_tan").
+   * When set, only these senders are forwarded to the AI agent.
+   */
+  allowedNumbers: allowedSendersFromEnv('ALLOWED_NUMBERS', defaultCountryCode),
   forwardGroups: boolFromEnv('FORWARD_GROUPS', true),
   /** IANA timezone used for the timestamps shown in the dashboard and sent in the webhook. */
   timezone: process.env.TIMEZONE?.trim() || 'Asia/Kuala_Lumpur'

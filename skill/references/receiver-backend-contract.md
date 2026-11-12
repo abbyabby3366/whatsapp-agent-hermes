@@ -14,6 +14,8 @@ Elevated owner privileges (`prompt_template_owner.txt` + shell/file operator too
    - Canonicalized `sender` digits match `MASTER_PHONE` (`OWNER_WHATSAPP`), **OR**
    - `senderJid` (stripped of `@lid`) matches `MASTER_LID` (or resolves to `MASTER_PHONE` in `chat_map.json`).
 
+`senderUsername` is filled from the message itself, from usernames the gateway learned earlier (contacts sync, group metadata, messages you sent from your phone), or from a short reverse lookup for an unknown `@lid` sender. It can still be `null` when WhatsApp exposes no handle, so never require it.
+
 Whenever an inbound payload carries `senderUsername` (normalized lowercase WhatsApp `@username` without `@`), persist the `@username <-> chatJid` (and `sender` phone digits if known) mapping in `chat_map.json` so outbound instructions to `@username` immediately map to the canonical thread key (`sessions.json`, `flows.json`, `contacts.json`). When `wa_send.py` or `receiver.py` dispatches to a `@username` not yet in `chat_map.json`, pass `"to": "@username"` (plus optional `"pin": "1234"` or `"@username#1234"`) directly to `/api/send*` (or pre-resolve via `GET /api/resolve?target=@username` with `x-api-key`) and store the returned `jid` in `chat_map.json`.
 
 All other turns (including every group turn) MUST run in the restricted external-contact sandbox (`prompt_template.txt`, zero shell/file-write tools), and outbound local loopback access (`127.0.0.1`, `localhost`, `[::1]`) remains protected by requiring `GATEWAY_API_KEY` on all gateway `/api/*` endpoints.
@@ -249,9 +251,10 @@ Process raw AI reply text in this exact deterministic order:
 4. **Sanitize & Convert Markdown to WhatsApp Formatting (`sanitize_reply`)**:
    ```python
    def sanitize_reply(text: str) -> str:
-       # Strip accidental routing header lines or bot labels (including stacked prefixes)
+       # Strip accidental routing header lines or bot labels (including stacked prefixes).
+       # Covers phone numbers, @username / @username#1234 handles, and raw WhatsApp JIDs.
        text = re.sub(
-           r"^(?:\s*(?:@@TO@@[^\n]*\n*|(?:To|Recipient):\s*\+?[0-9][^\n]*\n+|(?:Bot|AI|Assistant|Contact reply|Message):\s*))+",
+           r"^(?:\s*(?:@@TO@@[^\n]*\n*|(?:To|Recipient):\s*(?:@[A-Za-z0-9_.]{3,35}(?:#\d{4})?|\+?[0-9][^\n]*|[A-Za-z0-9_.:-]+@(?:lid|s\.whatsapp\.net|g\.us))\s*\n+|(?:Bot|AI|Assistant|Contact reply|Message|Reply):\s*))+",
            "",
            text,
            flags=re.I,
@@ -285,3 +288,27 @@ Process raw AI reply text in this exact deterministic order:
    - Call `POST /api/read { "messageId": inbound_id }` right before sending chunk 1.
    - Send chunk 1 immediately (`POST /api/send`, no prior typing indicator).
    - For chunks `2..N`: call `POST /api/presence { "recipient": chatJid, "presence": "composing" }`, sleep `SPLIT_MESSAGE_DELAY_SECONDS` (`2.0s`), call `POST /api/send`, then call `POST /api/presence { "recipient": chatJid, "presence": "paused" }`.
+
+---
+
+## 6. Canonical Contact Identity (Phone, `@username`, `@lid`)
+
+A contact can reach you as a phone number, a WhatsApp `@username`, or an opaque 15-digit `@lid`, and the same person can show up as more than one over time. Key every per-contact file (`sessions.json`, `flows.json`, `contacts.json`, pause timers, quotas) through `chat_map.json` so one person always maps to one thread:
+
+1. **Pick the canonical key in this order**: phone digits (when known) → `@username` → raw LID digits. Never store LID digits in a "phone" field.
+2. **Promote, never demote**: when a thread keyed by LID digits later reveals a `@username`, or a `@username` thread reveals a phone number, move the old key's history, flows, contact profile, pause timer, and quota counters to the new key and re-point every `chat_map.json` index (`byLid`, `byUsername`, `byJid`).
+3. **Usernames change**: if a known JID arrives with a different `senderUsername`, replace the old handle (the gateway already evicts stale handles from `data/usernames.json`).
+4. **Outbound lookups**: resolve `@username` / `@username#1234` via `chat_map.json` first, then `GET /api/usernames`, then pass it straight to `/api/send*` (or `GET /api/resolve`) and store the returned `jid`.
+
+### Gateway send results to handle
+
+| HTTP | Meaning | What to do |
+| --- | --- | --- |
+| `400` | Bad recipient or PIN format (PIN must be exactly 4 digits; JSON numbers like `412` are read as `"0412"`) | Fix the input; do not retry as-is |
+| `403` | `@username` needs a 4-digit PIN, or the PIN was wrong | Ask the owner for the PIN, retry once |
+| `404` | `@username` not found, or phone number not on WhatsApp | Report it; do not retry |
+| `429` | WhatsApp rate-limited username lookups | Back off before retrying |
+| `502` | WhatsApp rejected the message (Error `463` cold-outreach restriction, Error `479` stanza rejected) | Ledger as failed, alert the owner, never auto-retry |
+| `503` | Gateway not connected, or WhatsApp timed out | Retry later |
+
+The gateway waits briefly for WhatsApp's server acknowledgement before answering, so an immediate `463`/`479` rejection comes back as `502` instead of a false success. Late rejections are shown as **Failed** in the dashboard.
