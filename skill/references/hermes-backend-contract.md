@@ -125,11 +125,9 @@ Process raw `stdout` in this exact deterministic order:
        text = re.sub(r"https?://[^\s)>]+", _stash_url, text)
        # Convert Markdown **bold** -> WhatsApp *bold*
        text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text, flags=re.S)
-       # Fix internal spaces inside asterisks: * bold * -> *bold*
-       text = re.sub(r"\*\s+([^*\n]+?)\s+\*", r"*\1*", text)
        # Ensure boundary spaces around *bold* when touching alphanumeric or CJK characters
-       text = re.sub(r"([^\s*(\[\"'\u201c])\*([^\s*][^*\n]*?)\*", r"\1 *\2*", text)
-       text = re.sub(r"\*([^\s*][^*\n]*?)\*([^\s*.,!?:;)\]\"'\u201d])", r"*\1* \2", text)
+       text = re.sub(r"([^\s*(\[\"'\u201c])\*([^\s*](?:[^*\n]*?[^\s*])?)\*", r"\1 *\2*", text)
+       text = re.sub(r"\*([^\s*](?:[^*\n]*?[^\s*])?)\*([^\s*.,!?:;)\]\"'\u201d])", r"*\1* \2", text)
        # Convert Markdown headings (# Heading -> *Heading*)
        text = re.sub(r"(?m)^#{1,6}\s+(.+?)\s*$", r"*\1*", text)
        # Replace em/en dashes and space-flanked double hyphens with comma + space

@@ -94,9 +94,9 @@ interface ParsedContent {
 /**
  * Normalizes text formatting for WhatsApp:
  * 1. Converts standard Markdown **bold** to WhatsApp *bold*.
- * 2. Fixes internal whitespace inside asterisks (* text * -> *text*).
- * 3. Ensures space boundaries before opening * and after closing * when adjacent to alphanumeric/CJK characters,
+ * 2. Ensures space boundaries before opening * and after closing * when adjacent to alphanumeric/CJK characters,
  *    preventing WhatsApp from rendering raw asterisks (e.g. "be*bold*" -> "be *bold*", "字*粗体*" -> "字 *粗体*").
+ * 3. Preserves isolated multiplication/asterisk operators (e.g. "2 * 3 = 6") and URLs.
  */
 export function formatWhatsAppText(text: string): string {
   if (!text) return text;
@@ -111,14 +111,11 @@ export function formatWhatsAppText(text: string): string {
   // Convert Markdown **bold** to *bold*
   formatted = formatted.replace(/\*\*([^\n*]+?)\*\*/g, '*$1*');
 
-  // Fix internal spaces inside asterisks: * bold * -> *bold*
-  formatted = formatted.replace(/\*\s+([^\n*]+?)\s+\*/g, '*$1*');
-
   // Ensure leading space before opening * if preceded by alphanumeric/CJK letter/number
-  formatted = formatted.replace(/([\p{L}\p{N}])\*([^\s*][^*\n]*?)\*/gu, '$1 *$2*');
+  formatted = formatted.replace(/([\p{L}\p{N}])\*([^\s*](?:[^*\n]*?[^\s*])?)\*/gu, '$1 *$2*');
 
   // Ensure trailing space after closing * if followed by alphanumeric/CJK letter/number
-  formatted = formatted.replace(/\*([^\s*][^*\n]*?)\*([\p{L}\p{N}])/gu, '*$1* $2');
+  formatted = formatted.replace(/\*([^\s*](?:[^*\n]*?[^\s*])?)\*([\p{L}\p{N}])/gu, '*$1* $2');
 
   // Restore shielded URLs
   for (let i = 0; i < urls.length; i++) {
