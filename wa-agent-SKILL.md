@@ -57,6 +57,7 @@ For deep implementation schemas, subprocess contracts, systemd unit files, and N
 - `outbox.py` + `outbox.json`: Ledger of outbound escalations/drafts so Master quote-replies resolve back to the target contact `chatJid`.
 - `flow.py` + `flows.json`: Per-contact operational state (`open` items, `facts`, timestamped `events`).
 - `media/`: Local cache directory for inbound and outbound media.
+- `~/.hermes/skills/skill-crafter/SKILL.md` + `~/.hermes/skills/whatsapp-agent-rules/SKILL.md`: Companion single-file global meta-skill (`skill-crafter`) and reinstall-safe user-owned rules skill (`whatsapp-agent-rules`). Whenever the owner teaches or updates how to operate or reply with WhatsApp, `skill-crafter` merges it into `whatsapp-agent-rules/SKILL.md` (single `.md` file, zero subfolders, trivial 1-file export). `receiver.py` hot-loads Section 2 + only the matching contact's `###` block from Section 3 on contact turns while keeping Section 1 owner-only.
 
 ### Configuration & Loopback Auth
 - **Gateway `.env`**: `PORT=3100`, `HOST=127.0.0.1`, `GATEWAY_API_KEY=<48-hex-secret>`, `HERMES_WEBHOOK_URL=http://127.0.0.1:5000/api/webhook`, `HERMES_SECRET_TOKEN=<48-hex-secret>`, `TIMEZONE=Asia/Kuala_Lumpur`.

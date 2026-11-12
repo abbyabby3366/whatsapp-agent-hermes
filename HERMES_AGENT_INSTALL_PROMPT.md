@@ -50,13 +50,35 @@ Do NOT ask the human to edit `.env` files manually. Programmatically generate st
    - Same `HERMES_SECRET_TOKEN` and `GATEWAY_API_KEY`
    - `MASTER_PHONE=<from Step 0>`, `MASTER_LID=` (populate automatically once observed on first Master 1:1 DM), `MASTER_NAME=<from Step 0>`, `TIMEZONE=Asia/Kuala_Lumpur`
 
-### Step 5: Install the Hermes Skill & Seed Live Templates
-Install `wa-agent-SKILL.md` and its companion `assets/`, `references/`, and `scripts/` directories into Hermes's skill directory, and seed the live hot-reloadable templates into `~/whatsapp-hermes-receiver/`:
+### Step 5: Install the Hermes Skills & Seed Live Templates
+Install `wa-agent-SKILL.md` (with its companion `assets/`, `references/`, and `scripts/` directories) and the single-file `skill-crafter-SKILL.md` into Hermes's global skill directory, initialize the user-owned `whatsapp-agent-rules/SKILL.md` if not yet present (never overwrite existing learned rules), and seed the live hot-reloadable templates into `~/whatsapp-hermes-receiver/`:
 ```bash
-mkdir -p ~/.hermes/skills/whatsapp-agent-hermes-gateway ~/whatsapp-hermes-receiver/media
+mkdir -p ~/.hermes/skills/whatsapp-agent-hermes-gateway ~/.hermes/skills/skill-crafter ~/.hermes/skills/whatsapp-agent-rules ~/whatsapp-hermes-receiver/media
 cp ~/whatsapp-agent-hermes/wa-agent-SKILL.md ~/.hermes/skills/whatsapp-agent-hermes-gateway/SKILL.md
 cp -r ~/whatsapp-agent-hermes/skill/* ~/.hermes/skills/whatsapp-agent-hermes-gateway/
 chmod +x ~/.hermes/skills/whatsapp-agent-hermes-gateway/scripts/fetch-pairing-qr.sh
+
+# Install the single-file Skill Crafter meta-skill
+cp ~/whatsapp-agent-hermes/skill-crafter-SKILL.md ~/.hermes/skills/skill-crafter/SKILL.md
+
+# Seed the user-owned global WhatsApp rules skill ONLY if it does not exist yet (reinstall-safe)
+if [ ! -f ~/.hermes/skills/whatsapp-agent-rules/SKILL.md ]; then
+  cat > ~/.hermes/skills/whatsapp-agent-rules/SKILL.md <<'EOF'
+---
+name: whatsapp-agent-rules
+description: "Owner-defined global rules, workflows, reply preferences, business facts, and per-contact instructions for operating and replying with the WhatsApp agent. Load whenever using WhatsApp tools, managing contacts/escalations, or drafting WhatsApp messages."
+version: 1.0.0
+---
+
+# WhatsApp Agent — Learned Global Rules
+
+## 1. Operator & Outbound Workflow Rules (Owner-Only)
+
+## 2. Global Contact Reply Rules & Business Facts
+
+## 3. Contact-Specific Rules
+EOF
+fi
 
 # Seed live prompt templates (substitute ${MASTER_NAME} or interpolate dynamically per turn) and QR helper
 cp ~/whatsapp-agent-hermes/skill/assets/prompt_template.txt ~/whatsapp-hermes-receiver/prompt_template.txt
@@ -68,6 +90,7 @@ Read all installed skill files carefully before writing receiver code:
 - `~/.hermes/skills/whatsapp-agent-hermes-gateway/SKILL.md`
 - `~/.hermes/skills/whatsapp-agent-hermes-gateway/references/hermes-backend-contract.md`
 - `~/.hermes/skills/whatsapp-agent-hermes-gateway/references/deployment-and-env.md`
+- `~/.hermes/skills/skill-crafter/SKILL.md`
 
 ### Step 6: Run Gateway via `systemd --user` (Do NOT mix with `pm2`)
 Use `systemd --user` with user lingering enabled (`sudo loginctl enable-linger "$USER"`) as specified in `references/deployment-and-env.md` so all operational commands (`systemctl --user`, `journalctl --user`) work consistently:
@@ -117,7 +140,7 @@ Implement the receiver modules in `~/whatsapp-hermes-receiver/` (`receiver.py`, 
    - Production async path (standard) -> Immediately return HTTP 200 `{"reply": null, "status": "processing"}` and process in the background worker:
      - Coalesce rapid bursts (`2.5s` window) and supersede in-flight drafts on new arrivals.
      - **Do NOT** call `/api/read` or `presence: "composing"` while drafting the first reply.
-     - Enforce strict principal gating: `AGENT_TOOLSETS_OWNER` + `prompt_template_owner.txt` ONLY when `isGroup == false` AND sender matches `MASTER_PHONE` / `MASTER_LID`. Wrap untrusted contact messages in `<untrusted_inbound_message>` tags.
+     - Enforce strict principal gating: `AGENT_TOOLSETS_OWNER` + `prompt_template_owner.txt` ONLY when `isGroup == false` AND sender matches `MASTER_PHONE` / `MASTER_LID`. Wrap untrusted contact messages in `<untrusted_inbound_message>` tags, and hot-load Section 2 (plus only the matching contact's `###` block from Section 3) of `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` into `[Trusted Operator Context]` so owner-taught rules take effect live without exposing Section 1 or other contacts' notes.
      - Transcribe voice notes using **Gemini Audio** (`LOW` or `MEDIUM` thinking — never Whisper).
      - Strip and forward `@@FLAG@@` lines first, then evaluate `NO_REPLY`, then run `sanitize_reply()` (ensuring WhatsApp `*bold*`, never Markdown `**bold**`).
      - Right before dispatching an approved reply: call `POST /api/read {"messageId": messageId}`, send chunk 1 via `POST /api/send`, and for split chunks `2..N` (`===MSG===`) show `presence: "composing"` for `~2.0s` between chunks before pausing presence.

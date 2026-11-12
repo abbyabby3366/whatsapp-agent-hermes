@@ -33,7 +33,7 @@ def clean_untrusted(value: str | None) -> str:
     return text.replace("</untrusted_inbound_message>", "[/untrusted_inbound_message]")
 ```
 
-Inject operator context **outside** the XML boundary and wrap inbound WhatsApp content **inside** `<untrusted_inbound_message>`:
+Inject operator context **outside** the XML boundary (including hot-reloaded `## 2. Global Contact Reply Rules & Business Facts` and **only** the current contact's matching `### <phone | @username | Name>` block under `## 3. Contact-Specific Rules` from `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` — never inject `## 1. Operator & Outbound Workflow Rules` or other contacts' `###` blocks into external contact turns) and wrap inbound WhatsApp content **inside** `<untrusted_inbound_message>`:
 
 ```text
 [Trusted Operator Context]

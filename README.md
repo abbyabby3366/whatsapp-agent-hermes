@@ -121,4 +121,4 @@ curl -X POST http://127.0.0.1:3100/api/send \
   -d '{"to": "60123456789", "message": "Hello from Hermes!"}'
 ```
 
-See [HERMES_AGENT_INSTALL_PROMPT.md](HERMES_AGENT_INSTALL_PROMPT.md) for the complete prompt to set up Hermes, [wa-agent-SKILL.md](wa-agent-SKILL.md) (plus companion templates/references in [`skill/`](skill/)) for the operational Hermes skill, and [examples/hermes_agent_demo.ts](examples/hermes_agent_demo.ts) for a working Node.js demo receiver.
+See [HERMES_AGENT_INSTALL_PROMPT.md](HERMES_AGENT_INSTALL_PROMPT.md) for the complete prompt to set up Hermes, [wa-agent-SKILL.md](wa-agent-SKILL.md) (plus companion templates/references in [`skill/`](skill/)) for the operational Hermes skill, [skill-crafter-SKILL.md](skill-crafter-SKILL.md) for the single-file global skill-persistence meta-skill, and [examples/hermes_agent_demo.ts](examples/hermes_agent_demo.ts) for a working Node.js demo receiver.
