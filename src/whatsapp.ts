@@ -10,6 +10,14 @@ import makeWASocket, {
   jidNormalizedUser,
   isJidGroup,
   isLidUser,
+  isPnUser,
+  S_WHATSAPP_NET,
+  USyncQuery,
+  USyncUser,
+  getBinaryNodeChild,
+  getBinaryNodeChildren,
+  type BinaryNode,
+  type Contact,
   type WASocket,
   type ConnectionState,
   type WAMessage,
@@ -38,6 +46,7 @@ export interface RecentMessage {
   id: string;
   sender: string;
   senderName?: string;
+  senderUsername?: string;
   recipient: string;
   content: string;
   timestamp: string;
@@ -50,6 +59,36 @@ export interface RecentMessage {
   webhookError?: string;
   hermesReply?: string;
 }
+
+export interface UsernameDirectoryEntry {
+  /** Normalized lowercase WhatsApp username without leading "@". */
+  username: string;
+  /** Canonical WhatsApp JID resolved for this username (typically "...@lid" or "...@s.whatsapp.net"). */
+  jid: string;
+  /** Digits-only phone number if WhatsApp exposed it alongside the username. */
+  phoneNumber?: string;
+  /** Last observed contact/push name. */
+  name?: string;
+  /** ISO 8601 timestamp of when this mapping was recorded/refreshed. */
+  updatedAt: string;
+}
+
+export type RecipientErrorCode = 400 | 403 | 404 | 429 | 502 | 503;
+
+export type ResolveRecipientResult =
+  | {
+      success: true;
+      jid: string;
+      username?: string;
+      displayRecipient: string;
+      isGroup: boolean;
+      source: 'jid' | 'phone' | 'cache' | 'usync';
+    }
+  | {
+      success: false;
+      code: RecipientErrorCode;
+      error: string;
+    };
 
 export type WhatsAppConnectionStatus = 'disconnected' | 'connecting' | 'qr_ready' | 'connected';
 
@@ -77,8 +116,8 @@ export interface WhatsAppClientState {
 }
 
 export type SendResult =
-  | { success: true; messageId?: string }
-  | { success: false; error: string; code: 400 | 404 | 502 | 503 };
+  | { success: true; messageId?: string; jid?: string }
+  | { success: false; error: string; code: RecipientErrorCode };
 
 export const PRESENCE_VALUES = ['composing', 'paused', 'recording', 'available', 'unavailable'] as const;
 export type PresenceValue = (typeof PRESENCE_VALUES)[number];
@@ -138,10 +177,98 @@ const IGNORED_CONTENT_TYPES = new Set([
 
 const MAX_CACHED_MESSAGES = 300;
 
+type ParsedRecipientInput =
+  | { kind: 'jid'; jid: string }
+  | { kind: 'phone'; jid: string }
+  | { kind: 'username'; username: string; pin?: string }
+  | { kind: 'invalid'; error: string };
+
+/**
+ * Validates a normalized lowercase WhatsApp username (without leading "@").
+ * WhatsApp usernames are 3-35 chars of lowercase letters, digits, periods, and underscores,
+ * must contain at least one letter, and cannot start/end with "." or contain consecutive "..".
+ */
+export function isValidWhatsAppUsername(username: string): boolean {
+  if (!/^[a-z0-9._]{3,35}$/.test(username)) return false;
+  if (!/[a-z]/.test(username)) return false;
+  if (username.startsWith('.') || username.endsWith('.') || username.includes('..')) return false;
+  return true;
+}
+
+export function parseRecipientInput(recipient: string, explicitPin?: string): ParsedRecipientInput {
+  const trimmed = recipient.trim();
+  if (!trimmed) {
+    return { kind: 'invalid', error: 'Recipient is required.' };
+  }
+
+  // 1. Explicit WhatsApp JID (... @s.whatsapp.net | @g.us | @lid)
+  if (/^[^@\s]+@(s\.whatsapp\.net|g\.us|lid)$/i.test(trimmed)) {
+    return { kind: 'jid', jid: trimmed.toLowerCase() };
+  }
+
+  // Reject invalid mid-string "@" domains (e.g. email addresses)
+  if (trimmed.includes('@') && !trimmed.startsWith('@')) {
+    return {
+      kind: 'invalid',
+      error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789), a @username (e.g. @alex_tan), or a WhatsApp ID.'
+    };
+  }
+
+  // 2. @username (or bare handle containing letters), with optional "#1234" 4-digit PIN suffix
+  if (trimmed.startsWith('@') || /[a-zA-Z]/.test(trimmed)) {
+    const withoutAt = trimmed.replace(/^@+/, '');
+    const hashIdx = withoutAt.indexOf('#');
+    const handlePart = hashIdx === -1 ? withoutAt : withoutAt.slice(0, hashIdx);
+    const inlinePin = hashIdx === -1 ? undefined : withoutAt.slice(hashIdx + 1).trim();
+    const cleanExplicitPin = explicitPin?.trim() ? explicitPin.trim() : undefined;
+    const pin = cleanExplicitPin ?? (inlinePin ? inlinePin : undefined);
+
+    if (trimmed.startsWith('@') && /^\d+$/.test(handlePart)) {
+      return {
+        kind: 'invalid',
+        error: 'WhatsApp @usernames must contain at least one letter. For phone numbers, omit "@" (e.g. 60123456789).'
+      };
+    }
+
+    if (pin !== undefined && !/^\d{4}$/.test(pin)) {
+      return {
+        kind: 'invalid',
+        error: 'WhatsApp username PIN must be exactly 4 digits (e.g. "1234" or "@username#1234").'
+      };
+    }
+
+    const username = handlePart.toLowerCase();
+    if (!isValidWhatsAppUsername(username)) {
+      return {
+        kind: 'invalid',
+        error: 'Invalid WhatsApp @username. Usernames are 3-35 characters (letters, numbers, periods, underscores) and must include at least one letter.'
+      };
+    }
+
+    return { kind: 'username', username, pin };
+  }
+
+  // 3. Phone number (digits, optional country prefix or leading 0)
+  let digits = trimmed.replace(/[^0-9]/g, '');
+  if (digits.startsWith('0') && config.defaultCountryCode) {
+    digits = config.defaultCountryCode + digits.substring(1);
+  }
+  if (digits.length >= 8 && digits.length <= 15) {
+    return { kind: 'phone', jid: `${digits}@s.whatsapp.net` };
+  }
+
+  return {
+    kind: 'invalid',
+    error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789), a @username (e.g. @alex_tan), or a WhatsApp ID.'
+  };
+}
+
 export class WhatsAppClient {
   private sock: WASocket | null = null;
   private starting = false;
   private sessionDir: string;
+  private usernamesFile: string;
+  private usernameDirectory = new Map<string, UsernameDirectoryEntry>();
   private status: WhatsAppConnectionStatus = 'disconnected';
   private qrCodeDataUrl: string | null = null;
   private user: { id: string; name?: string } | null = null;
@@ -173,6 +300,105 @@ export class WhatsAppClient {
     if (!fs.existsSync(this.sessionDir)) {
       fs.mkdirSync(this.sessionDir, { recursive: true });
     }
+    this.usernamesFile = path.resolve(config.dataDir, 'usernames.json');
+    this.loadUsernameDirectory();
+  }
+
+  private loadUsernameDirectory(): void {
+    if (!fs.existsSync(this.usernamesFile)) return;
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.usernamesFile, 'utf8')) as Record<string, UsernameDirectoryEntry>;
+      for (const [key, entry] of Object.entries(raw)) {
+        const clean = (entry?.username || key).trim().replace(/^@+/, '').toLowerCase();
+        if (clean && entry?.jid && isValidWhatsAppUsername(clean)) {
+          this.usernameDirectory.set(clean, {
+            username: clean,
+            jid: jidNormalizedUser(entry.jid),
+            ...(entry.phoneNumber ? { phoneNumber: entry.phoneNumber } : {}),
+            ...(entry.name ? { name: entry.name } : {}),
+            updatedAt: entry.updatedAt || new Date().toISOString()
+          });
+        }
+      }
+    } catch (err: unknown) {
+      console.warn('[WhatsApp] Could not read usernames directory:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private saveUsernameDirectory(): void {
+    try {
+      fs.mkdirSync(path.dirname(this.usernamesFile), { recursive: true });
+      const serialized: Record<string, UsernameDirectoryEntry> = {};
+      for (const [key, value] of this.usernameDirectory.entries()) {
+        serialized[key] = value;
+      }
+      fs.writeFileSync(this.usernamesFile, JSON.stringify(serialized, null, 2));
+    } catch (err: unknown) {
+      console.error('[WhatsApp] Could not persist usernames directory:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private upsertUsernameMapping(
+    rawUsername: string,
+    rawJid: string,
+    phoneNumber?: string,
+    name?: string,
+    persist = true
+  ): boolean {
+    const cleanUsername = rawUsername.trim().replace(/^@+/, '').toLowerCase();
+    if (!isValidWhatsAppUsername(cleanUsername)) return false;
+
+    const normalizedJid = jidNormalizedUser(rawJid);
+    if (!normalizedJid || (!isLidUser(normalizedJid) && !isPnUser(normalizedJid))) {
+      return false;
+    }
+
+    const existing = this.usernameDirectory.get(cleanUsername);
+    const cleanPhone = phoneNumber?.replace(/[^0-9]/g, '') || existing?.phoneNumber;
+    const cleanName = name?.trim() || existing?.name;
+
+    const unchanged =
+      existing &&
+      existing.jid === normalizedJid &&
+      existing.phoneNumber === cleanPhone &&
+      existing.name === cleanName;
+
+    if (unchanged) return false;
+
+    this.usernameDirectory.set(cleanUsername, {
+      username: cleanUsername,
+      jid: normalizedJid,
+      ...(cleanPhone ? { phoneNumber: cleanPhone } : {}),
+      ...(cleanName ? { name: cleanName } : {}),
+      updatedAt: new Date().toISOString()
+    });
+
+    if (persist) {
+      this.saveUsernameDirectory();
+    }
+    return true;
+  }
+
+  private ingestContacts(contacts: Array<Partial<Contact>>): void {
+    let changed = false;
+    for (const contact of contacts) {
+      if (!contact?.username) continue;
+      const targetJid = contact.lid || contact.id || contact.phoneNumber;
+      if (!targetJid) continue;
+      const pnSource = contact.phoneNumber || (contact.id && isPnUser(contact.id) ? contact.id : undefined);
+      const digits = pnSource ? pnSource.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') : undefined;
+      const displayName = contact.name || contact.notify || undefined;
+      if (this.upsertUsernameMapping(contact.username, targetJid, digits, displayName, false)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.saveUsernameDirectory();
+    }
+  }
+
+  public listKnownUsernames(): UsernameDirectoryEntry[] {
+    return Array.from(this.usernameDirectory.values()).sort((a, b) => a.username.localeCompare(b.username));
   }
 
   private formatDateTime(date: Date = new Date()): string {
@@ -281,6 +507,18 @@ export class WhatsAppClient {
             console.error('[WhatsApp] Failed to process incoming message:', err);
           });
         }
+      });
+
+      sock.ev.on('messaging-history.set', ({ contacts }) => {
+        this.ingestContacts(contacts);
+      });
+
+      sock.ev.on('contacts.upsert', (contacts) => {
+        this.ingestContacts(contacts);
+      });
+
+      sock.ev.on('contacts.update', (updates) => {
+        this.ingestContacts(updates);
       });
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -412,6 +650,9 @@ export class WhatsAppClient {
       sock.ev.removeAllListeners('creds.update');
       sock.ev.removeAllListeners('connection.update');
       sock.ev.removeAllListeners('messages.upsert');
+      sock.ev.removeAllListeners('messaging-history.set');
+      sock.ev.removeAllListeners('contacts.upsert');
+      sock.ev.removeAllListeners('contacts.update');
       sock.ws.removeAllListeners();
       sock.end(undefined);
     } catch {
@@ -546,12 +787,20 @@ export class WhatsAppClient {
     const isGroup = Boolean(isJidGroup(chatJid));
     const senderJid = (isGroup ? msg.key.participant : chatJid) || chatJid;
     const senderAlt = isGroup ? msg.key.participantAlt : msg.key.remoteJidAlt;
+    const rawUsername = isGroup ? msg.key.participantUsername : msg.key.remoteJidUsername;
+    const senderUsername = rawUsername
+      ? rawUsername.trim().replace(/^@+/, '').toLowerCase() || undefined
+      : undefined;
 
     // WhatsApp now addresses many people by an opaque "LID" instead of their phone number.
     // Only report a phone number when we actually know it; replies always go to chatJid.
     const phoneJid = isLidUser(senderJid) ? senderAlt : senderJid;
     const phone = phoneJid ? phoneJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') || null : null;
     const senderId = senderJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+
+    if (senderUsername) {
+      this.upsertUsernameMapping(senderUsername, senderJid, phone ?? undefined, msg.pushName ?? undefined);
+    }
 
     const me = new Set(
       [this.sock?.user?.id, this.sock?.user?.lid].filter((v): v is string => Boolean(v)).map(jidNormalizedUser)
@@ -569,6 +818,7 @@ export class WhatsAppClient {
       id,
       sender: phone || senderId,
       senderName: msg.pushName || undefined,
+      senderUsername,
       recipient: 'Hermes Agent',
       content: parsed.text,
       timestamp: this.formatDateTime(eventDate),
@@ -605,8 +855,10 @@ export class WhatsAppClient {
       /** Phone number in digits, or null when WhatsApp only exposed an anonymous ID (LID). */
       sender: phone,
       senderName: record.senderName ?? null,
+      /** Normalized WhatsApp @username (without "@") when exposed by WhatsApp, otherwise null. */
+      senderUsername: senderUsername ?? null,
       senderJid,
-      /** Where to send replies. Always use this (or the sender's phone) as "to" in POST /api/send. */
+      /** Where to send replies. Always use this (or the sender's phone / @username) as "to" in POST /api/send. */
       chatJid,
       remoteJid: chatJid,
       isGroup,
@@ -707,31 +959,272 @@ export class WhatsAppClient {
   // Outgoing actions (used by the dashboard and by Hermes)
   // ---------------------------------------------------------------------------
 
-  /** Turns a phone number or JID into a JID. Returns null when it cannot be a valid recipient. */
+  /**
+   * Synchronously turns a phone number, JID, or cached @username into a JID.
+   * For uncached @usernames that require a live WhatsApp USync lookup, call resolveRecipient() instead.
+   */
   public resolveJid(recipient: string): string | null {
-    const trimmed = recipient.trim();
-    if (trimmed.includes('@')) {
-      return /^[^@\s]+@(s\.whatsapp\.net|g\.us|lid)$/i.test(trimmed) ? trimmed.toLowerCase() : null;
+    const parsed = parseRecipientInput(recipient);
+    if (parsed.kind === 'jid' || parsed.kind === 'phone') {
+      return parsed.jid;
     }
-    let digits = trimmed.replace(/[^0-9]/g, '');
-    if (digits.startsWith('0') && config.defaultCountryCode) {
-      digits = config.defaultCountryCode + digits.substring(1);
+    if (parsed.kind === 'username') {
+      return this.usernameDirectory.get(parsed.username)?.jid ?? null;
     }
-    return digits.length >= 8 && digits.length <= 15 ? `${digits}@s.whatsapp.net` : null;
+    return null;
   }
 
-  public async setPresence(recipient: string, presence: PresenceValue): Promise<boolean> {
-    if (!this.sock || this.status !== 'connected') {
-      return false;
+  private formatSendError(err: unknown, targetLabel: string): string {
+    const raw = err instanceof Error ? err.message : String(err);
+    const statusCode = (err as { output?: { statusCode?: number }; data?: unknown } | undefined)?.output?.statusCode;
+    if (statusCode === 463 || /\b463\b/.test(raw)) {
+      return `WhatsApp Error 463 (cold outreach restriction) sending to ${targetLabel}: linked devices cannot start brand-new 1:1 chats without a privacy token (tctoken). Do NOT auto-retry; initiate the first message manually from the primary phone.`;
     }
-    const jid = this.resolveJid(recipient);
-    if (!jid) return false;
+    return raw;
+  }
+
+  /**
+   * Resolves a phone number, JID, or WhatsApp @username (with optional 4-digit PIN) into a deliverable JID.
+   */
+  public async resolveRecipient(
+    recipient: string,
+    opts: { pin?: string; forceRefresh?: boolean } = {}
+  ): Promise<ResolveRecipientResult> {
+    const parsed = parseRecipientInput(recipient, opts.pin);
+    if (parsed.kind === 'invalid') {
+      return { success: false, code: 400, error: parsed.error };
+    }
+
+    // Fast path for already-cached @username mappings (unless caller requested a live refresh)
+    if (parsed.kind === 'username' && !opts.forceRefresh) {
+      const cached = this.usernameDirectory.get(parsed.username);
+      if (cached?.jid) {
+        return {
+          success: true,
+          jid: cached.jid,
+          username: parsed.username,
+          displayRecipient: `@${parsed.username}`,
+          isGroup: false,
+          source: 'cache'
+        };
+      }
+    }
+
+    if (!this.sock || this.status !== 'connected') {
+      return {
+        success: false,
+        code: 503,
+        error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.'
+      };
+    }
+
+    // 1. Direct JID or phone number
+    if (parsed.kind === 'jid' || parsed.kind === 'phone') {
+      let jid = parsed.jid;
+      if (jid.endsWith('@s.whatsapp.net')) {
+        try {
+          const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
+          if (match && !match.exists) {
+            return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
+          }
+          if (match?.exists && match.jid) jid = match.jid;
+        } catch {
+          // Lookup is best effort for phone numbers; proceed with constructed JID.
+        }
+      }
+      const isGroup = jid.endsWith('@g.us');
+      const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+      return {
+        success: true,
+        jid,
+        displayRecipient,
+        isGroup,
+        source: parsed.kind
+      };
+    }
+
+    // 2. WhatsApp @username live USync resolution
+    const { username, pin } = parsed;
+
     try {
-      await this.sock.sendPresenceUpdate(presence, jid);
-      return true;
+      const usyncQuery = new USyncQuery().withContactProtocol().withLIDProtocol();
+      const usyncUser = new USyncUser().withUsername(username);
+      if (pin) {
+        usyncUser.withUsernameKey(pin);
+      }
+      usyncQuery.withUser(usyncUser);
+
+      const userNodes: BinaryNode[] = usyncQuery.users.map((u) => ({
+        tag: 'user',
+        attrs: {
+          ...(u.id && !u.phone ? { jid: u.id } : {})
+        },
+        content: usyncQuery.protocols
+          .map((p) => p.getUserElement(u))
+          .filter((node): node is BinaryNode => node !== null)
+      }));
+
+      const iq: BinaryNode = {
+        tag: 'iq',
+        attrs: {
+          to: S_WHATSAPP_NET,
+          type: 'get',
+          xmlns: 'usync'
+        },
+        content: [
+          {
+            tag: 'usync',
+            attrs: {
+              context: usyncQuery.context,
+              mode: usyncQuery.mode,
+              sid: this.sock.generateMessageTag(),
+              last: 'true',
+              index: '0'
+            },
+            content: [
+              {
+                tag: 'query',
+                attrs: {},
+                content: usyncQuery.protocols.map((p) => p.getQueryElement())
+              },
+              {
+                tag: 'list',
+                attrs: {},
+                content: userNodes
+              }
+            ]
+          }
+        ]
+      };
+
+      const rawResp = await this.sock.query(iq);
+      const usyncNode = getBinaryNodeChild(rawResp, 'usync');
+      const resultNode = getBinaryNodeChild(usyncNode, 'result');
+      const resultContactErr = getBinaryNodeChild(getBinaryNodeChild(resultNode, 'contact'), 'error');
+      const listNode = getBinaryNodeChild(usyncNode, 'list');
+      const respUsers = getBinaryNodeChildren(listNode, 'user');
+
+      let protocolErrNode: BinaryNode | undefined = resultContactErr;
+      for (const userNode of respUsers) {
+        const contactNode = getBinaryNodeChild(userNode, 'contact');
+        const userContactErr = getBinaryNodeChild(contactNode, 'error');
+        if (userContactErr) {
+          protocolErrNode = userContactErr;
+          break;
+        }
+      }
+
+      if (protocolErrNode) {
+        const errCode = Number(protocolErrNode.attrs?.code || 0);
+        const errText = String(protocolErrNode.attrs?.text || '');
+        if (errCode === 429 || /rate|overlimit/i.test(errText)) {
+          return {
+            success: false,
+            code: 429,
+            error: `WhatsApp rate-limited @username lookups (${errText || '429'}). Wait before retrying.`
+          };
+        }
+        if (
+          errCode === 401 ||
+          errCode === 403 ||
+          errCode === 406 ||
+          errCode === 428 ||
+          /pin|key|auth|forbidden|not-acceptable|precondition/i.test(errText)
+        ) {
+          return {
+            success: false,
+            code: 403,
+            error: pin
+              ? `WhatsApp rejected the 4-digit PIN for @${username} (${errText || errCode}). Confirm the PIN with the recipient.`
+              : `@${username} requires a 4-digit WhatsApp username PIN. Ask for their PIN and pass "pin": "1234" (or "@${username}#1234").`
+          };
+        }
+        return {
+          success: false,
+          code: 502,
+          error: `WhatsApp USync error resolving @${username}: ${errText || errCode || 'unknown error'}`
+        };
+      }
+
+      for (const userNode of respUsers) {
+        const contactNode = getBinaryNodeChild(userNode, 'contact');
+        const lidNode = getBinaryNodeChild(userNode, 'lid');
+        const contactType = contactNode?.attrs?.type;
+        const attrJid = userNode.attrs?.jid;
+        const lidVal = lidNode?.attrs?.val;
+
+        if (contactType === 'out') {
+          continue;
+        }
+
+        const primaryJid = attrJid || lidVal;
+        if (!primaryJid) {
+          continue;
+        }
+
+        const normalizedPrimary = jidNormalizedUser(primaryJid);
+        const normalizedLid = lidVal ? jidNormalizedUser(lidVal) : isLidUser(normalizedPrimary) ? normalizedPrimary : undefined;
+        const normalizedPn = attrJid && isPnUser(attrJid) ? jidNormalizedUser(attrJid) : undefined;
+
+        if (normalizedLid && normalizedPn) {
+          try {
+            await this.sock.signalRepository.lidMapping.storeLIDPNMappings([{ lid: normalizedLid, pn: normalizedPn }]);
+          } catch {
+            // Non-fatal if signal store mapping cannot be updated
+          }
+        }
+
+        const phoneDigits = normalizedPn ? normalizedPn.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') : undefined;
+        this.upsertUsernameMapping(username, normalizedPrimary, phoneDigits);
+
+        return {
+          success: true,
+          jid: normalizedPrimary,
+          username,
+          displayRecipient: `@${username}`,
+          isGroup: false,
+          source: 'usync'
+        };
+      }
+
+      return {
+        success: false,
+        code: 404,
+        error: pin
+          ? `@${username} was not found on WhatsApp (or the 4-digit PIN was incorrect).`
+          : `@${username} was not found on WhatsApp (or requires a 4-digit username PIN — pass "pin": "1234" or "@${username}#1234").`
+      };
     } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        code: 502,
+        error: `Failed to resolve @${username} on WhatsApp: ${msg}`
+      };
+    }
+  }
+
+  public async setPresence(
+    recipient: string,
+    presence: PresenceValue,
+    pin?: string
+  ): Promise<{ success: true } | { success: false; code: RecipientErrorCode; error: string }> {
+    if (!this.sock || this.status !== 'connected') {
+      return {
+        success: false,
+        code: 503,
+        error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.'
+      };
+    }
+    const resolved = await this.resolveRecipient(recipient, { pin });
+    if (!resolved.success) return resolved;
+    try {
+      await this.sock.sendPresenceUpdate(presence, resolved.jid);
+      return { success: true };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[Presence] Failed to set presence ${presence} for ${recipient}:`, err);
-      return false;
+      return { success: false, code: 502, error: `Could not update presence: ${msg}` };
     }
   }
 
@@ -751,6 +1244,8 @@ export class WhatsAppClient {
     recipient: string,
     messageText: string,
     opts: {
+      /** Optional 4-digit WhatsApp username PIN when messaging an unknown @username. */
+      pin?: string;
       /** Inbound message to quote in the reply. */
       quotedMessageId?: string;
       /** Inbound message this reply answers (marks it "replied" in the dashboard). */
@@ -766,30 +1261,12 @@ export class WhatsAppClient {
       return { success: false, code: 400, error: 'Recipient and message text are required' };
     }
 
-    let jid = this.resolveJid(recipient);
-    if (!jid) {
-      return {
-        success: false,
-        code: 400,
-        error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789) or a WhatsApp ID.'
-      };
+    const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
+    if (!resolved.success) {
+      return resolved;
     }
 
-    // For plain phone numbers, confirm the number is on WhatsApp so we can give a clear error.
-    if (jid.endsWith('@s.whatsapp.net')) {
-      try {
-        const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
-        if (match && !match.exists) {
-          return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
-        }
-        if (match?.exists && match.jid) jid = match.jid;
-      } catch {
-        // Lookup is best effort; try sending anyway.
-      }
-    }
-
-    const isGroup = jid.endsWith('@g.us');
-    const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+    const { jid, isGroup, displayRecipient } = resolved;
     const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
     const textToSend = formatWhatsAppText(messageText);
 
@@ -811,9 +1288,9 @@ export class WhatsAppClient {
         isGroup
       });
 
-      return { success: true, messageId };
+      return { success: true, messageId, jid };
     } catch (err: unknown) {
-      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
     }
   }
 
@@ -822,6 +1299,8 @@ export class WhatsAppClient {
     imageUrl: string,
     caption?: string,
     opts: {
+      /** Optional 4-digit WhatsApp username PIN when messaging an unknown @username. */
+      pin?: string;
       /** Inbound message to quote in the reply. */
       quotedMessageId?: string;
       /** Inbound message this reply answers (marks it "replied" in the dashboard). */
@@ -837,30 +1316,12 @@ export class WhatsAppClient {
       return { success: false, code: 400, error: 'Recipient and image URL are required' };
     }
 
-    let jid = this.resolveJid(recipient);
-    if (!jid) {
-      return {
-        success: false,
-        code: 400,
-        error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789) or a WhatsApp ID.'
-      };
+    const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
+    if (!resolved.success) {
+      return resolved;
     }
 
-    // For plain phone numbers, confirm the number is on WhatsApp so we can give a clear error.
-    if (jid.endsWith('@s.whatsapp.net')) {
-      try {
-        const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
-        if (match && !match.exists) {
-          return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
-        }
-        if (match?.exists && match.jid) jid = match.jid;
-      } catch {
-        // Lookup is best effort; try sending anyway.
-      }
-    }
-
-    const isGroup = jid.endsWith('@g.us');
-    const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+    const { jid, isGroup, displayRecipient } = resolved;
     const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
     const cleanCaption = caption?.trim() ? formatWhatsAppText(caption.trim()) : undefined;
 
@@ -893,9 +1354,9 @@ export class WhatsAppClient {
         messageType: 'image'
       });
 
-      return { success: true, messageId };
+      return { success: true, messageId, jid };
     } catch (err: unknown) {
-      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
     }
   }
 
@@ -903,6 +1364,8 @@ export class WhatsAppClient {
     recipient: string,
     documentUrl: string,
     opts: {
+      /** Optional 4-digit WhatsApp username PIN when messaging an unknown @username. */
+      pin?: string;
       fileName?: string;
       mimetype?: string;
       caption?: string;
@@ -921,30 +1384,12 @@ export class WhatsAppClient {
       return { success: false, code: 400, error: 'Recipient and document URL are required' };
     }
 
-    let jid = this.resolveJid(recipient);
-    if (!jid) {
-      return {
-        success: false,
-        code: 400,
-        error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789) or a WhatsApp ID.'
-      };
+    const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
+    if (!resolved.success) {
+      return resolved;
     }
 
-    // For plain phone numbers, confirm the number is on WhatsApp so we can give a clear error.
-    if (jid.endsWith('@s.whatsapp.net')) {
-      try {
-        const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
-        if (match && !match.exists) {
-          return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
-        }
-        if (match?.exists && match.jid) jid = match.jid;
-      } catch {
-        // Lookup is best effort; try sending anyway.
-      }
-    }
-
-    const isGroup = jid.endsWith('@g.us');
-    const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+    const { jid, isGroup, displayRecipient } = resolved;
     const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
     const cleanCaption = opts.caption?.trim() ? formatWhatsAppText(opts.caption.trim()) : undefined;
     const cleanFileName = opts.fileName?.trim();
@@ -1010,9 +1455,9 @@ export class WhatsAppClient {
         messageType: 'document'
       });
 
-      return { success: true, messageId };
+      return { success: true, messageId, jid };
     } catch (err: unknown) {
-      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
     }
   }
 
@@ -1052,6 +1497,8 @@ export class WhatsAppClient {
     recipient: string,
     sticker: string | Buffer,
     opts: {
+      /** Optional 4-digit WhatsApp username PIN when messaging an unknown @username. */
+      pin?: string;
       pack?: string;
       author?: string;
       categories?: string[];
@@ -1071,30 +1518,12 @@ export class WhatsAppClient {
       return { success: false, code: 400, error: 'Recipient and sticker (URL, file path, base64, or Buffer) are required' };
     }
 
-    let jid = this.resolveJid(recipient);
-    if (!jid) {
-      return {
-        success: false,
-        code: 400,
-        error: 'Invalid recipient. Use a phone number with country code (e.g. 60123456789) or a WhatsApp ID.'
-      };
+    const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
+    if (!resolved.success) {
+      return resolved;
     }
 
-    // For plain phone numbers, confirm the number is on WhatsApp so we can give a clear error.
-    if (jid.endsWith('@s.whatsapp.net')) {
-      try {
-        const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
-        if (match && !match.exists) {
-          return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
-        }
-        if (match?.exists && match.jid) jid = match.jid;
-      } catch {
-        // Lookup is best effort; try sending anyway.
-      }
-    }
-
-    const isGroup = jid.endsWith('@g.us');
-    const displayRecipient = isGroup ? `${jid.split('@')[0]} (Group)` : jid.split('@')[0];
+    const { jid, isGroup, displayRecipient } = resolved;
     const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
 
     let stickerBuffer: Buffer;
@@ -1136,9 +1565,9 @@ export class WhatsAppClient {
         messageType: 'sticker'
       });
 
-      return { success: true, messageId };
+      return { success: true, messageId, jid };
     } catch (err: unknown) {
-      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
     }
   }
 

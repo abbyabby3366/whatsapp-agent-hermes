@@ -32,6 +32,7 @@ interface WebhookPayload {
   messageId: string;
   sender: string | null; // phone number, or null when WhatsApp only exposed an anonymous ID
   senderName: string | null;
+  senderUsername: string | null; // normalized WhatsApp @username (without "@") when exposed
   senderJid: string;
   chatJid: string; // always use this as "to" when replying
   isGroup: boolean;

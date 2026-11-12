@@ -91,6 +91,7 @@ Implement the receiver modules in `~/whatsapp-hermes-receiver/` (`receiver.py`, 
      "messageId": "3EB0ABC12345",
      "sender": "60123456789" | null,
      "senderName": "Customer Name" | null,
+     "senderUsername": "alex_tan" | null,
      "senderJid": "60123456789@s.whatsapp.net",
      "chatJid": "60123456789@s.whatsapp.net",
      "remoteJid": "60123456789@s.whatsapp.net",
@@ -120,12 +121,14 @@ Implement the receiver modules in `~/whatsapp-hermes-receiver/` (`receiver.py`, 
      - Transcribe voice notes using **Gemini Audio** (`LOW` or `MEDIUM` thinking — never Whisper).
      - Strip and forward `@@FLAG@@` lines first, then evaluate `NO_REPLY`, then run `sanitize_reply()` (ensuring WhatsApp `*bold*`, never Markdown `**bold**`).
      - Right before dispatching an approved reply: call `POST /api/read {"messageId": messageId}`, send chunk 1 via `POST /api/send`, and for split chunks `2..N` (`===MSG===`) show `presence: "composing"` for `~2.0s` between chunks before pausing presence.
-4. **Gateway REST Helpers** (all require header `x-api-key: <GATEWAY_API_KEY>`):
-   - `POST /api/send`          `{ "to": chatJid, "message": "...", "replyToMessageId"?: messageId }`
-   - `POST /api/send-image`    `{ "to": chatJid, "url": "...", "caption"?: "...", "replyToMessageId"?: messageId }`
-   - `POST /api/send-document` `{ "to": chatJid, "url": "...", "fileName"?: "...", "caption"?: "..." }`
-   - `POST /api/send-sticker`  `{ "to": chatJid, "url": "...", "pack"?: "...", "author"?: "..." }`
-   - `POST /api/presence`      `{ "recipient": chatJid, "presence": "composing" | "paused" }`
+4. **Gateway REST Helpers** (all require header `x-api-key: <GATEWAY_API_KEY>`; `to` accepts phone digits, `chatJid`, `@username`, or `@username#1234` with 4-digit PIN):
+   - `POST /api/send`          `{ "to": chatJid | "@username", "message": "...", "pin"?: "1234", "replyToMessageId"?: messageId }`
+   - `POST /api/send-image`    `{ "to": chatJid | "@username", "url": "...", "caption"?: "...", "pin"?: "1234", "replyToMessageId"?: messageId }`
+   - `POST /api/send-document` `{ "to": chatJid | "@username", "url": "...", "fileName"?: "...", "caption"?: "...", "pin"?: "1234" }`
+   - `POST /api/send-sticker`  `{ "to": chatJid | "@username", "url": "...", "pack"?: "...", "author"?: "...", "pin"?: "1234" }`
+   - `GET  /api/resolve`       `?target=@username&pin=1234` -> `{ "success": true, "jid": "...@lid", "username": "...", "source": "cache" | "usync" }`
+   - `GET  /api/usernames`     -> known `@username <-> jid` mappings cached from inbound chats, contacts sync, and USync
+   - `POST /api/presence`      `{ "recipient": chatJid | "@username", "presence": "composing" | "paused" }`
    - `POST /api/read`          `{ "messageId": "..." }`
    - `GET  /api/media/<messageId>` -> raw media bytes
 

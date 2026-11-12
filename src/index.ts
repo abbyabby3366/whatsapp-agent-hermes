@@ -48,18 +48,69 @@ app.get('/api/status', (_req: Request, res: Response) => {
   });
 });
 
+/** Extracts an optional PIN passed as a string ("1234" / "0412") or integer (1234) without silently dropping numeric JSON values. */
+function extractPin(raw: unknown): string | undefined {
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  if (typeof raw === 'number' && Number.isInteger(raw)) return String(raw);
+  return undefined;
+}
+
+// Resolve a phone number, @username (with optional 4-digit PIN), or JID into a canonical WhatsApp JID.
+const handleResolveRecipient = async (req: Request, res: Response): Promise<void> => {
+  const source = req.method === 'GET' ? req.query : (req.body ?? {});
+  const rawTarget = source.target ?? source.to ?? source.username;
+  const rawPin = source.pin;
+  const rawRefresh = source.refresh;
+
+  if (typeof rawTarget !== 'string' || !rawTarget.trim()) {
+    res.status(400).json({
+      success: false,
+      error: '"target" (phone number, @username, or WhatsApp ID) is required'
+    });
+    return;
+  }
+
+  const pin = extractPin(rawPin);
+  const forceRefresh = rawRefresh === true || rawRefresh === 'true' || rawRefresh === '1';
+
+  const result = await waClient.resolveRecipient(rawTarget, { pin, forceRefresh });
+  if (!result.success) {
+    res.status(result.code).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.json({
+    success: true,
+    jid: result.jid,
+    username: result.username ?? null,
+    displayRecipient: result.displayRecipient,
+    isGroup: result.isGroup,
+    source: result.source
+  });
+};
+
+app.get('/api/resolve', handleResolveRecipient);
+app.post('/api/resolve', handleResolveRecipient);
+
+// List known @username <-> JID mappings cached from inbound chats, contacts sync, and USync lookups.
+app.get('/api/usernames', (_req: Request, res: Response) => {
+  const usernames = waClient.listKnownUsernames();
+  res.json({ success: true, count: usernames.length, usernames });
+});
+
 // Send a message (used by Hermes for asynchronous replies, and by the dashboard form).
 app.post('/api/send', async (req: Request, res: Response) => {
-  const { to, message, replyToMessageId } = req.body ?? {};
+  const { to, message, pin, replyToMessageId } = req.body ?? {};
   if (!to || typeof message !== 'string' || !message.trim()) {
     res.status(400).json({
       success: false,
-      error: 'Both "to" (phone number or WhatsApp ID) and "message" (text) are required'
+      error: 'Both "to" (phone number, @username, or WhatsApp ID) and "message" (text) are required'
     });
     return;
   }
 
   const result = await waClient.sendMessage(String(to), message, {
+    pin: extractPin(pin),
     quotedMessageId: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
     inReplyTo: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
     source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
@@ -69,12 +120,12 @@ app.post('/api/send', async (req: Request, res: Response) => {
     return;
   }
 
-  res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
+  res.json({ success: true, messageId: result.messageId, jid: result.jid, timestamp: new Date().toISOString() });
 });
 
 // Send an image (used by Hermes and external APIs).
 app.post('/api/send-image', async (req: Request, res: Response) => {
-  const { to, url, imageUrl, caption, replyToMessageId } = req.body ?? {};
+  const { to, url, imageUrl, caption, pin, replyToMessageId } = req.body ?? {};
   const mediaUrl =
     typeof url === 'string' && url.trim()
       ? url.trim()
@@ -85,7 +136,7 @@ app.post('/api/send-image', async (req: Request, res: Response) => {
   if (!to || !mediaUrl) {
     res.status(400).json({
       success: false,
-      error: 'Both "to" (phone number or WhatsApp ID) and "url" (or "imageUrl") are required'
+      error: 'Both "to" (phone number, @username, or WhatsApp ID) and "url" (or "imageUrl") are required'
     });
     return;
   }
@@ -95,6 +146,7 @@ app.post('/api/send-image', async (req: Request, res: Response) => {
     mediaUrl,
     typeof caption === 'string' ? caption : undefined,
     {
+      pin: extractPin(pin),
       quotedMessageId: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
       inReplyTo: typeof replyToMessageId === 'string' ? replyToMessageId : undefined,
       source: req.headers['x-source'] === 'dashboard' ? 'api' : 'hermes'
@@ -105,12 +157,12 @@ app.post('/api/send-image', async (req: Request, res: Response) => {
     return;
   }
 
-  res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
+  res.json({ success: true, messageId: result.messageId, jid: result.jid, timestamp: new Date().toISOString() });
 });
 
 // Send a document (used by Hermes, dashboard, and external APIs).
 app.post('/api/send-document', async (req: Request, res: Response) => {
-  const { to, url, documentUrl, fileName, filename, mimetype, caption, replyToMessageId } = req.body ?? {};
+  const { to, url, documentUrl, fileName, filename, mimetype, caption, pin, replyToMessageId } = req.body ?? {};
   const mediaUrl =
     typeof url === 'string' && url.trim()
       ? url.trim()
@@ -121,7 +173,7 @@ app.post('/api/send-document', async (req: Request, res: Response) => {
   if (!to || !mediaUrl) {
     res.status(400).json({
       success: false,
-      error: 'Both "to" (phone number or WhatsApp ID) and "url" (or "documentUrl") are required'
+      error: 'Both "to" (phone number, @username, or WhatsApp ID) and "url" (or "documentUrl") are required'
     });
     return;
   }
@@ -137,6 +189,7 @@ app.post('/api/send-document', async (req: Request, res: Response) => {
     String(to),
     mediaUrl,
     {
+      pin: extractPin(pin),
       fileName: cleanFileName,
       mimetype: typeof mimetype === 'string' && mimetype.trim() ? mimetype.trim() : undefined,
       caption: typeof caption === 'string' && caption.trim() ? caption.trim() : undefined,
@@ -150,12 +203,12 @@ app.post('/api/send-document', async (req: Request, res: Response) => {
     return;
   }
 
-  res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
+  res.json({ success: true, messageId: result.messageId, jid: result.jid, timestamp: new Date().toISOString() });
 });
 
 // Send a sticker (used by Hermes, dashboard, and external APIs).
 app.post('/api/send-sticker', async (req: Request, res: Response) => {
-  const { to, url, stickerUrl, sticker, pack, author, categories, isAnimated, replyToMessageId } = req.body ?? {};
+  const { to, url, stickerUrl, sticker, pack, author, categories, isAnimated, pin, replyToMessageId } = req.body ?? {};
   const stickerData =
     typeof url === 'string' && url.trim()
       ? url.trim()
@@ -168,7 +221,7 @@ app.post('/api/send-sticker', async (req: Request, res: Response) => {
   if (!to || !stickerData) {
     res.status(400).json({
       success: false,
-      error: 'Both "to" (phone number or WhatsApp ID) and "url" (or "sticker" / "stickerUrl") are required'
+      error: 'Both "to" (phone number, @username, or WhatsApp ID) and "url" (or "sticker" / "stickerUrl") are required'
     });
     return;
   }
@@ -183,6 +236,7 @@ app.post('/api/send-sticker', async (req: Request, res: Response) => {
     String(to),
     stickerData,
     {
+      pin: extractPin(pin),
       pack: cleanPack,
       author: cleanAuthor,
       categories: cleanCategories,
@@ -197,12 +251,12 @@ app.post('/api/send-sticker', async (req: Request, res: Response) => {
     return;
   }
 
-  res.json({ success: true, messageId: result.messageId, timestamp: new Date().toISOString() });
+  res.json({ success: true, messageId: result.messageId, jid: result.jid, timestamp: new Date().toISOString() });
 });
 
 // Typing indicator etc.
 app.post('/api/presence', async (req: Request, res: Response) => {
-  const { recipient, presence } = req.body ?? {};
+  const { recipient, presence, pin } = req.body ?? {};
   if (!recipient || !PRESENCE_VALUES.includes(presence)) {
     res.status(400).json({
       success: false,
@@ -211,8 +265,12 @@ app.post('/api/presence', async (req: Request, res: Response) => {
     return;
   }
 
-  const ok = await waClient.setPresence(String(recipient), presence as PresenceValue);
-  res.status(ok ? 200 : 503).json({ success: ok, ...(ok ? {} : { error: 'Could not update presence (is WhatsApp connected?)' }) });
+  const result = await waClient.setPresence(String(recipient), presence as PresenceValue, extractPin(pin));
+  if (!result.success) {
+    res.status(result.code).json({ success: false, error: result.error });
+    return;
+  }
+  res.json({ success: true });
 });
 
 // Mark a received message as read (blue ticks).

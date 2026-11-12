@@ -1,14 +1,14 @@
 ---
 name: whatsapp-agent-hermes-gateway
-description: "Use when operating, diagnosing, configuring, or administering the WhatsApp Baileys gateway (`whatsapp-agent-hermes`) and Hermes webhook receiver (`hermes-wa-receiver`): pairing QR codes, checking service health/logs, managing per-contact briefs (`contacts.json`) and task/fact state (`flows.json` / `flow.py`), querying SQLite chat history (`wa_history.db` / `history.py`), toggling draft approval or per-number pauses, sending outbound WhatsApp text/media/stickers, resolving WhatsApp LID-to-phone mappings, or troubleshooting Error 463, burst coalescing, and webhook delivery."
-version: 1.1.0
+description: "Use when operating, diagnosing, configuring, or administering the WhatsApp Baileys gateway (`whatsapp-agent-hermes`) and Hermes webhook receiver (`hermes-wa-receiver`): pairing QR codes, checking service health/logs, managing per-contact briefs (`contacts.json`) and task/fact state (`flows.json` / `flow.py`), querying SQLite chat history (`wa_history.db` / `history.py`), toggling draft approval or per-contact pauses, sending outbound WhatsApp text/media/stickers to phone numbers, `@username` handles (with optional 4-digit PIN), or JIDs, resolving WhatsApp `@username`/LID-to-phone mappings, or troubleshooting Error 463, burst coalescing, and webhook delivery."
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
 metadata:
   hermes:
     requires_toolsets: [terminal]
-    tags: [whatsapp, baileys, gateway, webhook, receiver, systemd, ops, messaging]
+    tags: [whatsapp, baileys, gateway, webhook, receiver, systemd, ops, messaging, username]
 ---
 
 # WhatsApp Agent Hermes — External Gateway + Hermes Receiver
@@ -24,9 +24,9 @@ This architecture decouples WhatsApp connectivity from the core Hermes process. 
 Load and apply this skill whenever you need to:
 - Check gateway/receiver service status, inspect live logs, or export a fresh WhatsApp pairing QR code.
 - Manage contact profiles (`contacts.json`), per-contact open items/facts (`flow.py` / `flows.json`), or search conversation history (`history.py` / `wa_history.db`).
-- Administer runtime controls (`approval on/off`, global `on/off`, `pause <number> <duration>`, `resume <number>`).
-- Send outbound WhatsApp text, images, documents, or stickers via the gateway REST API or `wa_send.py`.
-- Implement, update, or debug `receiver.py`, prompt templates, LID canonicalization, burst superseding, or WhatsApp Error 463 restrictions.
+- Administer runtime controls (`approval on/off`, global `on/off`, `pause <number|@username> <duration>`, `resume <number|@username>`).
+- Send outbound WhatsApp text, images, documents, or stickers to phone numbers, `@username` handles (`@username` or `@username#1234` with 4-digit PIN), or JIDs via the gateway REST API (`/api/send*`, `/api/resolve`) or `wa_send.py`.
+- Implement, update, or debug `receiver.py`, prompt templates, `@username` & LID canonicalization, burst superseding, or WhatsApp Error 463 restrictions.
 
 For deep implementation schemas, subprocess contracts, systemd unit files, and Nginx tunnel configs, load the progressive-disclosure files in `SKILL_DIR`:
 - `SKILL_DIR/assets/prompt_template.txt` — Contact-facing first-person ghostwriter prompt.
@@ -48,7 +48,7 @@ For deep implementation schemas, subprocess contracts, systemd unit files, and N
 - `receiver.py`: Main webhook server, burst coalescer, and async worker dispatcher.
 - `history.py` + `wa_history.db`: SQLite conversation history store.
 - `handled.json`: Idempotency ledger of terminal message outcomes (`sent`, `silent`, `dry-run`).
-- `chat_map.json`: Canonical WhatsApp 15-digit LID (`...@lid`) <-> phone number lookup map.
+- `chat_map.json`: Canonical WhatsApp 15-digit LID (`...@lid`) <-> phone number <-> `@username` lookup map (gateway also persists `~/whatsapp-agent-hermes/data/usernames.json` from inbound messages, contacts sync, and USync lookups).
 - `sessions.json`: Canonical chat key -> active Hermes `session_id` mapping.
 - `state.json`: Persisted runtime toggles (approval mode, global on/off, per-contact pause timers).
 - `contacts.json`: Per-contact briefs, personas, notes, and `auto_reply` toggles (hot-reloaded per turn).
@@ -201,11 +201,12 @@ python3 ~/whatsapp-hermes-receiver/flow.py fact <key> "fact" | event <key> "even
 ```
 
 ### 3. Contact Profiles & Notes (`contacts.json`)
-Hot-reloaded per turn to customize persona, relationship context, or disable auto-reply (`"auto_reply": false`) per person without restarting services:
+Hot-reloaded per turn to customize persona, relationship context, `@username` handle, or disable auto-reply (`"auto_reply": false`) per person without restarting services (keyed by phone digits or 15-digit LID when phone is hidden):
 ```json
 {
   "60123456789": {
     "name": "Acme Corp Lead",
+    "username": "alex_tan",
     "relation": "Client",
     "auto_reply": true,
     "persona": "Warm and professional enterprise partner",
@@ -257,19 +258,42 @@ When editing `~/whatsapp-hermes-receiver/prompt_template.txt`, preserve these co
 - **Phone Admin Commands** (case-insensitive in 1:1 Master DM):
   - `status` — Health, active sessions, approval mode, paused contacts, quota counters.
   - `on` / `off` — Enable or disable automated contact replies globally.
-  - `pause <number> <duration>` / `resume <number>` — Pause (e.g., `4h`, `30m`, `1d`) or resume auto-replies for a contact.
+  - `pause <number|@username> <duration>` / `resume <number|@username>` — Pause (e.g., `4h`, `30m`, `1d`) or resume auto-replies for a contact.
   - `approval on` / `approval off` — Toggle Draft Approval testing mode.
   - `SEND` / `SKIP` / **Quote-Reply with custom text** — Approve, drop, or replace a held `[DRAFT APPROVAL]` message.
 
 ---
 
-## Outbound Media Dispatch (`wa_send.py`)
+## Outbound Dispatch & Contacting `@username` Handles
 
+Never reject an instruction to message `@username` by demanding a phone number. The gateway natively resolves WhatsApp `@username` handles (via its cached `data/usernames.json` directory and live Baileys `USyncContactProtocol` queries) into deliverable `@lid` / `@s.whatsapp.net` JIDs.
+
+### `@username` Resolution Priority Order
+1. **Check Local Known Contacts & History First (Zero Rate-Limit Risk)**:
+   - Look up `@username` (case-insensitive, without `@`) in `contacts.json` (`"username"` field or alias), `chat_map.json`, `GET /api/usernames`, or `history.py search`.
+   - If the contact already has a known `chatJid` (`...@lid` or `...@s.whatsapp.net`), send directly to that `chatJid`.
+2. **Send or Resolve via Gateway (`@username` or `@username#PIN`)**:
+   - Pass `"to": "@username"` directly to `POST /api/send`, `/api/send-image`, `/api/send-document`, or `/api/send-sticker` (with optional `"pin": "1234"` or inline `"@username#1234"` when the recipient uses a 4-digit WhatsApp username PIN).
+   - To inspect or resolve a handle before sending:
+     ```bash
+     curl -s "http://127.0.0.1:3100/api/resolve?target=@alex_tan" -H "x-api-key: $GATEWAY_API_KEY"
+     curl -s "http://127.0.0.1:3100/api/resolve?target=@alex_tan&pin=1234" -H "x-api-key: $GATEWAY_API_KEY"
+     curl -s "http://127.0.0.1:3100/api/usernames" -H "x-api-key: $GATEWAY_API_KEY"
+     ```
+3. **Handle PIN Challenges & Cold-Outreach Restrictions Cleanly**:
+   - **HTTP `403` / `404` (Username PIN Required)**: Do not guess PINs. Ask `${MASTER_NAME}` for the recipient's 4-digit WhatsApp username PIN and retry once with `"pin": "1234"` (or `"@username#1234"`).
+   - **HTTP `429` (USync Rate Limit)**: Stop repeated lookups and wait before retrying.
+   - **HTTP `502` with Error `463` (Cold 1:1 Outreach Blocked)**: Even after `@username` resolves to `...@lid`, WhatsApp blocks linked devices from initiating brand-new 1:1 chats when no `tctoken` exists. Never retry Error 463 in a loop — ask `${MASTER_NAME}` to send the very first message to `@username` manually from the primary WhatsApp phone app, after which automated replies and follow-ups work normally.
+
+### Outbound CLI Helper (`wa_send.py`)
+`<recipient>` accepts phone digits (`60123456789`), full JID (`...@lid` / `...@s.whatsapp.net` / `...@g.us`), `@username`, or `@username#1234`:
 ```bash
-wa_send.py text    <recipient_jid> "Message content"
-wa_send.py image   <recipient_jid> "http://127.0.0.1:8099/photo.jpg" "Caption"
-wa_send.py doc     <recipient_jid> /path/to/document.pdf "Caption"
-wa_send.py sticker <recipient_jid> "http://127.0.0.1:8099/sticker.webp" "Pack" "Author"
+wa_send.py text    <recipient> "Message content"
+wa_send.py text    @alex_tan "Hi Alex, following up on the proposal"
+wa_send.py text    "@alex_tan#1234" "Hi Alex!"
+wa_send.py image   <recipient> "http://127.0.0.1:8099/photo.jpg" "Caption"
+wa_send.py doc     <recipient> /path/to/document.pdf "Caption"
+wa_send.py sticker <recipient> "http://127.0.0.1:8099/sticker.webp" "Pack" "Author"
 ```
 Serve local HTTP media over HTTP/1.1 with valid `Content-Length` headers (`media_server.py`) and include `x-api-key: $GATEWAY_API_KEY` when calling `/api/send*`. Never use Python's `http.server` (HTTP/1.0 framing issues).
 
@@ -277,9 +301,9 @@ Serve local HTTP media over HTTP/1.1 with valid `Content-Length` headers (`media
 
 ## Operational Pitfalls
 
-1. **WhatsApp Error 463 (Cold Outreach Restriction)**: Baileys cannot initiate cold 1:1 chats without a privacy `tctoken`. Never auto-retry Error 463 sends in a loop (worsens account restrictions); initiate first contact manually from the primary phone or `wa.me/<number>`.
+1. **WhatsApp Error 463 (Cold Outreach Restriction)**: Baileys cannot initiate cold 1:1 chats (whether by phone number or `@username` -> `@lid`) without a privacy `tctoken`. Never auto-retry Error 463 sends in a loop (worsens account restrictions); initiate first contact manually from the primary phone or `wa.me/<number>`.
 2. **Stdout vs. Stderr Split**: `hermes chat -Q` writes reply text to `stdout` and `session_id: <id>` to `stderr`. Never parse `stdout` for session IDs.
-3. **LID vs. Phone Thread Splitting**: WhatsApp Web / privacy users often appear as `15-digit@lid` with `sender: null`. Always canonicalize through `chat_map.json` before looking up `sessions.json`, `flows.json`, or `contacts.json`, and reply to `chatJid`.
+3. **LID & `@username` vs. Phone Thread Splitting**: WhatsApp Web / privacy users often appear as `15-digit@lid` with `sender: null` (and optional `senderUsername`). Always canonicalize through `chat_map.json` (indexing LID, phone digits, and lowercase `senderUsername`) before looking up `sessions.json`, `flows.json`, or `contacts.json`, and reply to `chatJid`.
 4. **Disconnection 503s**: Sending during a brief Baileys reconnect returns HTTP 503. Retry with backoff (up to 6 attempts); if still down, leave unledgered for `replay_orphans()` and alert `MASTER_PHONE` once reconnected.
 5. **QR Code Rotation**: Pairing QR codes expire every ~60s. Always run `scripts/fetch-pairing-qr.sh` (which triggers `/api/connect` first) rather than reading stale cached screenshots.
 

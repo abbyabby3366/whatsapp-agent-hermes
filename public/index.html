@@ -107,9 +107,9 @@
           </div>
 
           <div class="field">
-            <label class="label" for="recipientInput">Phone number</label>
-            <input id="recipientInput" name="recipient" type="tel" inputmode="tel" autocomplete="off" placeholder="60123456789" aria-describedby="recipientHint recipientError" required>
-            <p class="hint" id="recipientHint">Include the country code, digits only (e.g. 60123456789 for Malaysia).</p>
+            <label class="label" for="recipientInput">Recipient (phone number or @username)</label>
+            <input id="recipientInput" name="recipient" type="text" autocomplete="off" placeholder="60123456789 or @username" aria-describedby="recipientHint recipientError" required>
+            <p class="hint" id="recipientHint">Phone number with country code (e.g. 60123456789), WhatsApp <code>@username</code> (or <code>@username#1234</code> with PIN), or JID.</p>
             <p class="field-error" id="recipientError" role="alert" hidden></p>
           </div>
 

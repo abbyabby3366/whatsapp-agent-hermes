@@ -244,8 +244,12 @@
         who = '<span>To ' + escapeHtml(m.recipient) + '</span><span class="sub">from ' + escapeHtml(m.sender) + '</span>';
         tag = '<span class="tag tag-info">Sent</span>';
       } else {
-        who = '<span>' + escapeHtml(m.senderName || m.sender) + '</span>' +
-          (m.senderName ? '<span class="sub">' + escapeHtml(m.sender) + '</span>' : '') +
+        const handleLabel = m.senderUsername ? ('@' + m.senderUsername) : '';
+        const subParts = [];
+        if (handleLabel) subParts.push(handleLabel);
+        if (m.senderName || handleLabel) subParts.push(m.sender);
+        who = '<span>' + escapeHtml(m.senderName || handleLabel || m.sender) + '</span>' +
+          (subParts.length ? '<span class="sub">' + escapeHtml(subParts.join(' · ')) + '</span>' : '') +
           (m.isGroup ? '<span class="tag">Group</span>' : '');
         const t = STATUS_TAGS[m.webhookStatus] || ['tag', escapeHtml(m.webhookStatus || ''), ''];
         const title = m.webhookError || t[2];
@@ -385,19 +389,49 @@
   });
   bindFilePicker(el.stickerPickBtn, el.stickerFileInput, el.stickerUrlInput, el.stickerUrlError);
 
+  function isValidRecipientInput(recipient) {
+    if (/^[^@\s]+@(s\.whatsapp\.net|g\.us|lid)$/i.test(recipient)) return '';
+    if (recipient.includes('@') && !recipient.startsWith('@')) {
+      return 'Invalid WhatsApp ID. Use a phone number (60123456789), @username, or JID.';
+    }
+    if (recipient.startsWith('@') || /[a-zA-Z]/.test(recipient)) {
+      const withoutAt = recipient.replace(/^@+/, '');
+      const hashIdx = withoutAt.indexOf('#');
+      const handle = (hashIdx === -1 ? withoutAt : withoutAt.slice(0, hashIdx)).toLowerCase();
+      const pin = hashIdx === -1 ? '' : withoutAt.slice(hashIdx + 1).trim();
+      if (recipient.startsWith('@') && /^\d+$/.test(handle)) {
+        return 'WhatsApp @usernames must contain at least one letter. For phone numbers, omit "@".';
+      }
+      if (hashIdx !== -1 && !/^\d{4}$/.test(pin)) {
+        return 'Username PIN after "#" must be 4 digits (e.g. @username#1234).';
+      }
+      if (!/^[a-z0-9._]{3,35}$/.test(handle) || !/[a-z]/.test(handle) || handle.startsWith('.') || handle.endsWith('.') || handle.includes('..')) {
+        return 'Enter a valid WhatsApp @username (3-35 letters, digits, "." or "_").';
+      }
+      return '';
+    }
+    const digits = recipient.replace(/[^0-9]/g, '');
+    if (digits.length < 8 || digits.length > 15) {
+      return 'Include the country code for phone numbers (e.g. 60123456789), or enter a @username.';
+    }
+    return '';
+  }
+
   function validateSend() {
     const recipient = el.recipientInput.value.trim();
     let valid = true;
 
-    const digits = recipient.replace(/[^0-9]/g, '');
     if (!recipient) {
-      setFieldError(el.recipientInput, el.recipientError, 'Enter the phone number to send to.');
-      valid = false;
-    } else if (!recipient.includes('@') && (digits.length < 8 || digits.length > 15)) {
-      setFieldError(el.recipientInput, el.recipientError, 'That does not look like a full phone number. Include the country code, e.g. 60123456789.');
+      setFieldError(el.recipientInput, el.recipientError, 'Enter a phone number or @username to send to.');
       valid = false;
     } else {
-      setFieldError(el.recipientInput, el.recipientError, '');
+      const recipientErr = isValidRecipientInput(recipient);
+      if (recipientErr) {
+        setFieldError(el.recipientInput, el.recipientError, recipientErr);
+        valid = false;
+      } else {
+        setFieldError(el.recipientInput, el.recipientError, '');
+      }
     }
 
     if (currentSendMode === 'text') {

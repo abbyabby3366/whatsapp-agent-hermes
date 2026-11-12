@@ -59,6 +59,7 @@ pm2 start npm --name whatsapp-agent-hermes -- start
   "messageId": "3EB0ABC123456789",
   "sender": "60123456789",
   "senderName": "John Doe",
+  "senderUsername": "johndoe",
   "senderJid": "60123456789@s.whatsapp.net",
   "chatJid": "60123456789@s.whatsapp.net",
   "isGroup": false,
@@ -93,13 +94,15 @@ pm2 start npm --name whatsapp-agent-hermes -- start
 
 All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>` when that is set.
 
-| Endpoint | Body | Purpose |
+| Endpoint | Body / Query | Purpose |
 | --- | --- | --- |
-| `POST /api/send` | `{ "to": "<phone or chatJid>", "message": "...", "replyToMessageId"?: "..." }` | Send a text message (optionally quoting one) |
-| `POST /api/send-image` | `{ "to": "<phone or chatJid>", "url": "...", "caption"?: "...", "replyToMessageId"?: "..." }` | Send an image (URL, local file, or data URI) |
-| `POST /api/send-document` | `{ "to": "<phone or chatJid>", "url": "...", "fileName"?: "...", "caption"?: "...", "replyToMessageId"?: "..." }` | Send a document (URL, local file, or data URI) |
-| `POST /api/send-sticker` | `{ "to": "<phone or chatJid>", "url": "...", "pack"?: "...", "author"?: "...", "replyToMessageId"?: "..." }` | Send a sticker (URL, local file, or data URI; auto-converts to 512x512 WebP with optional EXIF) |
-| `POST /api/presence` | `{ "recipient": "<chatJid>", "presence": "composing" \| "paused" \| "recording" \| "available" \| "unavailable" }` | Typing indicator |
+| `POST /api/send` | `{ "to": "<phone, @username, or chatJid>", "message": "...", "pin"?: "1234", "replyToMessageId"?: "..." }` | Send a text message (supports `@username` or `@username#1234` PIN) |
+| `POST /api/send-image` | `{ "to": "<phone, @username, or chatJid>", "url": "...", "caption"?: "...", "pin"?: "1234", "replyToMessageId"?: "..." }` | Send an image (URL, local file, or data URI) |
+| `POST /api/send-document` | `{ "to": "<phone, @username, or chatJid>", "url": "...", "fileName"?: "...", "caption"?: "...", "pin"?: "1234", "replyToMessageId"?: "..." }` | Send a document (URL, local file, or data URI) |
+| `POST /api/send-sticker` | `{ "to": "<phone, @username, or chatJid>", "url": "...", "pack"?: "...", "author"?: "...", "pin"?: "1234", "replyToMessageId"?: "..." }` | Send a sticker (URL, local file, or data URI; auto-converts to 512x512 WebP with optional EXIF) |
+| `GET /api/resolve` | `?target=@username&pin=1234` (or `POST` body) | Resolve a `@username` or phone number to a canonical WhatsApp JID (`@lid` / `@s.whatsapp.net`) |
+| `GET /api/usernames` | – | List cached `@username <-> JID` mappings learned from chats, contacts, and USync |
+| `POST /api/presence` | `{ "recipient": "<chatJid or @username>", "presence": "composing" \| "paused" \| "recording" \| "available" \| "unavailable" }` | Typing indicator |
 | `POST /api/read` | `{ "messageId": "..." }` | Mark a received message as read (blue ticks) |
 | `GET /api/media/:messageId` | – | Download the media of a recent message (raw bytes, correct `Content-Type`) |
 | `POST /api/forwarding` | `{ "enabled": true \| false }` | Pause / resume forwarding to Hermes |

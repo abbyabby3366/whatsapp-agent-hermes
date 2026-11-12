@@ -14,6 +14,8 @@ Elevated owner privileges (`AGENT_TOOLSETS_OWNER=terminal,file,web,vision` and `
    - Canonicalized `sender` digits match `MASTER_PHONE` (`OWNER_WHATSAPP`), **OR**
    - `senderJid` (stripped of `@lid`) matches `MASTER_LID` (or resolves to `MASTER_PHONE` in `chat_map.json`).
 
+Whenever an inbound payload carries `senderUsername` (normalized lowercase WhatsApp `@username` without `@`), persist the `@username <-> chatJid` (and `sender` phone digits if known) mapping in `chat_map.json` so outbound instructions to `@username` immediately map to the canonical thread key (`sessions.json`, `flows.json`, `contacts.json`). When `wa_send.py` or `receiver.py` dispatches to a `@username` not yet in `chat_map.json`, pass `"to": "@username"` (plus optional `"pin": "1234"` or `"@username#1234"`) directly to `/api/send*` (or pre-resolve via `GET /api/resolve?target=@username` with `x-api-key`) and store the returned `jid` in `chat_map.json`.
+
 All other turns (including every group turn) MUST run in the restricted contact sandbox (`AGENT_TOOLSETS=web,vision` with `prompt_template.txt`), and outbound local loopback access (`127.0.0.1`, `localhost`, `[::1]`) remains protected by requiring `GATEWAY_API_KEY` on all gateway `/api/*` endpoints.
 
 ---
