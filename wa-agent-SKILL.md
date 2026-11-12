@@ -1,6 +1,6 @@
 ---
 name: whatsapp-agent-hermes-gateway
-description: "Use when operating, diagnosing, configuring, or administering the WhatsApp Baileys gateway (`whatsapp-agent-hermes`) and Hermes webhook receiver (`hermes-wa-receiver`): pairing QR codes, checking service health/logs, managing per-contact briefs (`contacts.json`) and task/fact state (`flows.json` / `flow.py`), querying SQLite chat history (`wa_history.db` / `history.py`), toggling draft approval or per-contact pauses, sending outbound WhatsApp text/media/stickers to phone numbers, `@username` handles (with optional 4-digit PIN), or JIDs, resolving WhatsApp `@username`/LID-to-phone mappings, or troubleshooting Error 463, burst coalescing, and webhook delivery."
+description: "Use when operating, diagnosing, configuring, or administering the WhatsApp Baileys gateway (`whatsapp-agent-hermes`) and Hermes webhook receiver (`hermes-wa-receiver`): pairing QR codes, checking service health/logs, managing per-contact briefs (`contacts.json`) and task/fact state (`flows.json` / `flow.py`), querying SQLite chat history (`wa_history.db` / `history.py`), toggling global or per-contact pauses, sending outbound WhatsApp text/media/stickers to phone numbers, `@username` handles (with optional 4-digit PIN), or JIDs, resolving WhatsApp `@username`/LID-to-phone mappings, or troubleshooting Error 463, burst coalescing, and webhook delivery."
 version: 1.2.0
 author: Hermes Agent
 license: MIT
@@ -24,7 +24,7 @@ This architecture decouples WhatsApp connectivity from the core Hermes process. 
 Load and apply this skill whenever you need to:
 - Check gateway/receiver service status, inspect live logs, or export a fresh WhatsApp pairing QR code.
 - Manage contact profiles (`contacts.json`), per-contact open items/facts (`flow.py` / `flows.json`), or search conversation history (`history.py` / `wa_history.db`).
-- Administer runtime controls (`approval on/off`, global `on/off`, `pause <number|@username> <duration>`, `resume <number|@username>`).
+- Administer runtime controls (global `on/off`, `pause <number|@username> <duration>`, `resume <number|@username>`).
 - Send outbound WhatsApp text, images, documents, or stickers to phone numbers, `@username` handles (`@username` or `@username#1234` with 4-digit PIN), or JIDs via the gateway REST API (`/api/send*`, `/api/resolve`) or `wa_send.py`.
 - Implement, update, or debug `receiver.py`, prompt templates, `@username` & LID canonicalization, burst superseding, or WhatsApp Error 463 restrictions.
 
@@ -50,11 +50,11 @@ For deep implementation schemas, subprocess contracts, systemd unit files, and N
 - `handled.json`: Idempotency ledger of terminal message outcomes (`sent`, `silent`, `dry-run`).
 - `chat_map.json`: Canonical WhatsApp 15-digit LID (`...@lid`) <-> phone number <-> `@username` lookup map (gateway also persists `~/whatsapp-agent-hermes/data/usernames.json` from inbound messages, contacts sync, and USync lookups).
 - `sessions.json`: Canonical chat key -> active Hermes `session_id` mapping.
-- `state.json`: Persisted runtime toggles (approval mode, global on/off, per-contact pause timers).
+- `state.json`: Persisted runtime toggles (global on/off, per-contact pause timers).
 - `contacts.json`: Per-contact briefs, personas, notes, and `auto_reply` toggles (hot-reloaded per turn).
 - `prompt_template.txt`: Live contact ghostwriter brief (seeded from `SKILL_DIR/assets/prompt_template.txt`, hot-reloaded per turn).
 - `prompt_template_owner.txt`: Live 1:1 Master operator brief (seeded from `SKILL_DIR/assets/prompt_template_owner.txt`, hot-reloaded per turn).
-- `outbox.py` + `outbox.json`: Ledger of outbound escalations/drafts so Master quote-replies resolve back to the target contact `chatJid`.
+- `outbox.py` + `outbox.json`: Ledger of outbound `[FLAG]` escalations so Master quote-replies resolve back to the target contact `chatJid`.
 - `flow.py` + `flows.json`: Per-contact operational state (`open` items, `facts`, timestamped `events`).
 - `media/`: Local cache directory for inbound and outbound media.
 - `~/.hermes/skills/skill-crafter/SKILL.md` + `~/.hermes/skills/whatsapp-agent-rules/SKILL.md`: Companion single-file global meta-skill (`skill-crafter`) and reinstall-safe user-owned rules skill (`whatsapp-agent-rules`). Whenever the owner teaches or updates how to operate or reply with WhatsApp, `skill-crafter` merges it into `whatsapp-agent-rules/SKILL.md` (single `.md` file, zero subfolders, trivial 1-file export). `receiver.py` hot-loads Section 2 + only the matching contact's `###` block from Section 3 on contact turns while keeping Section 1 owner-only.
@@ -116,15 +116,13 @@ sequenceDiagram
     Note over Recv,Agent: Draft silently (NO /api/read yet, NO typing indicator)
     Recv->>Agent: Run Hermes with XML-wrapped untrusted input + SQLite history
     Agent-->>Recv: Raw output (optional @@FLAG@@ + reply chunks or NO_REPLY)
-    Note over Recv: 1) Strip & send any @@FLAG@@ alert to MASTER_PHONE first
+    opt Output contains @@FLAG@@
+        Recv->>GW: POST /api/send { to: MASTER_PHONE, message: "[FLAG] ..." }
+        GW->>Master: Escalation alert (contact reply is NOT held)
+    end
     alt Remaining body is NO_REPLY
         Note over Recv: Ledgered as "silent"; no /api/read, no send
     else Remaining body has 1..5 chunks (split by ===MSG===)
-        alt Draft Approval Mode is ON
-            Recv->>GW: POST /api/send { to: MASTER_PHONE, message: "[DRAFT APPROVAL]..." }
-            Master->>GW: Reply: SEND | SKIP | Quote-edit
-            GW->>Recv: Webhook with Master decision (1:1 DM only)
-        end
         Recv->>GW: POST /api/read { messageId } (blue ticks right before reply)
         Recv->>GW: POST /api/send { to: chatJid, message: part1 }
         loop For subsequent split parts (2..N)
@@ -137,7 +135,8 @@ sequenceDiagram
 ```
 
 - **Fast Webhook Release**: Answer the gateway within 15s using `{"reply": null, "status": "processing"}` and dispatch async work in the background.
-- **No Premature Blue Ticks (`/api/read`)**: Never mark a message read at webhook arrival. Only call `POST /api/read` immediately before dispatching an approved outbound reply (so `NO_REPLY` turns and held Draft Approval messages never flash instant 3:00 AM blue ticks).
+- **Immediate Live Replies (No Draft Approval Gate)**: Never hold outbound replies in a `[DRAFT APPROVAL]` queue. Once paired, automated replies dispatch live directly to contacts (unless `NO_REPLY`, global `off`, or the contact is paused / `"auto_reply": false`).
+- **No Premature Blue Ticks (`/api/read`)**: Never mark a message read at webhook arrival. Only call `POST /api/read` immediately before dispatching an outbound reply (so `NO_REPLY` turns never flash instant 3:00 AM blue ticks).
 - **Silent First Draft**: Never send `presence: "composing"` while generating the initial reply. Only show `"composing"` during the ~2s pause between split messages `2..N`.
 - **Bursts & Superseding**:
   1. Consecutive messages within `COALESCE_WINDOW_SECONDS` (`2.5s`) bundle into one turn.
@@ -247,7 +246,7 @@ When editing `~/whatsapp-hermes-receiver/prompt_template.txt`, preserve these co
 
 ---
 
-## Security Boundaries, Draft Approval & Master Authority
+## Security Boundaries & Master Authority
 
 ### Untrusted Contact Sandbox & Anti-Injection
 - **Restricted Toolset**: External contacts run strictly with `AGENT_TOOLSETS=web,vision` (no terminal, no file write, no memory/config mutation).
@@ -257,11 +256,10 @@ When editing `~/whatsapp-hermes-receiver/prompt_template.txt`, preserve these co
 ### Master 1:1 DM Authority & Phone Commands
 - **Strict 1:1 DM Gate (`isGroup == false`)**: Elevated Master mode (`AGENT_TOOLSETS_OWNER=terminal,file,web,vision` + `prompt_template_owner.txt` + administrative commands) activates **only** when `isGroup == false` AND the sender matches `MASTER_PHONE` or verified `MASTER_LID`. In group chats, even messages sent by `MASTER_PHONE` run under standard non-privileged group rules so internal outputs never leak into shared groups.
 - **Phone Admin Commands** (case-insensitive in 1:1 Master DM):
-  - `status` — Health, active sessions, approval mode, paused contacts, quota counters.
+  - `status` — Health, active sessions, global on/off state, paused contacts, quota counters.
   - `on` / `off` — Enable or disable automated contact replies globally.
   - `pause <number|@username> <duration>` / `resume <number|@username>` — Pause (e.g., `4h`, `30m`, `1d`) or resume auto-replies for a contact.
-  - `approval on` / `approval off` — Toggle Draft Approval testing mode.
-  - `SEND` / `SKIP` / **Quote-Reply with custom text** — Approve, drop, or replace a held `[DRAFT APPROVAL]` message.
+  - **Quote-Reply to `[FLAG]` Escalation** — Resolve target contact from `outbox.json` and carry out the instruction toward that contact in `${MASTER_NAME}`'s first-person voice.
 
 ---
 
