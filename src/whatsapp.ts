@@ -14,10 +14,16 @@ import makeWASocket, {
   S_WHATSAPP_NET,
   USyncQuery,
   USyncUser,
+  USyncUsernameProtocol,
+  WAMessageStatus,
+  generateMessageIDV2,
   getBinaryNodeChild,
   getBinaryNodeChildren,
   type BinaryNode,
   type Contact,
+  type GroupMetadata,
+  type GroupParticipant,
+  type WAMessageUpdate,
   type WASocket,
   type ConnectionState,
   type WAMessage,
@@ -58,6 +64,8 @@ export interface RecentMessage {
   webhookStatus?: WebhookStatus;
   webhookError?: string;
   hermesReply?: string;
+  /** Set on outbound messages that WhatsApp rejected after sending (e.g. Error 463 / 479). */
+  deliveryError?: string;
 }
 
 export interface UsernameDirectoryEntry {
@@ -177,6 +185,36 @@ const IGNORED_CONTENT_TYPES = new Set([
 
 const MAX_CACHED_MESSAGES = 300;
 
+/** How long to wait for WhatsApp's server <ack class="message"> before optimistically reporting success. */
+const OUTBOUND_ACK_TIMEOUT_MS = 4000;
+/** Upper bound for the reverse LID -> @username lookup done while processing an inbound 1:1 message. */
+const LID_USERNAME_LOOKUP_TIMEOUT_MS = 2500;
+/** Avoid re-querying WhatsApp for LIDs that recently returned no @username. */
+const EMPTY_LID_USERNAME_TTL_MS = 6 * 3600_000;
+
+const digitsOfJid = (jid: string | null | undefined): string =>
+  jid ? jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') : '';
+
+/** Decodes a <username> node body, which WhatsApp sends either as a string or as raw bytes. */
+function readBinaryNodeText(node: BinaryNode | undefined): string | undefined {
+  if (!node) return undefined;
+  if (typeof node.content === 'string') return node.content;
+  if (node.content instanceof Uint8Array) return Buffer.from(node.content).toString('utf8');
+  const val = node.attrs?.val;
+  return typeof val === 'string' ? val : undefined;
+}
+
+/** Maps a WhatsApp outbound-ack error code to a clear, actionable message. */
+function describeOutboundAckError(code: string, targetLabel: string): string {
+  if (code === '463') {
+    return `WhatsApp Error 463 (cold outreach restriction) sending to ${targetLabel}: linked devices cannot start brand-new 1:1 chats without a privacy token (tctoken). Do NOT auto-retry; send the first message manually from the primary phone.`;
+  }
+  if (code === '479') {
+    return `WhatsApp Error 479 (stanza rejected) sending to ${targetLabel}: the server refused the message, usually because of a stale device session or addressing. Do NOT auto-retry blindly.`;
+  }
+  return `WhatsApp rejected the message to ${targetLabel} (error ${code}).`;
+}
+
 type ParsedRecipientInput =
   | { kind: 'jid'; jid: string }
   | { kind: 'phone'; jid: string }
@@ -269,6 +307,12 @@ export class WhatsAppClient {
   private sessionDir: string;
   private usernamesFile: string;
   private usernameDirectory = new Map<string, UsernameDirectoryEntry>();
+  /** LID JIDs whose reverse @username lookup returned nothing recently (jid -> epoch ms). */
+  private emptyLidUsernameCache = new Map<string, number>();
+  /** In-flight reverse lookups, so a burst of messages from one LID triggers a single query. */
+  private pendingLidUsernameLookups = new Map<string, Promise<string | undefined>>();
+  /** Outbound Hermes reply id -> inbound message id it answered (to undo "replied" on a late rejection). */
+  private hermesReplyLinks = new Map<string, string>();
   private status: WhatsAppConnectionStatus = 'disconnected';
   private qrCodeDataUrl: string | null = null;
   private user: { id: string; name?: string } | null = null;
@@ -357,7 +401,17 @@ export class WhatsAppClient {
     const cleanPhone = phoneNumber?.replace(/[^0-9]/g, '') || existing?.phoneNumber;
     const cleanName = name?.trim() || existing?.name;
 
+    // Evict any older handle previously mapped to the same JID (the contact changed their @username)
+    let staleRemoved = false;
+    for (const [otherKey, otherEntry] of this.usernameDirectory.entries()) {
+      if (otherKey !== cleanUsername && otherEntry.jid === normalizedJid) {
+        this.usernameDirectory.delete(otherKey);
+        staleRemoved = true;
+      }
+    }
+
     const unchanged =
+      !staleRemoved &&
       existing &&
       existing.jid === normalizedJid &&
       existing.phoneNumber === cleanPhone &&
@@ -372,11 +426,176 @@ export class WhatsAppClient {
       ...(cleanName ? { name: cleanName } : {}),
       updatedAt: new Date().toISOString()
     });
+    this.emptyLidUsernameCache.delete(normalizedJid);
 
     if (persist) {
       this.saveUsernameDirectory();
     }
     return true;
+  }
+
+  /** Finds a cached @username for a sender by JID, alternate JID (LID <-> PN), or phone digits. */
+  private findUsernameForSender(senderJid: string, senderAlt?: string | null, phone?: string | null): string | undefined {
+    const normSender = senderJid ? jidNormalizedUser(senderJid) : '';
+    const normAlt = senderAlt ? jidNormalizedUser(senderAlt) : '';
+    const cleanPhone = phone?.replace(/[^0-9]/g, '') || '';
+    for (const entry of this.usernameDirectory.values()) {
+      if (entry.jid === normSender || (normAlt && entry.jid === normAlt)) return entry.username;
+      if (cleanPhone && (entry.phoneNumber === cleanPhone || (isPnUser(entry.jid) && digitsOfJid(entry.jid) === cleanPhone))) {
+        return entry.username;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Learns @username <-> JID mappings from message keys. Runs for every message (including our own
+   * fromMe messages sent from the primary phone, where WhatsApp includes the peer's recipient_username).
+   * Historical messages (history sync / append) only fill gaps: they never replace a handle we already
+   * know for that JID, so an old username in history cannot overwrite the contact's current one.
+   */
+  private ingestMessageUsernames(messages: WAMessage[], opts: { historical?: boolean } = {}): void {
+    let changed = false;
+    const learn = (username: string, jid: string, pn: string | undefined, name: string | undefined): void => {
+      if (opts.historical) {
+        const normalized = jidNormalizedUser(jid);
+        const cleanUsername = username.trim().replace(/^@+/, '').toLowerCase();
+        for (const entry of this.usernameDirectory.values()) {
+          if (entry.jid === normalized && entry.username !== cleanUsername) return;
+        }
+      }
+      if (this.upsertUsernameMapping(username, jid, pn, name, false)) changed = true;
+    };
+    for (const msg of messages) {
+      const key = msg?.key;
+      if (!key?.remoteJid) continue;
+      const chatJid = key.remoteJid;
+      // pushName on fromMe messages is our own name, never the peer's
+      const peerName = key.fromMe ? undefined : msg.pushName ?? undefined;
+      if (isJidGroup(chatJid)) {
+        if (key.participantUsername && key.participant) {
+          const pn = key.participantAlt && isPnUser(key.participantAlt) ? key.participantAlt : isPnUser(key.participant) ? key.participant : undefined;
+          learn(key.participantUsername, key.participant, digitsOfJid(pn) || undefined, peerName);
+        }
+      } else if (key.remoteJidUsername) {
+        const pn = key.remoteJidAlt && isPnUser(key.remoteJidAlt) ? key.remoteJidAlt : isPnUser(chatJid) ? chatJid : undefined;
+        learn(key.remoteJidUsername, chatJid, digitsOfJid(pn) || undefined, peerName);
+      }
+    }
+    if (changed) this.saveUsernameDirectory();
+  }
+
+  /** Learns @username mappings from group metadata (owner, subject/description owners, participants). */
+  private ingestGroupParticipants(participants: Array<Partial<GroupParticipant>>): boolean {
+    let changed = false;
+    for (const p of participants) {
+      if (!p?.username) continue;
+      const targetJid = p.lid || p.id || p.phoneNumber;
+      if (!targetJid) continue;
+      const pnSource = p.phoneNumber || (p.id && isPnUser(p.id) ? p.id : undefined);
+      if (this.upsertUsernameMapping(p.username, targetJid, digitsOfJid(pnSource) || undefined, p.name || p.notify || undefined, false)) {
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private ingestGroupMetadata(groups: Array<Partial<GroupMetadata>>): void {
+    let changed = false;
+    for (const g of groups) {
+      if (!g) continue;
+      const owners: Array<[string | undefined, string | undefined, string | undefined]> = [
+        [g.ownerUsername, g.owner, g.ownerPn],
+        [g.subjectOwnerUsername, g.subjectOwner, g.subjectOwnerPn],
+        [g.descOwnerUsername, g.descOwner, g.descOwnerPn],
+        [g.authorUsername, g.author, g.authorPn]
+      ];
+      for (const [username, jid, pn] of owners) {
+        if (username && jid && this.upsertUsernameMapping(username, jid, digitsOfJid(pn) || undefined, undefined, false)) {
+          changed = true;
+        }
+      }
+      if (Array.isArray(g.participants) && this.ingestGroupParticipants(g.participants)) {
+        changed = true;
+      }
+    }
+    if (changed) this.saveUsernameDirectory();
+  }
+
+  /**
+   * Reads username attributes straight from raw <message> stanzas. Baileys only decodes
+   * recipient/participant usernames into the message key, so this also catches sender-side attributes.
+   */
+  private ingestRawMessageStanza(node: BinaryNode): void {
+    const attrs = node?.attrs;
+    if (!attrs) return;
+    // Only the attributes Baileys itself decodes into message keys (see decode-wa-message.js)
+    const pairs: Array<[string | undefined, string | undefined]> = [
+      [attrs.participant_username, attrs.participant],
+      [attrs.peer_recipient_username || attrs.recipient_username, attrs.recipient]
+    ];
+    let changed = false;
+    for (const [username, jid] of pairs) {
+      if (!username || !jid || isJidGroup(jid)) continue;
+      if (this.upsertUsernameMapping(username, jid, undefined, undefined, false)) changed = true;
+    }
+    if (changed) this.saveUsernameDirectory();
+  }
+
+  /**
+   * Reverse lookup (LID -> @username) through WhatsApp USync for inbound 1:1 messages from an uncached LID.
+   * Bounded by LID_USERNAME_LOOKUP_TIMEOUT_MS so it never stalls message handling.
+   */
+  private async lookupUsernameForLid(lidJid: string): Promise<string | undefined> {
+    const sock = this.sock;
+    if (!sock || this.status !== 'connected' || !isLidUser(lidJid)) return undefined;
+    const normalized = jidNormalizedUser(lidJid);
+    const emptyAt = this.emptyLidUsernameCache.get(normalized);
+    if (emptyAt && Date.now() - emptyAt < EMPTY_LID_USERNAME_TTL_MS) return undefined;
+
+    const pending = this.pendingLidUsernameLookups.get(normalized);
+    if (pending) return pending;
+
+    const lookup = (async (): Promise<string | undefined> => {
+      try {
+        const protocol = new USyncUsernameProtocol();
+        const iq: BinaryNode = {
+          tag: 'iq',
+          attrs: { to: S_WHATSAPP_NET, type: 'get', xmlns: 'usync' },
+          content: [
+            {
+              tag: 'usync',
+              attrs: { context: 'interactive', mode: 'query', sid: sock.generateMessageTag(), last: 'true', index: '0' },
+              content: [
+                { tag: 'query', attrs: {}, content: [protocol.getQueryElement()] },
+                { tag: 'list', attrs: {}, content: [{ tag: 'user', attrs: { jid: normalized } }] }
+              ]
+            }
+          ]
+        };
+        const resp = await sock.query(iq, LID_USERNAME_LOOKUP_TIMEOUT_MS);
+        if (!resp) return undefined; // timed out: do not cache as empty, try again next message
+        const listNode = getBinaryNodeChild(getBinaryNodeChild(resp, 'usync'), 'list');
+        for (const userNode of getBinaryNodeChildren(listNode, 'user')) {
+          const usernameNode = getBinaryNodeChild(userNode, 'username');
+          if (getBinaryNodeChild(usernameNode, 'error')) continue;
+          const raw = readBinaryNodeText(usernameNode)?.trim().replace(/^@+/, '').toLowerCase();
+          if (raw && isValidWhatsAppUsername(raw)) {
+            this.upsertUsernameMapping(raw, normalized);
+            return raw;
+          }
+        }
+        this.emptyLidUsernameCache.set(normalized, Date.now());
+        return undefined;
+      } catch (err: unknown) {
+        console.warn(`[WhatsApp] Reverse @username lookup failed for ${normalized}:`, err instanceof Error ? err.message : err);
+        return undefined;
+      } finally {
+        this.pendingLidUsernameLookups.delete(normalized);
+      }
+    })();
+    this.pendingLidUsernameLookups.set(normalized, lookup);
+    return lookup;
   }
 
   private ingestContacts(contacts: Array<Partial<Contact>>): void {
@@ -499,6 +718,8 @@ export class WhatsAppClient {
       });
 
       sock.ev.on('messages.upsert', ({ messages, type }) => {
+        // Learn @username mappings from every message first (including our own fromMe and history appends)
+        this.ingestMessageUsernames(messages, { historical: type !== 'notify' });
         if (type !== 'notify') return;
 
         // Do not await: a slow Hermes webhook must never hold up the WhatsApp event loop.
@@ -509,8 +730,14 @@ export class WhatsAppClient {
         }
       });
 
-      sock.ev.on('messaging-history.set', ({ contacts }) => {
+      // WhatsApp reports late server rejections (e.g. Error 463 / 479) as a status=ERROR update.
+      sock.ev.on('messages.update', (updates) => {
+        this.handleMessageUpdates(updates);
+      });
+
+      sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
         this.ingestContacts(contacts);
+        this.ingestMessageUsernames(messages, { historical: true });
       });
 
       sock.ev.on('contacts.upsert', (contacts) => {
@@ -519,6 +746,28 @@ export class WhatsAppClient {
 
       sock.ev.on('contacts.update', (updates) => {
         this.ingestContacts(updates);
+      });
+
+      sock.ev.on('groups.upsert', (groups) => {
+        this.ingestGroupMetadata(groups);
+      });
+
+      sock.ev.on('groups.update', (updates) => {
+        this.ingestGroupMetadata(updates);
+      });
+
+      sock.ev.on('group-participants.update', (update) => {
+        this.ingestGroupMetadata([
+          { id: update.id, author: update.author, authorPn: update.authorPn, authorUsername: update.authorUsername, participants: update.participants }
+        ]);
+      });
+
+      sock.ws.on('CB:message', (node: BinaryNode) => {
+        try {
+          this.ingestRawMessageStanza(node);
+        } catch (err: unknown) {
+          console.warn('[WhatsApp] Could not read username attributes from stanza:', err instanceof Error ? err.message : err);
+        }
       });
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -650,9 +899,13 @@ export class WhatsAppClient {
       sock.ev.removeAllListeners('creds.update');
       sock.ev.removeAllListeners('connection.update');
       sock.ev.removeAllListeners('messages.upsert');
+      sock.ev.removeAllListeners('messages.update');
       sock.ev.removeAllListeners('messaging-history.set');
       sock.ev.removeAllListeners('contacts.upsert');
       sock.ev.removeAllListeners('contacts.update');
+      sock.ev.removeAllListeners('groups.upsert');
+      sock.ev.removeAllListeners('groups.update');
+      sock.ev.removeAllListeners('group-participants.update');
       sock.ws.removeAllListeners();
       sock.end(undefined);
     } catch {
@@ -788,7 +1041,7 @@ export class WhatsAppClient {
     const senderJid = (isGroup ? msg.key.participant : chatJid) || chatJid;
     const senderAlt = isGroup ? msg.key.participantAlt : msg.key.remoteJidAlt;
     const rawUsername = isGroup ? msg.key.participantUsername : msg.key.remoteJidUsername;
-    const senderUsername = rawUsername
+    let senderUsername = rawUsername
       ? rawUsername.trim().replace(/^@+/, '').toLowerCase() || undefined
       : undefined;
 
@@ -800,6 +1053,13 @@ export class WhatsAppClient {
 
     if (senderUsername) {
       this.upsertUsernameMapping(senderUsername, senderJid, phone ?? undefined, msg.pushName ?? undefined);
+    } else {
+      // Inbound 1:1 stanzas do not carry the sender's username, so use what we learned earlier,
+      // and for an unknown LID ask WhatsApp once (bounded, cached).
+      senderUsername = this.findUsernameForSender(senderJid, senderAlt, phone);
+      if (!senderUsername && !isGroup && isLidUser(senderJid)) {
+        senderUsername = await this.lookupUsernameForLid(senderJid);
+      }
     }
 
     const me = new Set(
@@ -841,7 +1101,9 @@ export class WhatsAppClient {
     if (
       (isGroup && !config.forwardGroups) ||
       (config.allowedNumbers.length > 0 &&
-        !config.allowedNumbers.some((n) => n === phone || n === senderId))
+        !config.allowedNumbers.some(
+          (n) => n === phone || n === senderId || (senderUsername !== undefined && n === `@${senderUsername}`)
+        ))
     ) {
       record.webhookStatus = 'filtered';
       return;
@@ -944,15 +1206,16 @@ export class WhatsAppClient {
    * Marks the inbound message a Hermes reply answers as "replied", so asynchronous replies
    * (sent later through POST /api/send) close the loop in the dashboard and the stats.
    */
-  private linkHermesReply(chatJid: string, replyText: string, inReplyTo?: string): void {
+  private linkHermesReply(chatJid: string, replyText: string, inReplyTo?: string): string | undefined {
     const target =
       (inReplyTo && this.recentMessages.find((m) => !m.fromMe && m.id === inReplyTo)) ||
       this.recentMessages.find((m) => !m.fromMe && m.chatJid === chatJid && m.webhookStatus === 'processing');
-    if (!target || target.webhookStatus === 'replied') return;
+    if (!target || target.webhookStatus === 'replied') return undefined;
     target.webhookStatus = 'replied';
     target.hermesReply = replyText;
     delete target.webhookError;
     this.stats.hermesRepliesCount++;
+    return target.id;
   }
 
   // ---------------------------------------------------------------------------
@@ -1023,8 +1286,10 @@ export class WhatsAppClient {
       let jid = parsed.jid;
       if (jid.endsWith('@s.whatsapp.net')) {
         try {
-          const [match] = (await this.sock.onWhatsApp(jid)) ?? [];
-          if (match && !match.exists) {
+          const results = await this.sock.onWhatsApp(jid);
+          // Baileys returns [] (or entries with exists=false) for numbers that are not on WhatsApp
+          const match = results?.[0];
+          if (Array.isArray(results) && (!match || !match.exists)) {
             return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
           }
           if (match?.exists && match.jid) jid = match.jid;
@@ -1098,18 +1363,36 @@ export class WhatsAppClient {
       };
 
       const rawResp = await this.sock.query(iq);
+      // Baileys resolves undefined (instead of throwing) when the query times out
+      if (!rawResp) {
+        return {
+          success: false,
+          code: 503,
+          error: `Timed out waiting for WhatsApp while resolving @${username}. Try again shortly.`
+        };
+      }
+
       const usyncNode = getBinaryNodeChild(rawResp, 'usync');
+      if (!usyncNode) {
+        return {
+          success: false,
+          code: 502,
+          error: `Unexpected USync response from WhatsApp while resolving @${username}.`
+        };
+      }
+
       const resultNode = getBinaryNodeChild(usyncNode, 'result');
       const resultContactErr = getBinaryNodeChild(getBinaryNodeChild(resultNode, 'contact'), 'error');
+      const resultLidErr = getBinaryNodeChild(getBinaryNodeChild(resultNode, 'lid'), 'error');
       const listNode = getBinaryNodeChild(usyncNode, 'list');
       const respUsers = getBinaryNodeChildren(listNode, 'user');
 
-      let protocolErrNode: BinaryNode | undefined = resultContactErr;
+      let protocolErrNode: BinaryNode | undefined = resultContactErr ?? resultLidErr;
       for (const userNode of respUsers) {
-        const contactNode = getBinaryNodeChild(userNode, 'contact');
-        const userContactErr = getBinaryNodeChild(contactNode, 'error');
-        if (userContactErr) {
-          protocolErrNode = userContactErr;
+        const contactErr = getBinaryNodeChild(getBinaryNodeChild(userNode, 'contact'), 'error');
+        const lidErr = getBinaryNodeChild(getBinaryNodeChild(userNode, 'lid'), 'error');
+        if (contactErr || lidErr) {
+          protocolErrNode = contactErr ?? lidErr;
           break;
         }
       }
@@ -1117,38 +1400,13 @@ export class WhatsAppClient {
       if (protocolErrNode) {
         const errCode = Number(protocolErrNode.attrs?.code || 0);
         const errText = String(protocolErrNode.attrs?.text || '');
-        if (errCode === 429 || /rate|overlimit/i.test(errText)) {
-          return {
-            success: false,
-            code: 429,
-            error: `WhatsApp rate-limited @username lookups (${errText || '429'}). Wait before retrying.`
-          };
-        }
-        if (
-          errCode === 401 ||
-          errCode === 403 ||
-          errCode === 406 ||
-          errCode === 428 ||
-          /pin|key|auth|forbidden|not-acceptable|precondition/i.test(errText)
-        ) {
-          return {
-            success: false,
-            code: 403,
-            error: pin
-              ? `WhatsApp rejected the 4-digit PIN for @${username} (${errText || errCode}). Confirm the PIN with the recipient.`
-              : `@${username} requires a 4-digit WhatsApp username PIN. Ask for their PIN and pass "pin": "1234" (or "@${username}#1234").`
-          };
-        }
-        return {
-          success: false,
-          code: 502,
-          error: `WhatsApp USync error resolving @${username}: ${errText || errCode || 'unknown error'}`
-        };
+        return this.classifyUsyncError(errCode, errText, username, pin);
       }
 
       for (const userNode of respUsers) {
         const contactNode = getBinaryNodeChild(userNode, 'contact');
         const lidNode = getBinaryNodeChild(userNode, 'lid');
+        const usernameNode = getBinaryNodeChild(userNode, 'username');
         const contactType = contactNode?.attrs?.type;
         const attrJid = userNode.attrs?.jid;
         const lidVal = lidNode?.attrs?.val;
@@ -1162,6 +1420,11 @@ export class WhatsAppClient {
           continue;
         }
 
+        // Prefer the canonical handle WhatsApp returns (case / formatting), falling back to what was asked for
+        const returnedUsername = readBinaryNodeText(usernameNode)?.trim().replace(/^@+/, '').toLowerCase();
+        const canonicalUsername =
+          returnedUsername && isValidWhatsAppUsername(returnedUsername) ? returnedUsername : username;
+
         const normalizedPrimary = jidNormalizedUser(primaryJid);
         const normalizedLid = lidVal ? jidNormalizedUser(lidVal) : isLidUser(normalizedPrimary) ? normalizedPrimary : undefined;
         const normalizedPn = attrJid && isPnUser(attrJid) ? jidNormalizedUser(attrJid) : undefined;
@@ -1174,14 +1437,14 @@ export class WhatsAppClient {
           }
         }
 
-        const phoneDigits = normalizedPn ? normalizedPn.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') : undefined;
-        this.upsertUsernameMapping(username, normalizedPrimary, phoneDigits);
+        const phoneDigits = normalizedPn ? digitsOfJid(normalizedPn) : undefined;
+        this.upsertUsernameMapping(canonicalUsername, normalizedPrimary, phoneDigits);
 
         return {
           success: true,
           jid: normalizedPrimary,
-          username,
-          displayRecipient: `@${username}`,
+          username: canonicalUsername,
+          displayRecipient: `@${canonicalUsername}`,
           isGroup: false,
           source: 'usync'
         };
@@ -1195,13 +1458,68 @@ export class WhatsAppClient {
           : `@${username} was not found on WhatsApp (or requires a 4-digit username PIN — pass "pin": "1234" or "@${username}#1234").`
       };
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
+      // Baileys throws a Boom for a top-level <iq><error code="..."/>; the code is in err.data
+      const boom = err as { data?: unknown; output?: { statusCode?: number } } | undefined;
+      const dataCode =
+        typeof boom?.data === 'number'
+          ? boom.data
+          : Number((boom?.data as { attrs?: { code?: string } } | undefined)?.attrs?.code || 0);
+      const errCode = dataCode || Number(boom?.output?.statusCode || 0);
+      const errText = err instanceof Error ? err.message : String(err);
+      return this.classifyUsyncError(errCode, errText, username, pin);
+    }
+  }
+
+  /** Maps a WhatsApp USync error code/text to an HTTP-style result for @username lookups. */
+  private classifyUsyncError(
+    errCode: number,
+    errText: string,
+    username: string,
+    pin?: string
+  ): Extract<ResolveRecipientResult, { success: false }> {
+    if (errCode === 429 || /rate|overlimit/i.test(errText)) {
       return {
         success: false,
-        code: 502,
-        error: `Failed to resolve @${username} on WhatsApp: ${msg}`
+        code: 429,
+        error: `WhatsApp rate-limited @username lookups (${errText || '429'}). Wait before retrying.`
       };
     }
+    if (errCode === 404 || /item-not-found|not.?found/i.test(errText)) {
+      return {
+        success: false,
+        code: 404,
+        error: pin
+          ? `@${username} was not found on WhatsApp (or the 4-digit PIN was incorrect).`
+          : `@${username} was not found on WhatsApp (or requires a 4-digit username PIN — pass "pin": "1234" or "@${username}#1234").`
+      };
+    }
+    if (errCode === 408 || errCode === 500 || errCode === 503 || /timed?.?out|unavailable|connection closed/i.test(errText)) {
+      return {
+        success: false,
+        code: 503,
+        error: `WhatsApp could not resolve @${username} right now (${errText || errCode}). Try again shortly.`
+      };
+    }
+    if (
+      errCode === 401 ||
+      errCode === 403 ||
+      errCode === 406 ||
+      errCode === 428 ||
+      /pin|key|auth|forbidden|not-acceptable|precondition/i.test(errText)
+    ) {
+      return {
+        success: false,
+        code: 403,
+        error: pin
+          ? `WhatsApp rejected the 4-digit PIN for @${username} (${errText || errCode}). Confirm the PIN with the recipient.`
+          : `@${username} requires a 4-digit WhatsApp username PIN. Ask for their PIN and pass "pin": "1234" (or "@${username}#1234").`
+      };
+    }
+    return {
+      success: false,
+      code: 502,
+      error: `WhatsApp USync error resolving @${username}: ${errText || errCode || 'unknown error'}`
+    };
   }
 
   public async setPresence(
@@ -1209,17 +1527,16 @@ export class WhatsAppClient {
     presence: PresenceValue,
     pin?: string
   ): Promise<{ success: true } | { success: false; code: RecipientErrorCode; error: string }> {
-    if (!this.sock || this.status !== 'connected') {
-      return {
-        success: false,
-        code: 503,
-        error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.'
-      };
-    }
+    const precheck = this.precheckSend(recipient, pin);
+    if (precheck) return precheck;
     const resolved = await this.resolveRecipient(recipient, { pin });
     if (!resolved.success) return resolved;
+    const sock = this.sock;
+    if (!sock || this.status !== 'connected') {
+      return { success: false, code: 503, error: 'WhatsApp disconnected before the presence update could be sent.' };
+    }
     try {
-      await this.sock.sendPresenceUpdate(presence, resolved.jid);
+      await sock.sendPresenceUpdate(presence, resolved.jid);
       return { success: true };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1240,6 +1557,142 @@ export class WhatsAppClient {
     }
   }
 
+  /** Validates recipient/PIN format and connection state before any send, so bad input is always a 400. */
+  private precheckSend(recipient: string, pin?: string): Extract<SendResult, { success: false }> | null {
+    const parsed = parseRecipientInput(recipient, pin);
+    if (parsed.kind === 'invalid') {
+      return { success: false, code: 400, error: parsed.error };
+    }
+    if (!this.sock || this.status !== 'connected') {
+      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
+    }
+    return null;
+  }
+
+  /**
+   * Sends through Baileys, then waits briefly for WhatsApp's server <ack class="message">, so immediate
+   * server rejections (Error 463 cold-outreach restriction, Error 479, ...) fail with HTTP 502 instead of
+   * falsely reporting "Sent". If no ack arrives in time the send is reported as successful, and a later
+   * status=ERROR update (see handleMessageUpdates) rolls the dashboard record back to "Failed".
+   */
+  private async dispatchOutboundMessage(params: {
+    resolved: Extract<ResolveRecipientResult, { success: true }>;
+    content: Parameters<WASocket['sendMessage']>[1];
+    summaryText: string;
+    messageType?: string;
+    quotedMessageId?: string;
+    inReplyTo?: string;
+    source?: 'hermes' | 'api';
+    ackTimeoutMs?: number;
+  }): Promise<SendResult> {
+    const sock = this.sock;
+    if (!sock || this.status !== 'connected') {
+      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
+    }
+
+    const { jid, isGroup, displayRecipient } = params.resolved;
+    const quoted = params.quotedMessageId ? this.rawMessages.get(params.quotedMessageId) : undefined;
+    // Pre-generate the id so the ack listener is attached before the stanza goes out
+    const outboundId = generateMessageIDV2(sock.user?.id);
+    const ackTimeoutMs = params.ackTimeoutMs ?? OUTBOUND_ACK_TIMEOUT_MS;
+
+    let ackListener: ((node: BinaryNode) => void) | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const ackPromise = new Promise<{ error?: string } | null>((resolve) => {
+      ackListener = (node: BinaryNode) => {
+        if (node?.tag !== 'ack' || node.attrs?.class !== 'message') return;
+        resolve({ error: node.attrs?.error || undefined });
+      };
+      sock.ws.on(`TAG:${outboundId}`, ackListener);
+    });
+
+    try {
+      const result = await sock.sendMessage(jid, params.content, {
+        messageId: outboundId,
+        ...(quoted ? { quoted } : {})
+      });
+      const messageId = result?.key?.id ?? outboundId;
+
+      // Ack window starts after the upload/relay finished, so large media is not cut short
+      const ack = await Promise.race([
+        ackPromise,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), ackTimeoutMs);
+        })
+      ]);
+
+      if (ack?.error) {
+        const error = describeOutboundAckError(ack.error, displayRecipient);
+        this.addRecentMessage({
+          id: messageId,
+          sender: params.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
+          recipient: displayRecipient,
+          content: params.summaryText,
+          timestamp: this.formatDateTime(),
+          fromMe: true,
+          isGroup,
+          ...(params.messageType ? { messageType: params.messageType } : {}),
+          deliveryError: error
+        });
+        return { success: false, code: 502, error };
+      }
+
+      this.stats.sentCount++;
+      if (params.source === 'hermes') {
+        const answeredId = this.linkHermesReply(jid, params.summaryText, params.inReplyTo ?? params.quotedMessageId);
+        if (answeredId) {
+          this.hermesReplyLinks.set(messageId, answeredId);
+          if (this.hermesReplyLinks.size > MAX_CACHED_MESSAGES) {
+            const oldest = this.hermesReplyLinks.keys().next().value;
+            if (oldest) this.hermesReplyLinks.delete(oldest);
+          }
+        }
+      }
+      this.addRecentMessage({
+        id: messageId,
+        sender: params.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
+        recipient: displayRecipient,
+        content: params.summaryText,
+        timestamp: this.formatDateTime(),
+        fromMe: true,
+        isGroup,
+        ...(params.messageType ? { messageType: params.messageType } : {})
+      });
+
+      return { success: true, messageId, jid };
+    } catch (err: unknown) {
+      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (ackListener) sock.ws.off(`TAG:${outboundId}`, ackListener);
+    }
+  }
+
+  /** Rolls back optimistic "Sent" records when WhatsApp later reports a delivery error for them. */
+  private handleMessageUpdates(updates: WAMessageUpdate[]): void {
+    for (const { key, update } of updates) {
+      if (!key?.fromMe || !key.id || update?.status !== WAMessageStatus.ERROR) continue;
+      const record = this.recentMessages.find((m) => m.fromMe && m.id === key.id);
+      if (!record || record.deliveryError) continue;
+      const code = String(update.messageStubParameters?.[0] ?? 'unknown');
+      record.deliveryError = describeOutboundAckError(code, record.recipient);
+      this.stats.sentCount = Math.max(0, this.stats.sentCount - 1);
+
+      // If this was a Hermes reply, the inbound message it answered was not actually answered
+      const answeredId = this.hermesReplyLinks.get(key.id);
+      if (answeredId) {
+        this.hermesReplyLinks.delete(key.id);
+        const inbound = this.recentMessages.find((m) => !m.fromMe && m.id === answeredId);
+        if (inbound && inbound.webhookStatus === 'replied') {
+          inbound.webhookStatus = 'failed';
+          inbound.webhookError = `Reply was rejected by WhatsApp: ${record.deliveryError}`;
+          this.stats.hermesRepliesCount = Math.max(0, this.stats.hermesRepliesCount - 1);
+        }
+      }
+      console.warn(`[WhatsApp] Message ${key.id} to ${record.recipient} was rejected by WhatsApp (error ${code}).`);
+    }
+  }
+
   public async sendMessage(
     recipient: string,
     messageText: string,
@@ -1253,45 +1706,26 @@ export class WhatsAppClient {
       source?: 'hermes' | 'api';
     } = {}
   ): Promise<SendResult> {
-    if (!this.sock || this.status !== 'connected') {
-      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
-    }
-
     if (!recipient?.trim() || !messageText?.trim()) {
       return { success: false, code: 400, error: 'Recipient and message text are required' };
     }
+    const precheck = this.precheckSend(recipient, opts.pin);
+    if (precheck) return precheck;
 
     const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
     if (!resolved.success) {
       return resolved;
     }
 
-    const { jid, isGroup, displayRecipient } = resolved;
-    const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
     const textToSend = formatWhatsAppText(messageText);
-
-    try {
-      const result = await this.sock.sendMessage(jid, { text: textToSend }, quoted ? { quoted } : undefined);
-      const messageId = result?.key?.id ?? undefined;
-
-      this.stats.sentCount++;
-      if (opts.source === 'hermes') {
-        this.linkHermesReply(jid, textToSend, opts.inReplyTo ?? opts.quotedMessageId);
-      }
-      this.addRecentMessage({
-        id: messageId || `sent-${Date.now()}`,
-        sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
-        recipient: displayRecipient,
-        content: textToSend,
-        timestamp: this.formatDateTime(),
-        fromMe: true,
-        isGroup
-      });
-
-      return { success: true, messageId, jid };
-    } catch (err: unknown) {
-      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
-    }
+    return this.dispatchOutboundMessage({
+      resolved,
+      content: { text: textToSend },
+      summaryText: textToSend,
+      quotedMessageId: opts.quotedMessageId,
+      inReplyTo: opts.inReplyTo,
+      source: opts.source
+    });
   }
 
   public async sendImage(
@@ -1308,56 +1742,34 @@ export class WhatsAppClient {
       source?: 'hermes' | 'api';
     } = {}
   ): Promise<SendResult> {
-    if (!this.sock || this.status !== 'connected') {
-      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
-    }
-
     if (!recipient?.trim() || !imageUrl?.trim()) {
       return { success: false, code: 400, error: 'Recipient and image URL are required' };
     }
+    const precheck = this.precheckSend(recipient, opts.pin);
+    if (precheck) return precheck;
 
     const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
     if (!resolved.success) {
       return resolved;
     }
 
-    const { jid, isGroup, displayRecipient } = resolved;
-    const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
+    const cleanImageUrl = imageUrl.trim();
     const cleanCaption = caption?.trim() ? formatWhatsAppText(caption.trim()) : undefined;
+    const summaryText = cleanCaption
+      ? `[Image] ${cleanCaption}`
+      : cleanImageUrl.startsWith('data:')
+        ? '[Image]'
+        : `[Image] ${cleanImageUrl}`;
 
-    try {
-      const result = await this.sock.sendMessage(
-        jid,
-        { image: { url: imageUrl.trim() }, ...(cleanCaption ? { caption: cleanCaption } : {}) },
-        quoted ? { quoted } : undefined
-      );
-      const messageId = result?.key?.id ?? undefined;
-
-      this.stats.sentCount++;
-      const cleanImageUrl = imageUrl.trim();
-      const summaryText = cleanCaption
-        ? `[Image] ${cleanCaption}`
-        : cleanImageUrl.startsWith('data:')
-          ? '[Image]'
-          : `[Image] ${cleanImageUrl}`;
-      if (opts.source === 'hermes') {
-        this.linkHermesReply(jid, summaryText, opts.inReplyTo ?? opts.quotedMessageId);
-      }
-      this.addRecentMessage({
-        id: messageId || `sent-${Date.now()}`,
-        sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
-        recipient: displayRecipient,
-        content: summaryText,
-        timestamp: this.formatDateTime(),
-        fromMe: true,
-        isGroup,
-        messageType: 'image'
-      });
-
-      return { success: true, messageId, jid };
-    } catch (err: unknown) {
-      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
-    }
+    return this.dispatchOutboundMessage({
+      resolved,
+      content: { image: { url: cleanImageUrl }, ...(cleanCaption ? { caption: cleanCaption } : {}) },
+      summaryText,
+      messageType: 'image',
+      quotedMessageId: opts.quotedMessageId,
+      inReplyTo: opts.inReplyTo,
+      source: opts.source
+    });
   }
 
   public async sendDocument(
@@ -1376,21 +1788,17 @@ export class WhatsAppClient {
       source?: 'hermes' | 'api';
     } = {}
   ): Promise<SendResult> {
-    if (!this.sock || this.status !== 'connected') {
-      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
-    }
-
     if (!recipient?.trim() || !documentUrl?.trim()) {
       return { success: false, code: 400, error: 'Recipient and document URL are required' };
     }
+    const precheck = this.precheckSend(recipient, opts.pin);
+    if (precheck) return precheck;
 
     const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
     if (!resolved.success) {
       return resolved;
     }
 
-    const { jid, isGroup, displayRecipient } = resolved;
-    const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
     const cleanCaption = opts.caption?.trim() ? formatWhatsAppText(opts.caption.trim()) : undefined;
     const cleanFileName = opts.fileName?.trim();
     const cleanUrl = documentUrl.trim();
@@ -1424,41 +1832,24 @@ export class WhatsAppClient {
       mimetype = this.inferDocumentMimetype(resolvedFileName);
     }
 
-    try {
-      const result = await this.sock.sendMessage(
-        jid,
-        {
-          document: { url: cleanUrl },
-          mimetype,
-          fileName: resolvedFileName,
-          ...(cleanCaption ? { caption: cleanCaption } : {})
-        },
-        quoted ? { quoted } : undefined
-      );
-      const messageId = result?.key?.id ?? undefined;
+    const summaryText = cleanCaption
+      ? `[Document: ${resolvedFileName}] ${cleanCaption}`
+      : `[Document: ${resolvedFileName}]`;
 
-      this.stats.sentCount++;
-      const summaryText = cleanCaption
-        ? `[Document: ${resolvedFileName}] ${cleanCaption}`
-        : `[Document: ${resolvedFileName}]`;
-      if (opts.source === 'hermes') {
-        this.linkHermesReply(jid, summaryText, opts.inReplyTo ?? opts.quotedMessageId);
-      }
-      this.addRecentMessage({
-        id: messageId || `sent-${Date.now()}`,
-        sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
-        recipient: displayRecipient,
-        content: summaryText,
-        timestamp: this.formatDateTime(),
-        fromMe: true,
-        isGroup,
-        messageType: 'document'
-      });
-
-      return { success: true, messageId, jid };
-    } catch (err: unknown) {
-      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
-    }
+    return this.dispatchOutboundMessage({
+      resolved,
+      content: {
+        document: { url: cleanUrl },
+        mimetype,
+        fileName: resolvedFileName,
+        ...(cleanCaption ? { caption: cleanCaption } : {})
+      },
+      summaryText,
+      messageType: 'document',
+      quotedMessageId: opts.quotedMessageId,
+      inReplyTo: opts.inReplyTo,
+      source: opts.source
+    });
   }
 
   private inferDocumentMimetype(filename: string): string {
@@ -1510,21 +1901,16 @@ export class WhatsAppClient {
       source?: 'hermes' | 'api';
     } = {}
   ): Promise<SendResult> {
-    if (!this.sock || this.status !== 'connected') {
-      return { success: false, code: 503, error: 'WhatsApp is not connected yet. Scan the QR code or press Reconnect first.' };
-    }
-
     if (!recipient?.trim() || !sticker || (typeof sticker === 'string' && !sticker.trim())) {
       return { success: false, code: 400, error: 'Recipient and sticker (URL, file path, base64, or Buffer) are required' };
     }
+    const precheck = this.precheckSend(recipient, opts.pin);
+    if (precheck) return precheck;
 
     const resolved = await this.resolveRecipient(recipient, { pin: opts.pin });
     if (!resolved.success) {
       return resolved;
     }
-
-    const { jid, isGroup, displayRecipient } = resolved;
-    const quoted = opts.quotedMessageId ? this.rawMessages.get(opts.quotedMessageId) : undefined;
 
     let stickerBuffer: Buffer;
     try {
@@ -1538,37 +1924,18 @@ export class WhatsAppClient {
       return { success: false, code: 400, error: `Failed to prepare sticker: ${err instanceof Error ? err.message : String(err)}` };
     }
 
-    try {
-      const result = await this.sock.sendMessage(
-        jid,
-        {
-          sticker: stickerBuffer,
-          ...(typeof opts.isAnimated === 'boolean' ? { isAnimated: opts.isAnimated } : {})
-        },
-        quoted ? { quoted } : undefined
-      );
-      const messageId = result?.key?.id ?? undefined;
-
-      this.stats.sentCount++;
-      const summaryText = '[Sticker]';
-      if (opts.source === 'hermes') {
-        this.linkHermesReply(jid, summaryText, opts.inReplyTo ?? opts.quotedMessageId);
-      }
-      this.addRecentMessage({
-        id: messageId || `sent-${Date.now()}`,
-        sender: opts.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
-        recipient: displayRecipient,
-        content: summaryText,
-        timestamp: this.formatDateTime(),
-        fromMe: true,
-        isGroup,
-        messageType: 'sticker'
-      });
-
-      return { success: true, messageId, jid };
-    } catch (err: unknown) {
-      return { success: false, code: 502, error: this.formatSendError(err, displayRecipient) };
-    }
+    return this.dispatchOutboundMessage({
+      resolved,
+      content: {
+        sticker: stickerBuffer,
+        ...(typeof opts.isAnimated === 'boolean' ? { isAnimated: opts.isAnimated } : {})
+      },
+      summaryText: '[Sticker]',
+      messageType: 'sticker',
+      quotedMessageId: opts.quotedMessageId,
+      inReplyTo: opts.inReplyTo,
+      source: opts.source
+    });
   }
 
 

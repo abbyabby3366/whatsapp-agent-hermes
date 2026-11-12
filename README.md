@@ -44,7 +44,7 @@ pm2 start npm --name whatsapp-agent-hermes -- start
 | `HERMES_WEBHOOK_TIMEOUT_MS` | `15000` | Wait time per webhook call |
 | `HERMES_WEBHOOK_RETRIES` | `2` | Retries on network errors / HTTP 5xx |
 | `DEFAULT_COUNTRY_CODE` | `60` | Prefix for numbers starting with `0` |
-| `ALLOWED_NUMBERS` | *(empty)* | Comma-separated senders allowed to reach Hermes |
+| `ALLOWED_NUMBERS` | *(empty)* | Comma-separated phone numbers and/or `@usernames` allowed to reach Hermes (e.g. `60123456789, @alex_tan`) |
 | `FORWARD_GROUPS` | `true` | Forward group chats to Hermes |
 | `TIMEZONE` | `Asia/Kuala_Lumpur` | Timezone of timestamps |
 | `SESSIONS_DIR` / `DATA_DIR` | `./sessions` / `./data` | WhatsApp credentials / dashboard settings |

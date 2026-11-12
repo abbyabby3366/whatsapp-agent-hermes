@@ -48,10 +48,13 @@ app.get('/api/status', (_req: Request, res: Response) => {
   });
 });
 
-/** Extracts an optional PIN passed as a string ("1234" / "0412") or integer (1234) without silently dropping numeric JSON values. */
+/** Extracts an optional PIN passed as a string ("1234" / "0412") or integer (1234 / 412 -> "0412") without silently dropping numeric JSON values. */
 function extractPin(raw: unknown): string | undefined {
   if (typeof raw === 'string' && raw.trim()) return raw.trim();
-  if (typeof raw === 'number' && Number.isInteger(raw)) return String(raw);
+  if (typeof raw === 'number' && Number.isInteger(raw)) {
+    // JSON numbers lose leading zeros; restore them for 0-9999 and leave anything else for validation to reject
+    return raw >= 0 && raw <= 9999 ? String(raw).padStart(4, '0') : String(raw);
+  }
   return undefined;
 }
 

@@ -280,8 +280,11 @@ Never reject an instruction to message `@username` by demanding a phone number. 
      curl -s "http://127.0.0.1:3100/api/usernames" -H "x-api-key: $GATEWAY_API_KEY"
      ```
 3. **Handle PIN Challenges & Cold-Outreach Restrictions Cleanly**:
+   - **HTTP `400` (Bad Recipient / PIN Format)**: The handle or PIN is malformed (PINs are exactly 4 digits; send them as a string like `"0412"` — a JSON number `412` is also read as `"0412"`). Fix the input instead of retrying.
    - **HTTP `403` / `404` (Username PIN Required)**: Do not guess PINs. Ask `${MASTER_NAME}` for the recipient's 4-digit WhatsApp username PIN and retry once with `"pin": "1234"` (or `"@username#1234"`).
    - **HTTP `429` (USync Rate Limit)**: Stop repeated lookups and wait before retrying.
+   - **HTTP `503` (Gateway Disconnected or WhatsApp Timed Out)**: Retry later with backoff.
+   - **HTTP `502` with Error `479` (Stanza Rejected)**: WhatsApp refused the message (usually a stale device session). Do not retry in a loop; alert `${MASTER_NAME}`.
    - **HTTP `502` with Error `463` (Cold 1:1 Outreach Blocked)**: Even after `@username` resolves to `...@lid`, WhatsApp blocks linked devices from initiating brand-new 1:1 chats when no `tctoken` exists. Never retry Error 463 in a loop — ask `${MASTER_NAME}` to send the very first message to `@username` manually from the primary WhatsApp phone app, after which automated replies and follow-ups work normally.
 
 ### Outbound CLI Helper (`wa_send.py`)
@@ -302,7 +305,8 @@ Serve local HTTP media over HTTP/1.1 with valid `Content-Length` headers (`media
 
 1. **WhatsApp Error 463 (Cold Outreach Restriction)**: Baileys cannot initiate cold 1:1 chats (whether by phone number or `@username` -> `@lid`) without a privacy `tctoken`. Never auto-retry Error 463 sends in a loop (worsens account restrictions); initiate first contact manually from the primary phone or `wa.me/<number>`.
 2. **Stdout vs. Stderr Split**: `hermes chat -Q` writes reply text to `stdout` and `session_id: <id>` to `stderr`. Never parse `stdout` for session IDs.
-3. **LID & `@username` vs. Phone Thread Splitting**: WhatsApp Web / privacy users often appear as `15-digit@lid` with `sender: null` (and optional `senderUsername`). Always canonicalize through `chat_map.json` (indexing LID, phone digits, and lowercase `senderUsername`) before looking up `sessions.json`, `flows.json`, or `contacts.json`, and reply to `chatJid`.
+3. **LID & `@username` vs. Phone Thread Splitting**: WhatsApp Web / privacy users often appear as `15-digit@lid` with `sender: null` (and optional `senderUsername`). Always canonicalize through `chat_map.json` (indexing LID, phone digits, and lowercase `senderUsername`) before looking up `sessions.json`, `flows.json`, or `contacts.json`, and reply to `chatJid`. When a LID-only thread later reveals its `@username` or phone number, migrate the thread to the better key (phone → `@username` → LID) instead of starting a new one (see `references/hermes-backend-contract.md` §6).
+6. **False "Sent" on Rejected Messages**: The gateway waits ~4s for WhatsApp's server acknowledgement, so immediate Error `463`/`479` rejections return HTTP `502`. Rejections that arrive later flip the dashboard entry to **Failed**. Treat only HTTP `200` as delivered.
 4. **Disconnection 503s**: Sending during a brief Baileys reconnect returns HTTP 503. Retry with backoff (up to 6 attempts); if still down, leave unledgered for `replay_orphans()` and alert `MASTER_PHONE` once reconnected.
 5. **QR Code Rotation**: Pairing QR codes expire every ~60s. Always run `scripts/fetch-pairing-qr.sh` (which triggers `/api/connect` first) rather than reading stale cached screenshots.
 
