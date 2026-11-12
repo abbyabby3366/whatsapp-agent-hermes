@@ -280,9 +280,8 @@ Process raw AI reply text in this exact deterministic order:
    ```
 5. **Split Multi-Messages (`===MSG===`)**:
    - Split on `===MSG===`, apply `sanitize_reply()` to each chunk, drop empty chunks, and cap at `MAX_MESSAGES_PER_TURN` (`5`; merge overflow into chunk 5).
-6. **Draft Approval Gate**:
-   - If `approval_mode` is enabled (and recipient is not `MASTER_PHONE`), forward the preview to `MASTER_PHONE` and pause **without** calling `/api/read` on the contact's message yet.
-7. **Read Receipt + Human Cadence Dispatch**:
+6. **Read Receipt + Immediate Live Human Cadence Dispatch (No Draft Approval Gate)**:
+   - Never hold outbound contact replies behind a `[DRAFT APPROVAL]` queue — dispatch live directly to `chatJid`.
    - Call `POST /api/read { "messageId": inbound_id }` right before sending chunk 1.
    - Send chunk 1 immediately (`POST /api/send`, no prior typing indicator).
    - For chunks `2..N`: call `POST /api/presence { "recipient": chatJid, "presence": "composing" }`, sleep `SPLIT_MESSAGE_DELAY_SECONDS` (`2.0s`), call `POST /api/send`, then call `POST /api/presence { "recipient": chatJid, "presence": "paused" }`.

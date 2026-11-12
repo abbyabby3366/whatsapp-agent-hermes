@@ -145,7 +145,6 @@ https://gateway.example.com -> Nginx (TLS) -> SSH Remote Tunnel (127.0.0.1:3101)
 | `HISTORY_LIMIT` | `30` | Prior SQLite turns injected as read-only conversation context |
 | `DAILY_REPLY_LIMIT_PER_PERSON` | `25` | Max automated replies per contact per 24h |
 | `HOURLY_GLOBAL_REPLY_LIMIT` | `60` | Max automated replies globally per rolling hour |
-| `DRAFT_APPROVAL_DEFAULT` | `false` | Initial draft approval state when `state.json` is initialized |
 | `SPLIT_MESSAGE_DELAY_SECONDS` | `2.0` | Typing delay between `===MSG===` chunks `2..N` |
 | `MAX_MESSAGES_PER_TURN` | `5` | Hard ceiling on outbound messages per turn |
 | `DRY_RUN` | `false` | Logs full reply plan without calling `/api/send` |

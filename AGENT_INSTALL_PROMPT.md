@@ -185,7 +185,8 @@ Implement the receiver modules in `~/whatsapp-agent-receiver/` (`receiver.py`, `
        - **If a Gemini API key is present**: Use **Gemini Audio** (`gemini-3.8-flash`, `thinking_level: "low"` or `"medium"`, `store=False`) to extract accurate multilingual/Manglish transcript + vocal vibe (`[voice note | vibe: polite | transcript: "..."]`). If a configured Gemini key fails authentication/quota, log the error visibly and alert `MASTER_PHONE`.
        - **Else (no Gemini API key configured)**: Use local **`faster-whisper`** (`WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)`, `vad_filter=True`, lazy singleton) so voice transcription works out of the box with zero API keys (`[voice note | engine: faster-whisper | lang: ... | transcript: "..."]`).
      - Strip and forward `@@FLAG@@` lines first, then evaluate `NO_REPLY`, then run `sanitize_reply()` (ensuring WhatsApp `*bold*`, never Markdown `**bold**`).
-     - Right before dispatching an approved reply: call `POST /api/read {"messageId": messageId}`, send chunk 1 via `POST /api/send`, and for split chunks `2..N` (`===MSG===`) show `presence: "composing"` for `~2.0s` between chunks before pausing presence.
+     - **Live Auto-Reply Immediately (NO Draft Approval Gate)**: Do **NOT** implement or enable any `[DRAFT APPROVAL]` / manual approval queue. Once connected, inbound contact turns reply live automatically (unless `NO_REPLY`, global `off`, or the contact is paused / `"auto_reply": false`).
+     - Right before dispatching an outbound reply: call `POST /api/read {"messageId": messageId}`, send chunk 1 via `POST /api/send`, and for split chunks `2..N` (`===MSG===`) show `presence: "composing"` for `~2.0s` between chunks before pausing presence.
 4. **Gateway REST Helpers** (all require header `x-api-key: <GATEWAY_API_KEY>`; `to` accepts phone digits, `chatJid`, `@username`, or `@username#1234` with 4-digit PIN):
    - `POST /api/send`          `{ "to": chatJid | "@username", "message": "...", "pin"?: "1234", "replyToMessageId"?: messageId }`
    - `POST /api/send-image`    `{ "to": chatJid | "@username", "url": "...", "caption"?: "...", "pin"?: "1234", "replyToMessageId"?: messageId }`
@@ -197,9 +198,9 @@ Implement the receiver modules in `~/whatsapp-agent-receiver/` (`receiver.py`, `
    - `POST /api/read`          `{ "messageId": "..." }`
    - `GET  /api/media/<messageId>` -> raw media bytes
 
-### Step 9: End-to-End Verification
+### Step 9: End-to-End Verification & Master Setup Notification
 1. `curl -s http://127.0.0.1:3100/api/health` -> `"whatsapp": "connected"`
 2. `curl -s http://127.0.0.1:5000/health` -> `"ok": true` AND `"brain_ready": true`
 3. `curl -s -X POST http://127.0.0.1:3100/api/webhook/test -H "x-api-key: $GATEWAY_API_KEY"` -> `"success": true, "status": 200`
-4. Ask the human to send a test WhatsApp message (first from their `MASTER_PHONE` DM to verify `status` and capture `MASTER_LID` if applicable, then from a second phone to verify first-person `${MASTER_NAME}` reply style).
+4. **Notify `MASTER_PHONE` & Go Live Immediately**: Once WhatsApp is `"connected"` and checks 1–3 pass, leave automated replies **ON and live** (never enable any draft-approval mode) and send a single concise WhatsApp message to `MASTER_PHONE` via `POST /api/send` saying setup is complete and live auto-reply is active (e.g., `"WhatsApp AI Agent setup complete. Live auto-reply is active."`). *(If WhatsApp returns Error 463 because the linked number has no prior chat thread with `MASTER_PHONE`, do not retry — just confirm completion to the user in chat.)*
 ````
