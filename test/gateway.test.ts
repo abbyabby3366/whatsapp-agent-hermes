@@ -269,4 +269,55 @@ describe('HTTP Gateway (Express 5, CSP, Auth Rate Limit, SSE)', () => {
     });
     assert.equal(recoveredRes.status, 200);
   });
+
+  it('serves GET /api/qr.png with auth, 404 when unready, raw PNG on qr_ready, and 409 when connected', async () => {
+    const unauthQr = await fetch(`${baseUrl}/api/qr.png`);
+    assert.equal(unauthQr.status, 401);
+
+    const pngBytes = await sharp({
+      create: { width: 32, height: 32, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } }
+    })
+      .png()
+      .toBuffer();
+    const originalGetState = waClient.getState.bind(waClient);
+
+    try {
+      waClient.getState = () => ({
+        ...originalGetState(),
+        status: 'disconnected',
+        qrCodeDataUrl: null
+      });
+      const notReadyRes = await fetch(`${baseUrl}/api/qr.png`, {
+        headers: { 'x-api-key': TEST_API_KEY }
+      });
+      assert.equal(notReadyRes.status, 404);
+
+      waClient.getState = () => ({
+        ...originalGetState(),
+        status: 'qr_ready',
+        qrCodeDataUrl: `data:image/png;base64,${pngBytes.toString('base64')}`
+      });
+      const qrRes = await fetch(`${baseUrl}/api/qr.png`, {
+        headers: { 'x-api-key': TEST_API_KEY }
+      });
+      assert.equal(qrRes.status, 200);
+      assert.equal(qrRes.headers.get('content-type'), 'image/png');
+      assert.equal(qrRes.headers.get('cache-control'), 'no-store');
+      const bodyBytes = Buffer.from(await qrRes.arrayBuffer());
+      assert.equal(bodyBytes.equals(pngBytes), true);
+
+      waClient.getState = () => ({
+        ...originalGetState(),
+        status: 'connected',
+        user: { id: '60123456789@s.whatsapp.net', name: 'Test' },
+        qrCodeDataUrl: null
+      });
+      const connectedRes = await fetch(`${baseUrl}/api/qr.png`, {
+        headers: { 'x-api-key': TEST_API_KEY }
+      });
+      assert.equal(connectedRes.status, 409);
+    } finally {
+      waClient.getState = originalGetState;
+    }
+  });
 });

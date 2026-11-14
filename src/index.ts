@@ -111,6 +111,46 @@ app.get('/api/status', (_req: Request, res: Response) => {
   });
 });
 
+// Returns the current WhatsApp pairing QR code as raw PNG bytes (authenticated).
+app.get('/api/qr.png', (_req: Request, res: Response) => {
+  const state = waClient.getState();
+  if (state.status === 'connected') {
+    res.status(409).json({
+      success: false,
+      status: 'connected',
+      user: state.user,
+      error: 'WhatsApp is already connected'
+    });
+    return;
+  }
+
+  const qrDataUrl = state.qrCodeDataUrl;
+  const pngPrefix = 'data:image/png;base64,';
+  if (!qrDataUrl || !qrDataUrl.startsWith(pngPrefix)) {
+    res.status(404).json({
+      success: false,
+      status: state.status,
+      error: 'Pairing QR code is not ready yet'
+    });
+    return;
+  }
+
+  const pngBuffer = Buffer.from(qrDataUrl.slice(pngPrefix.length), 'base64');
+  if (pngBuffer.length === 0) {
+    res.status(404).json({
+      success: false,
+      status: state.status,
+      error: 'Pairing QR code is empty'
+    });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.status(200).send(pngBuffer);
+});
+
 // Server-Sent Events stream for real-time dashboard updates without polling.
 app.get('/api/events', (req: Request, res: Response) => {
   res.status(200);

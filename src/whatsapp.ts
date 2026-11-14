@@ -35,8 +35,10 @@ import QRCode from 'qrcode';
 import fs from 'fs';
 import path from 'path';
 import { config, formatDateTimeParts, loadSettings, saveSettings, type RuntimeSettings } from './config.js';
+import { formatWhatsAppText } from './formatting.js';
 import { postToHermes } from './hermes.js';
 import { MediaResolutionError, resolveMediaInput } from './media.js';
+import { inferDocumentMimetype } from './mime.js';
 import { DebouncedJsonWriter } from './persistence.js';
 import { prepareSticker } from './sticker.js';
 
@@ -146,89 +148,7 @@ interface ParsedContent {
   contextInfo?: proto.IContextInfo | null;
 }
 
-const DOCUMENT_MIME_TYPES: Record<string, string> = {
-  pdf: 'application/pdf',
-  doc: 'application/msword',
-  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  xls: 'application/vnd.ms-excel',
-  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  ppt: 'application/vnd.ms-powerpoint',
-  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  csv: 'text/csv',
-  txt: 'text/plain',
-  log: 'text/plain',
-  md: 'text/markdown',
-  markdown: 'text/markdown',
-  json: 'application/json',
-  yaml: 'application/yaml',
-  yml: 'application/yaml',
-  xml: 'application/xml',
-  html: 'text/html',
-  htm: 'text/html',
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  webp: 'image/webp',
-  gif: 'image/gif',
-  svg: 'image/svg+xml',
-  mp3: 'audio/mpeg',
-  ogg: 'audio/ogg',
-  oga: 'audio/ogg',
-  opus: 'audio/ogg',
-  wav: 'audio/wav',
-  m4a: 'audio/mp4',
-  mp4: 'video/mp4',
-  zip: 'application/zip',
-  gz: 'application/gzip',
-  tgz: 'application/gzip',
-  tar: 'application/x-tar',
-  '7z': 'application/x-7z-compressed'
-};
-
-export function inferDocumentMimetype(filename: string): string {
-  const dotIdx = filename.lastIndexOf('.');
-  if (dotIdx === -1 || dotIdx === filename.length - 1) {
-    return 'application/octet-stream';
-  }
-  const ext = filename.slice(dotIdx + 1).toLowerCase();
-  return DOCUMENT_MIME_TYPES[ext] ?? 'application/octet-stream';
-}
-
-/**
- * Normalizes text formatting for WhatsApp:
- * 1. Converts standard Markdown **bold** to WhatsApp *bold*.
- * 2. Ensures space boundaries before opening * and after closing * when adjacent to alphanumeric/CJK characters,
- *    preventing WhatsApp from rendering raw asterisks (e.g. "be*bold*" -> "be *bold*", "字*粗体*" -> "字 *粗体*").
- * 3. Preserves fenced code blocks, inline code spans, isolated multiplication/asterisk operators (e.g. "2 * 3 = 6"), and URLs.
- */
-export function formatWhatsAppText(text: string): string {
-  if (!text) return text;
-
-  // Temporarily shield fenced code blocks, inline code spans, and URLs so inner asterisks are never altered
-  const shielded: string[] = [];
-  const stash = (match: string): string => {
-    const token = `\x00SHIELD${shielded.length}\x00`;
-    shielded.push(match);
-    return token;
-  };
-
-  let formatted = text
-    .replace(/```[\s\S]*?```/g, stash)
-    .replace(/`[^`\n]+`/g, stash)
-    .replace(/https?:\/\/[^\s)>]+/g, stash);
-
-  // Convert Markdown **bold** to *bold*
-  formatted = formatted.replace(/\*\*([^\n*]+?)\*\*/g, '*$1*');
-
-  // Ensure leading space before opening * if preceded by alphanumeric/CJK letter/number
-  formatted = formatted.replace(/([\p{L}\p{N}])\*([^\s*](?:[^*\n]*?[^\s*])?)\*/gu, '$1 *$2*');
-
-  // Ensure trailing space after closing * if followed by alphanumeric/CJK letter/number
-  formatted = formatted.replace(/\*([^\s*](?:[^*\n]*?[^\s*])?)\*([\p{L}\p{N}])/gu, '*$1* $2');
-
-  // Restore shielded blocks via replacer function so literal "$" characters stay untouched
-  return formatted.replace(/\x00SHIELD(\d+)\x00/g, (_match, idx) => shielded[Number(idx)] ?? '');
-}
+export { inferDocumentMimetype, formatWhatsAppText };
 
 /** Message kinds that are protocol noise rather than something a person wrote. */
 const IGNORED_CONTENT_TYPES = new Set([

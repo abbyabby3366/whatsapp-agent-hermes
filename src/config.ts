@@ -1,7 +1,14 @@
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
+import {
+  formatDateTimeParts as formatDateTimePartsForZone,
+  getDateTimeFormatter,
+  isPlaceholderSecret
+} from './formatting.js';
 import { DebouncedJsonWriter } from './persistence.js';
+
+export { isPlaceholderSecret };
 
 const intFromEnv = (name: string, fallback: number): number => {
   const parsed = parseInt(process.env[name] ?? '', 10);
@@ -23,8 +30,6 @@ const boolFromEnv = (name: string, fallback: boolean): boolean => {
   if (!raw) return fallback;
   return ['1', 'true', 'yes', 'on'].includes(raw);
 };
-
-export const isPlaceholderSecret = (value: string): boolean => /^change-me(-|$)/i.test(value.trim());
 
 /**
  * Parses ALLOWED_NUMBERS: phone numbers become digits (a leading 0 gets DEFAULT_COUNTRY_CODE),
@@ -61,26 +66,6 @@ const defaultCountryCode = (process.env.DEFAULT_COUNTRY_CODE ?? '60').replace(/[
 const dataDir = process.env.DATA_DIR || './data';
 const timezone = process.env.TIMEZONE?.trim() || 'Asia/Kuala_Lumpur';
 
-const dateTimeFormatters = new Map<string, Intl.DateTimeFormat>();
-
-function getDateTimeFormatter(timeZone: string): Intl.DateTimeFormat {
-  let formatter = dateTimeFormatters.get(timeZone);
-  if (!formatter) {
-    formatter = new Intl.DateTimeFormat('en-GB', {
-      timeZone,
-      day: '2-digit',
-      month: '2-digit',
-      year: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hourCycle: 'h23'
-    });
-    dateTimeFormatters.set(timeZone, formatter);
-  }
-  return formatter;
-}
-
 try {
   getDateTimeFormatter(timezone);
 } catch {
@@ -91,22 +76,7 @@ export function formatDateTimeParts(
   date: Date = new Date(),
   timeZone: string = timezone
 ): { date: string; time: string; full: string } {
-  const formatter = getDateTimeFormatter(timeZone);
-  const parts = new Map<string, string>();
-  for (const part of formatter.formatToParts(date)) {
-    if (part.type !== 'literal') {
-      parts.set(part.type, part.value);
-    }
-  }
-  const day = parts.get('day') ?? '';
-  const month = parts.get('month') ?? '';
-  const year = parts.get('year') ?? '';
-  const hour = parts.get('hour') ?? '';
-  const minute = parts.get('minute') ?? '';
-  const second = parts.get('second') ?? '';
-  const dateStr = `${day}-${month}-${year}`;
-  const timeStr = `${hour}:${minute}:${second}`;
-  return { date: dateStr, time: timeStr, full: `${dateStr} ${timeStr}` };
+  return formatDateTimePartsForZone(date, timeZone);
 }
 
 const apiKey = process.env.GATEWAY_API_KEY?.trim() || '';

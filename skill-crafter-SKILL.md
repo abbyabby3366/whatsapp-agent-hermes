@@ -59,7 +59,7 @@ Use this skill whenever the human owner teaches, corrects, or defines how the ag
 
 ## Standard Single-File Template: `whatsapp-agent-rules/SKILL.md`
 
-When creating or updating `~/.hermes/skills/whatsapp-agent-rules/SKILL.md`, keep this exact 3-section structure inside the single file so **both** global Hermes sessions (CLI, cron, Master DM) **and** `receiver.py` (live WhatsApp contact turns) can consume it safely:
+When creating or updating `~/.hermes/skills/whatsapp-agent-rules/SKILL.md`, keep this exact 3-section structure inside the single file so **both** global Hermes sessions (CLI, cron, Master DM) **and** the built-in webhook receiver (`hermes-wa-receiver`) can consume it safely:
 
 ```markdown
 ---
@@ -74,13 +74,13 @@ updated_at: "2026-11-12T15:30:00+08:00"
 Last updated: `12-11-26 15:30` (`GMT+8`)
 
 ## 1. Operator & Outbound Workflow Rules (Owner-Only)
-<!-- How Hermes operates WhatsApp globally (wa_send.py, @username outreach, escalations, reporting, schedules). Never injected into external contact prompts. -->
+<!-- How Hermes operates WhatsApp globally (`~/.local/bin/wa-send`, @username outreach, escalations, reporting, schedules). Never injected into external contact prompts. -->
 
 ## 2. Global Contact Reply Rules & Business Facts
 <!-- Tone, boundaries, pricing, availability, and FAQs injected into every WhatsApp contact reply turn. -->
 
 ## 3. Contact-Specific Rules
-<!-- Use `### <phone | @username | Display Name>` per person. receiver.py injects ONLY the matching contact's block on their turn so contacts never see each other's notes. -->
+<!-- Use `### <phone | @username | Display Name>` per person. The webhook receiver injects ONLY the matching contact's block on their turn so contacts never see each other's notes. -->
 ```
 
 ### Routing Inside `whatsapp-agent-rules/SKILL.md`
@@ -124,7 +124,7 @@ Because every crafted skill is strictly a single `SKILL.md` file:
 - **Export via CLI / Chat**: Output or copy `~/.hermes/skills/<skill-slug>/SKILL.md` directly.
 - **Export over Master 1:1 WhatsApp DM**: Send the single `.md` file directly to `MASTER_PHONE` as a document:
   ```bash
-  python3 ~/whatsapp-hermes-receiver/wa_send.py doc "$MASTER_PHONE" ~/.hermes/skills/whatsapp-agent-rules/SKILL.md "Exported whatsapp-agent-rules SKILL.md"
+  ~/.local/bin/wa-send doc "$MASTER_PHONE" ~/.hermes/skills/whatsapp-agent-rules/SKILL.md "Exported whatsapp-agent-rules SKILL.md"
   ```
 - **Import on a New Server**: Place the exported file at `~/.hermes/skills/<skill-slug>/SKILL.md` — no extra folders or build steps required.
 

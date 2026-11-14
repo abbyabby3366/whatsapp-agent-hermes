@@ -1,8 +1,20 @@
 # Deployment, Systemd Units & Tunables Reference
 
-## 1. Systemd User Services (`systemd --user`)
+## 1. One-Command Installer (`scripts/install.sh`)
 
-Always run both the gateway and the receiver under `systemd --user` with user lingering enabled so services survive SSH disconnects and reboots cleanly (never mix `pm2` and `systemd` on the same host):
+Run the idempotent installer on the Linux host to configure both secrets, build `dist/`, install `~/.hermes/skills/`, add `~/.local/bin/{wa-send,wa-history,wa-flow,wa-qr}`, pre-warm ONNX Whisper, enable `systemd --user` lingering, and run self-checks:
+
+```bash
+bash ~/whatsapp-agent-hermes/scripts/install.sh \
+  --master-phone 60123456789 \
+  --master-name "Alex"
+```
+
+---
+
+## 2. Systemd User Services (`systemd --user`)
+
+Always run both the gateway and the built-in Node receiver under `systemd --user` with user lingering enabled so services survive SSH disconnects and reboots cleanly (never mix `pm2` and `systemd` on the same host). Service templates live in `~/whatsapp-agent-hermes/systemd/*.service.tpl`:
 
 ```bash
 sudo loginctl enable-linger "$USER"
@@ -10,18 +22,20 @@ mkdir -p ~/.config/systemd/user
 ```
 
 ### `~/.config/systemd/user/whatsapp-agent-hermes.service`
-*(Verify `command -v node` first; if Node is installed via `nvm`/`fnm`/`mise`, include its bin directory in `PATH` and set `ExecStart` to that `node` binary directly so `SIGTERM` reaches Node cleanly without an `npm` wrapper.)*
+*(Rendered from `systemd/whatsapp-agent-hermes.service.tpl` using the exact `node >= 22.5.0` binary detected during install.)*
 ```ini
 [Unit]
 Description=WhatsApp Agent Hermes Gateway (Baileys)
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=%h/whatsapp-agent-hermes
-Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="NODE_ENV=production"
+Environment="PATH={{NODE_BIN_DIR}}:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=%h/whatsapp-agent-hermes/.env
-ExecStart=/usr/bin/env node %h/whatsapp-agent-hermes/dist/index.js
+ExecStart={{NODE_BIN}} %h/whatsapp-agent-hermes/dist/index.js
 Restart=always
 RestartSec=5
 
@@ -30,18 +44,20 @@ WantedBy=default.target
 ```
 
 ### `~/.config/systemd/user/hermes-wa-receiver.service`
-*(Run `receiver.py` using its dedicated `%h/whatsapp-hermes-receiver/.venv/bin/python` virtualenv where `faster-whisper` is installed, while keeping `%h/.local/bin` and `%h/.hermes/hermes-agent/venv/bin` in `PATH` so `receiver.py` always finds the `hermes` CLI under `systemd --user`.)*
+*(Rendered from `systemd/hermes-wa-receiver.service.tpl` — runs the built-in Node receiver with `--no-warnings=ExperimentalWarning` for `node:sqlite`, zero Python `.venv`, while keeping `%h/.local/bin` and `%h/.hermes/hermes-agent/venv/bin` on `PATH` so `hermes chat -Q` always resolves under `systemd --user`.)*
 ```ini
 [Unit]
-Description=Hermes WhatsApp Webhook Receiver
+Description=Hermes WhatsApp Webhook Receiver (Built-In Node)
 After=network-online.target whatsapp-agent-hermes.service
+Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=%h/whatsapp-hermes-receiver
-Environment="PATH=%h/.local/bin:%h/.hermes/hermes-agent/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="NODE_ENV=production"
+Environment="PATH={{NODE_BIN_DIR}}:%h/.local/bin:%h/.hermes/hermes-agent/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=%h/whatsapp-hermes-receiver/receiver.env
-ExecStart=%h/whatsapp-hermes-receiver/.venv/bin/python %h/whatsapp-hermes-receiver/receiver.py
+ExecStart={{NODE_BIN}} --no-warnings=ExperimentalWarning %h/whatsapp-agent-hermes/dist/receiver/index.js
 KillMode=control-group
 TimeoutStopSec=130
 Restart=always
@@ -58,11 +74,11 @@ systemctl --user enable --now whatsapp-agent-hermes hermes-wa-receiver
 ```
 
 ### Voice-Note Transcription
-Voice notes are transcribed locally via `faster-whisper` (`WHISPER_MODEL=base`) with zero external API keys. No Gemini or other LLM/provider key is ever requested or stored.
+Voice notes are transcribed locally in Node via `@huggingface/transformers` (`onnx-community/whisper-base`, CPU `q8`) + `ffmpeg-static` with zero Python and zero external API keys.
 
 ---
 
-## 2. Public Dashboard Exposure (Nginx Reverse Proxy + SSH Tunnel)
+## 3. Public Dashboard Exposure (Nginx Reverse Proxy + SSH Tunnel)
 
 Keep `HOST=127.0.0.1` on the gateway and expose the dashboard externally only behind TLS + `GATEWAY_API_KEY`:
 
@@ -98,32 +114,38 @@ Optional comma-separated list of phone numbers and/or WhatsApp `@usernames` (e.g
 
 ---
 
-## 3. Complete `receiver.env` Tunables
+## 4. Complete `receiver.env` Tunables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `RECEIVER_PORT` | `5000` | Receiver listen port on `127.0.0.1` |
-| `HERMES_SECRET_TOKEN` | *(required)* | Shared webhook auth header (`x-hermes-token`) |
+| `RECEIVER_HOST` | `127.0.0.1` | Receiver bind address |
+| `RECEIVER_PORT` | `5000` | Receiver listen port |
+| `RECEIVER_DATA_DIR` | `~/whatsapp-hermes-receiver` | Directory for SQLite history, stores, prompts, media & model cache |
 | `WHATSAPP_GATEWAY_URL` | `http://127.0.0.1:3100` | Gateway REST base URL |
 | `GATEWAY_API_KEY` | *(required)* | Shared API key sent as `x-api-key` to gateway `/api/*` |
+| `HERMES_SECRET_TOKEN` | *(required)* | Shared webhook auth header (`x-hermes-token`) |
 | `MASTER_PHONE` | *(required)* | Master operator phone digits (alias: `OWNER_WHATSAPP`) |
 | `MASTER_LID` | `""` | Optional 15-digit WhatsApp LID for Master 1:1 DM recognition |
 | `MASTER_NAME` | *(required)* | Principal's real name for first-person voice |
+| `DEFAULT_COUNTRY_CODE` | `60` | Prefix applied to leading `0` phone inputs |
 | `TIMEZONE` | `Asia/Kuala_Lumpur` | Timezone (`GMT+8`) for `DD-MM-YY` formatted timestamps |
-| `WHISPER_MODEL` | `base` | Local `faster-whisper` model (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) used for all voice-note transcription |
-| `WHISPER_DEVICE` | `cpu` | Execution device for local `faster-whisper` (`cpu` or `cuda`) |
-| `WHISPER_COMPUTE_TYPE` | `int8` | Quantization type for local `faster-whisper` (`int8` on CPU, `float16` on CUDA) |
+| `WHISPER_MODEL` | `base` | Local ONNX Whisper model shorthand (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) or HF model ID |
+| `WHISPER_DTYPE` | `q8` | ONNX quantization (`q8` on CPU, `fp32`, `fp16`, or `q4`) |
+| `WHISPER_CACHE_DIR` | `~/whatsapp-hermes-receiver/models` | Persistent ONNX model cache outside `node_modules` |
+| `HERMES_BIN` | `hermes` | Path to the `hermes` CLI binary |
+| `HERMES_RULES_PATH` | `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` | User-owned hot-reloaded WhatsApp rules file |
 | `AGENT_TOOLSETS` | `web,vision` | Restricted read-only toolsets for external contacts |
 | `AGENT_TOOLSETS_OWNER` | `terminal,file,web,vision` | Elevated toolsets exclusively for 1:1 Master DM |
 | `AGENT_TIMEOUT_SECONDS` | `300` | Max execution time per Hermes turn |
 | `COALESCE_WINDOW_SECONDS` | `2.5` | Burst bundling window for consecutive messages |
 | `MAX_CONCURRENT_RUNS` | `4` | Max parallel Hermes subprocesses |
 | `DRAIN_SECONDS` | `120` | Graceful shutdown wait window |
-| `STARTUP_REPLAY` | `true` | Replay unanswered `processing` messages on receiver boot |
+| `STARTUP_REPLAY` | `true` | Replay unledgered inbound messages on receiver boot |
 | `REPLAY_MAX_AGE_MIN` | `60` | Maximum age (minutes, via `rawTimestamp`) for startup replay |
 | `HISTORY_LIMIT` | `30` | Prior SQLite turns injected as read-only conversation context |
 | `DAILY_REPLY_LIMIT_PER_PERSON` | `25` | Max automated replies per contact per 24h |
 | `HOURLY_GLOBAL_REPLY_LIMIT` | `60` | Max automated replies globally per rolling hour |
 | `SPLIT_MESSAGE_DELAY_SECONDS` | `2.0` | Typing delay between `===MSG===` chunks `2..N` |
 | `MAX_MESSAGES_PER_TURN` | `5` | Hard ceiling on outbound messages per turn |
+| `MAX_MEDIA_BYTES` | `26214400` | Maximum media byte limit for `wa-send` data URIs (25 MiB) |
 | `DRY_RUN` | `false` | Logs full reply plan without calling `/api/send` |

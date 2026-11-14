@@ -7,20 +7,26 @@ set -euo pipefail
 OUT_PATH="${1:-/tmp/wa-qr.png}"
 mkdir -p "$(dirname "$OUT_PATH")"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_CANDIDATES=(
+  "${RECEIVER_ENV_FILE:-}"
+  "${SCRIPT_DIR}/../.env"
   "${HOME}/whatsapp-agent-hermes/.env"
   "${HOME}/whatsapp-hermes-receiver/receiver.env"
   ".env"
 )
 
-# Load PORT / GATEWAY_API_KEY from env files if not already exported
+# Load PORT / WHATSAPP_GATEWAY_URL / GATEWAY_API_KEY from env files if not already exported
 for env_file in "${ENV_CANDIDATES[@]}"; do
-  if [[ -f "$env_file" ]]; then
+  if [[ -n "$env_file" && -f "$env_file" ]]; then
     if [[ -z "${GATEWAY_API_KEY:-}" ]]; then
-      GATEWAY_API_KEY="$(grep -E '^GATEWAY_API_KEY=' "$env_file" | tail -n1 | cut -d'=' -f2- | tr -d '"\r' || true)"
+      GATEWAY_API_KEY="$(grep -E '^GATEWAY_API_KEY=' "$env_file" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r" || true)"
+    fi
+    if [[ -z "${WHATSAPP_GATEWAY_URL:-}" ]]; then
+      WHATSAPP_GATEWAY_URL="$(grep -E '^WHATSAPP_GATEWAY_URL=' "$env_file" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r" || true)"
     fi
     if [[ -z "${PORT:-}" ]]; then
-      PORT="$(grep -E '^PORT=' "$env_file" | tail -n1 | cut -d'=' -f2- | tr -d '"\r' || true)"
+      PORT="$(grep -E '^PORT=' "$env_file" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r" || true)"
     fi
   fi
 done
@@ -37,50 +43,70 @@ if ! curl -fsS -X POST "${GATEWAY_URL}/api/connect" "${AUTH_ARGS[@]}" -H "Conten
   exit 1
 fi
 
-# Poll /api/status up to 15s for qr_ready or connected
-python3 - "$GATEWAY_URL" "${GATEWAY_API_KEY:-}" "$OUT_PATH" <<'PY'
-import base64
-import json
-import sys
-import time
-import urllib.error
-import urllib.request
+NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
+if [[ -z "${NODE_BIN}" ]]; then
+  echo "node binary not found in PATH." >&2
+  exit 1
+fi
 
-gateway_url, api_key, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-headers = {"x-api-key": api_key} if api_key else {}
+# Poll /api/qr.png up to 15s for raw QR PNG or 409 already-connected
+"${NODE_BIN}" --input-type=module - "${GATEWAY_URL}" "${GATEWAY_API_KEY:-}" "${OUT_PATH}" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
 
-for _ in range(15):
-    req = urllib.request.Request(f"{gateway_url}/api/status", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        print(f"Gateway returned HTTP {err.code} on /api/status (check GATEWAY_API_KEY).", file=sys.stderr)
-        sys.exit(1)
+const [gatewayUrl, apiKey, outPath] = process.argv.slice(2);
+const headers = apiKey ? { 'x-api-key': apiKey } : {};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    if not payload.get("success") or not isinstance(payload.get("data"), dict):
-        print(f"Unexpected /api/status response: {payload}", file=sys.stderr)
-        sys.exit(1)
+for (let attempt = 0; attempt < 15; attempt++) {
+  let res;
+  try {
+    res = await fetch(`${gatewayUrl.replace(/\/+$/, '')}/api/qr.png`, {
+      headers,
+      signal: AbortSignal.timeout(5000)
+    });
+  } catch (err) {
+    console.error(`Gateway request failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
 
-    data = payload["data"]
-    status = data.get("status")
-    qr_data_url = data.get("qrCodeDataUrl")
+  if (res.status === 200) {
+    const pngBuffer = Buffer.from(await res.arrayBuffer());
+    const tmpPath = `${outPath}.${process.pid}.tmp`;
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(tmpPath, pngBuffer);
+    fs.renameSync(tmpPath, outPath);
+    console.log(`Saved fresh pairing QR code to ${outPath}`);
+    process.exit(0);
+  }
 
-    if status == "connected":
-        user = data.get("user")
-        account_id = user["id"] if isinstance(user, dict) and "id" in user else "linked account"
-        print(f"WhatsApp is already connected as {account_id}.")
-        sys.exit(0)
+  if (res.status === 409) {
+    let accountId = 'linked account';
+    try {
+      const payload = await res.json();
+      if (payload?.user?.id) {
+        accountId = payload.user.id;
+      }
+    } catch {
+      // Ignore JSON parse failure on 409
+    }
+    console.log(`WhatsApp is already connected as ${accountId}.`);
+    process.exit(0);
+  }
 
-    if isinstance(qr_data_url, str) and "," in qr_data_url:
-        b64 = qr_data_url.split(",", 1)[1]
-        with open(out_path, "wb") as f:
-            f.write(base64.b64decode(b64))
-        print(f"Saved fresh pairing QR code to {out_path}")
-        sys.exit(0)
+  if (res.status === 401 || res.status === 403) {
+    console.error(`Gateway returned HTTP ${res.status} on /api/qr.png (check GATEWAY_API_KEY).`);
+    process.exit(1);
+  }
 
-    time.sleep(1)
+  if (res.status !== 404) {
+    console.error(`Unexpected HTTP ${res.status} from /api/qr.png.`);
+    process.exit(1);
+  }
 
-print("Timed out waiting for QR code from gateway.", file=sys.stderr)
-sys.exit(1)
-PY
+  await sleep(1000);
+}
+
+console.error('Timed out waiting for QR code from gateway.');
+process.exit(1);
+NODE

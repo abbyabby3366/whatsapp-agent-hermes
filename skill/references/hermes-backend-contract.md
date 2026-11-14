@@ -1,22 +1,22 @@
 # Hermes Backend & Receiver Implementation Contract
 
-This reference specifies the exact runtime invariants between the Node/Baileys gateway (`whatsapp-agent-hermes`, port `3100`), the Python webhook receiver (`~/whatsapp-hermes-receiver/receiver.py`, port `5000`), and the `hermes` CLI subprocess.
+This reference specifies the exact runtime invariants between the Node/Baileys gateway (`src/index.ts`, port `3100`), the built-in Node webhook receiver (`src/receiver/*`, port `5000`, state in `~/whatsapp-hermes-receiver/`), and the `hermes` CLI subprocess.
 
 ---
 
 ## 1. Principal Verification (Master vs. Contact Routing)
 
-Elevated owner privileges (`AGENT_TOOLSETS_OWNER=terminal,file,web,vision` and `prompt_template_owner.txt`) MUST only activate when **all three** conditions hold:
+Elevated owner privileges (`AGENT_TOOLSETS_OWNER=terminal,file,web,vision` and `prompt_template_owner.txt`) MUST only activate when **all three** conditions hold (`isMasterPrincipal()` in `src/receiver/server.ts`):
 
-1. `payload["isGroup"] is False` (NEVER elevate inside a group chat, even if `sender == MASTER_PHONE`, to prevent leaking internal outputs to group members or executing group-injected quoted text).
-2. `chat_jid` is a 1:1 user JID (`@s.whatsapp.net` or `@lid`).
+1. `payload.isGroup` is `false` and `!payload.chatJid.endsWith('@g.us')` (NEVER elevate inside a group chat, even if `sender == MASTER_PHONE`, to prevent leaking internal outputs to group members or executing group-injected quoted text).
+2. `chatJid` is a 1:1 user JID (`@s.whatsapp.net` or `@lid`).
 3. Either:
-   - Canonicalized `sender` digits match `MASTER_PHONE` (`OWNER_WHATSAPP`), **OR**
-   - `senderJid` (stripped of `@lid`) matches `MASTER_LID` (or resolves to `MASTER_PHONE` in `chat_map.json`).
+   - Canonicalized `sender` (or `chat_map.json` `record.phone`) matches `MASTER_PHONE` (`OWNER_WHATSAPP`), **OR**
+   - `senderJid` / `record.lid` matches configured `MASTER_LID` or previously learned `runtimeState.getMasterLid()`. When `MASTER_PHONE` authenticates with a known LID, `runtimeState.setMasterLid(record.lid)` persists it automatically.
 
-`senderUsername` is filled from the message itself, from usernames the gateway learned earlier (contacts sync, group metadata, messages you sent from your phone), or from a short reverse lookup for an unknown `@lid` sender. It can still be `null` when WhatsApp exposes no handle, so never require it.
+`senderUsername` is filled from the message itself, from usernames the gateway learned earlier (contacts sync, group metadata, messages sent from the primary phone), or from a short reverse lookup for an unknown `@lid` sender. It can still be `null` when WhatsApp exposes no handle, so never require it.
 
-Whenever an inbound payload carries `senderUsername` (normalized lowercase WhatsApp `@username` without `@`), persist the `@username <-> chatJid` (and `sender` phone digits if known) mapping in `chat_map.json` so outbound instructions to `@username` immediately map to the canonical thread key (`sessions.json`, `flows.json`, `contacts.json`). When `wa_send.py` or `receiver.py` dispatches to a `@username` not yet in `chat_map.json`, pass `"to": "@username"` (plus optional `"pin": "1234"` or `"@username#1234"`) directly to `/api/send*` (or pre-resolve via `GET /api/resolve?target=@username` with `x-api-key`) and store the returned `jid` in `chat_map.json`.
+Whenever an inbound payload carries `senderUsername` (normalized lowercase WhatsApp `@username` without `@`), `ChatMapStore.upsertInbound()` persists the `@username <-> chatJid` (and `sender` phone digits if known) mapping in `chat_map.json` so outbound instructions to `@username` immediately map to the canonical thread key (`sessions.json`, `flows.json`, `contacts.json`). When `wa-send` or the receiver dispatches to a `@username` not yet in `chat_map.json`, passing `"to": "@username"` (plus optional `"pin": "1234"` or `"@username#1234"`) directly to `/api/send*` (or resolving via `GET /api/resolve?target=@username` with `x-api-key`) returns the deliverable `jid`.
 
 All other turns (including every group turn) MUST run in the restricted contact sandbox (`AGENT_TOOLSETS=web,vision` with `prompt_template.txt`), and outbound local loopback access (`127.0.0.1`, `localhost`, `[::1]`) remains protected by requiring `GATEWAY_API_KEY` on all gateway `/api/*` endpoints.
 
@@ -24,18 +24,20 @@ All other turns (including every group turn) MUST run in the restricted contact 
 
 ## 2. Untrusted Input Sanitization & XML Prompt Wrapping
 
-Before building the contact prompt, strip control tokens from all untrusted strings (`senderName`, `message`, `quoted.message`, and voice transcripts) so contacts cannot spoof multi-message splits or escalations:
+Before building the contact prompt, `cleanUntrusted()` (`src/receiver/sanitizer.ts`) strips control tokens and XML boundaries from all untrusted strings (`senderName`, `message`, `quoted.message`, and voice transcripts):
 
-```python
-def clean_untrusted(value: str | None) -> str:
-    if value is None:
-        return ""
-    text = value.replace("===MSG===", "[split]").replace("@@FLAG@@", "[flag]")
-    # Prevent breaking out of XML data boundary tags
-    return text.replace("</untrusted_inbound_message>", "[/untrusted_inbound_message]")
+```ts
+export function cleanUntrusted(value: string | null | undefined): string {
+  if (!value) return '';
+  return value
+    .replaceAll('===MSG===', '[split]')
+    .replaceAll('@@FLAG@@', '[flag]')
+    .replace(/<\/untrusted_inbound_message\s*>/gi, '[/untrusted_inbound_message]')
+    .replace(/<untrusted_inbound_message\b[^>]*>/gi, '[untrusted_inbound_message]');
+}
 ```
 
-Inject operator context **outside** the XML boundary (including hot-reloaded `## 2. Global Contact Reply Rules & Business Facts` and **only** the current contact's matching `### <phone | @username | Name>` block under `## 3. Contact-Specific Rules` from `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` — never inject `## 1. Operator & Outbound Workflow Rules` or other contacts' `###` blocks into external contact turns) and wrap inbound WhatsApp content **inside** `<untrusted_inbound_message>`:
+Operator context is injected **outside** the XML boundary (including hot-reloaded `## 2. Global Contact Reply Rules & Business Facts` and **only** the matching contact's `### <phone | @username | Name>` block under `## 3. Contact-Specific Rules` from `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` via `loadContactRules()`, never exposing `## 1. Operator & Outbound Workflow Rules` or other contacts' `###` blocks), while inbound WhatsApp content is wrapped **inside** `<untrusted_inbound_message>`:
 
 ```text
 [Trusted Operator Context]
@@ -52,6 +54,7 @@ Open Flow Items: Pending invoice delivery
 
 [New Inbound Turn — Answer ONLY What Is Inside <untrusted_inbound_message>]
 <untrusted_inbound_message>
+chat_type: direct
 sender_name: Alex Tan
 timestamp_gmt8: 09-10-26 14:25:10
 quoted: null
@@ -62,141 +65,62 @@ messages (count=1):
 
 ---
 
-## 3. Hermes Subprocess Invocation & Stdout/Stderr Split
+## 3. Hermes Subprocess Invocation & Stdout/Stderr Split (`src/receiver/hermes-runner.ts`)
 
-- Invoke `hermes chat -Q` in its own POSIX process group (`start_new_session=True`) so superseding bursts can cleanly terminate in-flight runs via `os.killpg(proc.pid, signal.SIGTERM)`.
-- **Brain = the box's own built-in AI proxy, ONLY**: `hermes chat -Q` must use whatever model/provider Hermes is already configured with on this host (its built-in AI proxy). Never ask the owner for an LLM / OpenAI / OpenRouter / Anthropic / provider API key, never add an alternate endpoint or model override, and never write LLM keys into any vault or `.env`.
-- **Subprocess Secret Hygiene (deny-list, NOT allow-list)**: Start from a full copy of the receiver's environment and remove exactly two receiver-only keys — `env = os.environ.copy(); for k in ("GATEWAY_API_KEY", "HERMES_SECRET_TOKEN"): env.pop(k, None)`. Never build the child env from scratch or from an allow-list, and never strip any other variable (`HOME`, `PATH`, `XDG_*`, Hermes's own config/proxy/provider variables, `*_BASE_URL`, proxy tokens): dropping them makes the box's AI proxy reject `hermes chat -Q` as unauthorized.
-- **AI proxy failure handling**: If `hermes chat -Q` fails with an auth/quota error (401/402/403/429, "unauthorized", "budget"), first verify that the same command succeeds when run manually as the service user with the receiver's environment (`systemctl --user show-environment`, `hermes chat -Q` smoke test) — a mismatch means env passthrough is broken; fix it. If the proxy itself refuses, log it, alert `MASTER_PHONE`, and report that the box's AI proxy is refusing calls. Do NOT ask for or suggest a substitute LLM key or endpoint.
+- Invoke `hermes chat -Q --toolsets <toolsets> [--resume <session_id>] [--image <local_path>] -q <prompt>` with `detached: true` (on POSIX) so superseding bursts cleanly terminate the entire child process group via `process.kill(-child.pid, 'SIGTERM')` (with 3s `SIGKILL` escalation).
+- **Brain = the box's own built-in AI proxy, ONLY**: `hermes chat -Q` uses whatever model/provider Hermes is already configured with on this host. Never ask the owner for an LLM / OpenAI / OpenRouter / Anthropic / provider API key, never add an alternate endpoint or model override, and never write LLM keys into any vault or `.env`.
+- **Subprocess Secret Hygiene (deny-list, NOT allow-list)**: `buildHermesChildEnv()` copies `process.env` and deletes **only** `GATEWAY_API_KEY` and `HERMES_SECRET_TOKEN`. Never build the child env from scratch or strip `HOME`, `PATH`, `XDG_*`, `*_BASE_URL`, or proxy credentials.
+- **AI proxy failure handling**: If `hermes chat -Q` fails with an auth/quota error (`401`/`402`/`403`/`429`, `unauthorized`, `budget`, `quota`), `server.ts` logs the failure and alerts `MASTER_PHONE` at most once per 15 minutes without asking for an API key.
 - **Stdout vs. Stderr Invariant**:
   - `stdout`: Raw assistant reply text only.
-  - `stderr`: Diagnostics and `session_id: <id>`. Parse `session_id` exclusively from `stderr` and persist in `sessions.json` keyed by canonical phone/chat key.
-- Pass `--resume <session_id>` when an active session exists for that canonical chat key, and `--image <local_path>` when an inbound image was downloaded from `GET /api/media/<messageId>`.
+  - `stderr`: Diagnostics and `session_id: <id>`. Parse `session_id` exclusively from `stderr` and persist in `sessions.json` keyed by canonical `chatKey`. If resuming a stale session fails with non-zero exit and empty stdout, `runHermesWithSessionFallback()` clears the stored session ID and retries once fresh.
 
 ---
 
-## 4. Voice Note Pipeline (Local `faster-whisper`, No API Keys)
+## 4. Voice Note Pipeline (Local Pure-Node ONNX Whisper, Zero Python, No API Keys)
 
 - Download `.ogg` / `audio` payloads immediately via `GET /api/media/<messageId>` (with header `x-api-key: <GATEWAY_API_KEY>`) into `media/`.
-- **Transcription Engine = Local `faster-whisper` only** (never call Gemini or any external transcription API; no API keys involved):
-  - Lazily initialize a process-wide thread-safe `faster_whisper.WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)` singleton (default `WHISPER_MODEL="base"`, `device="cpu"`, `compute_type="int8"`, decoded natively via bundled PyAV with zero external API keys required).
-  - Run `model.transcribe(str(audio_path), beam_size=5, vad_filter=True)`.
-  - If speech segments are present, inject (after `clean_untrusted()`):
-    `[voice note | engine: faster-whisper | lang: {info.language} | transcript: "..."]`
-  - If no speech is detected or average log-probability indicates garbled audio (`avg_logprob < -1.0`), mark `unclear`:
-    `[voice note | engine: faster-whisper | quality: unclear | transcript: "(inaudible/muffled)"]`
-- Whenever a transcript is marked `unclear`, `prompt_template.txt` instructs the agent to ask the sender to type it out rather than guessing:
-
-```python
-import os
-import threading
-from pathlib import Path
-
-_whisper_lock = threading.Lock()
-_whisper_model = None
-
-
-def transcribe_with_faster_whisper(audio_path: Path) -> str:
-    global _whisper_model
-    from faster_whisper import WhisperModel
-
-    with _whisper_lock:
-        if _whisper_model is None:
-            _whisper_model = WhisperModel(
-                os.environ.get("WHISPER_MODEL", "base"),
-                device=os.environ.get("WHISPER_DEVICE", "cpu"),
-                compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
-            )
-        segments_iter, info = _whisper_model.transcribe(str(audio_path), beam_size=5, vad_filter=True)
-        segments = list(segments_iter)
-
-    text = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
-    if not text:
-        return '[voice note | engine: faster-whisper | quality: unclear | transcript: "(inaudible/muffled)"]'
-
-    avg_logprob = sum(seg.avg_logprob for seg in segments) / len(segments)
-    clean_text = clean_untrusted(text)
-    if avg_logprob < -1.0:
-        return f'[voice note | engine: faster-whisper | lang: {info.language} | quality: unclear | transcript: "{clean_text}"]'
-    return f'[voice note | engine: faster-whisper | lang: {info.language} | transcript: "{clean_text}"]'
-```
+- **Transcription Engine (`src/receiver/transcribe.ts`)**:
+  - Decodes arbitrary WhatsApp audio formats (`.ogg` Opus, `.m4a`, `.mp3`, `.wav`) in memory to 16 kHz mono `Float32Array` (`f32le` PCM) via bundled `ffmpeg-static`.
+  - Runs `@huggingface/transformers` (`automatic-speech-recognition` pipeline, default `onnx-community/whisper-base`, CPU `dtype: 'q8'`, cached persistently under `WHISPER_CACHE_DIR`, default `~/whatsapp-hermes-receiver/models`). Zero Python, zero `.venv`, zero API keys.
+  - Mutex-serialized lazy singleton pipeline prevents OOM under concurrent voice bursts.
+  - Injects `[voice note | engine: whisper-onnx | transcript: "..."]` (cleaned via `cleanUntrusted()`), or `[voice note | engine: whisper-onnx | quality: unclear | transcript: "(inaudible/muffled)"]` when speech is empty or noise-only (`[BLANK_AUDIO]`, `[Music]`, etc.).
 
 ---
 
-## 5. Output Parsing Order (`@@FLAG@@`, `NO_REPLY`, `===MSG===`, `sanitize_reply`)
+## 5. Output Parsing Order (`@@FLAG@@`, `NO_REPLY`, `===MSG===`, `sanitizeReply`)
 
-Process raw `stdout` in this exact deterministic order:
+Process raw `stdout` in `parseHermesOutput()` (`src/receiver/sanitizer.ts`):
 
-1. **Empty Check**: If `raw_stdout.strip() == ""`, treat as **`no-answer`** (process failure/timeout). Do **not** ledger in `handled.json` so `replay_orphans()` can retry.
+1. **Empty Check**: If trimmed `rawStdout` is empty, treat as **`no-answer`** (process failure/timeout). Leave unledgered in `handled.json` so `replayOrphans()` can retry on restart.
 2. **Extract & Strip `@@FLAG@@` First**:
-   ```python
-   import re
-
-   flags: list[str] = []
-   kept_lines: list[str] = []
-   for line in raw_stdout.splitlines():
-       m = re.match(r"^\s*@@FLAG@@\s*(.*)$", line)
-       if m:
-           flags.append(m.group(1).strip() or "Manual review requested")
-       else:
-           kept_lines.append(line)
-   body = "\n".join(kept_lines).strip()
-   ```
-   Dispatch every extracted flag to `MASTER_PHONE` via `/api/send` and record its outbound message ID in `outbox.json` so quote-replies resolve back to `chatJid`.
+   - Match `/^\s*@@FLAG@@\s*(.*)$/` line-by-line, defaulting empty summaries to `"Manual review requested"`.
+   - Dispatch every extracted flag to `MASTER_PHONE` via `/api/send` and record its outbound message ID in `outbox.json` so Master quote-replies resolve back to `targetChatJid`.
 3. **Evaluate `NO_REPLY` Second**:
-   If `body == "NO_REPLY"` (or `body == ""` *only when at least one `@@FLAG@@` was extracted*):
-   - Ledger outcome as `silent` in `handled.json`.
-   - Do **not** call `/api/read` and do **not** send anything to the contact.
-4. **Sanitize & Convert Markdown to WhatsApp Formatting (`sanitize_reply`)**:
-   ```python
-   def sanitize_reply(text: str) -> str:
-       # Strip accidental routing header lines or bot labels (including stacked prefixes).
-       # Covers phone numbers, @username / @username#1234 handles, and raw WhatsApp JIDs.
-       text = re.sub(
-           r"^(?:\s*(?:@@TO@@[^\n]*\n*|(?:To|Recipient):\s*(?:@[A-Za-z0-9_.]{3,35}(?:#\d{4})?|\+?[0-9][^\n]*|[A-Za-z0-9_.:-]+@(?:lid|s\.whatsapp\.net|g\.us))\s*\n+|(?:Bot|AI|Assistant|Contact reply|Message|Reply):\s*))+",
-           "",
-           text,
-           flags=re.I,
-       )
-       # Convert Markdown links [label](https://...) -> label (https://...) before protecting URLs
-       text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1 (\2)", text)
-       # Temporarily shield bare URLs so dashes/asterisks inside URLs are never altered
-       urls: list[str] = []
-       def _stash_url(match: re.Match[str]) -> str:
-           urls.append(match.group(0))
-           return f"\x00URL{len(urls) - 1}\x00"
-       text = re.sub(r"https?://[^\s)>]+", _stash_url, text)
-       # Convert Markdown **bold** -> WhatsApp *bold*
-       text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text, flags=re.S)
-       # Ensure boundary spaces around *bold* when touching alphanumeric or CJK characters
-       text = re.sub(r"([^\s*(\[\"'\u201c])\*([^\s*](?:[^*\n]*?[^\s*])?)\*", r"\1 *\2*", text)
-       text = re.sub(r"\*([^\s*](?:[^*\n]*?[^\s*])?)\*([^\s*.,!?:;)\]\"'\u201d])", r"*\1* \2", text)
-       # Convert Markdown headings (# Heading -> *Heading*)
-       text = re.sub(r"(?m)^#{1,6}\s+(.+?)\s*$", r"*\1*", text)
-       # Replace em/en dashes and space-flanked double hyphens with comma + space
-       text = re.sub(r"\s*(?:—|–)\s*|\s+--\s+", ", ", text)
-       # Restore shielded URLs
-       for idx, url in enumerate(urls):
-           text = text.replace(f"\x00URL{idx}\x00", url)
-       return text.strip()
-   ```
+   - If the remaining trimmed body equals `NO_REPLY` (or `""` *only when at least one `@@FLAG@@` was extracted*):
+     - Ledger outcome as `silent` in `handled.json`.
+     - Do **not** call `/api/read` and do **not** send anything to the contact.
+4. **Sanitize & Convert Markdown to WhatsApp Formatting (`sanitizeReply`)**:
+   - Strip stacked routing headers (`To:`, `Recipient:`, `@@TO@@`, `Bot:`, `AI:`, `Assistant:`, `Reply:`, etc.) using an explicit loop instead of nested quantifiers.
+   - Flatten Markdown links `[label](https://...)` -> `label (https://...)` before shielding bare URLs (preventing regex `$1` backreference corruption on URL query strings).
+   - Convert `# Heading` -> `*Heading*`, replace em/en dashes (`—`, `–`, ` -- `) with `, `, and normalize via `formatWhatsAppText()` (`**bold**` -> `*bold*` + space boundaries around CJK/alphanumeric text).
 5. **Split Multi-Messages (`===MSG===`)**:
-   - Split on `===MSG===`, apply `sanitize_reply()` to each chunk, drop empty chunks, and cap at `MAX_MESSAGES_PER_TURN` (`5`; merge overflow into chunk 5).
+   - Split on `===MSG===`, apply `sanitizeReply()` per chunk, drop empty chunks, and cap at `MAX_MESSAGES_PER_TURN` (`5`; merge overflow into chunk 5).
 6. **Read Receipt + Immediate Live Human Cadence Dispatch (No Draft Approval Gate)**:
    - Never hold outbound contact replies behind a `[DRAFT APPROVAL]` queue — dispatch live directly to `chatJid`.
-   - Call `POST /api/read { "messageId": inbound_id }` right before sending chunk 1.
-   - Send chunk 1 immediately (`POST /api/send`, no prior typing indicator).
+   - Call `POST /api/read { "messageId": latestInboundId }` right before sending chunk 1.
+   - Send chunk 1 immediately (`POST /api/send`, quoting `latestInboundId` in groups).
    - For chunks `2..N`: call `POST /api/presence { "recipient": chatJid, "presence": "composing" }`, sleep `SPLIT_MESSAGE_DELAY_SECONDS` (`2.0s`), call `POST /api/send`, then call `POST /api/presence { "recipient": chatJid, "presence": "paused" }`.
 
 ---
 
 ## 6. Canonical Contact Identity (Phone, `@username`, `@lid`)
 
-A contact can reach you as a phone number, a WhatsApp `@username`, or an opaque 15-digit `@lid`, and the same person can show up as more than one over time. Key every per-contact file (`sessions.json`, `flows.json`, `contacts.json`, pause timers, quotas) through `chat_map.json` so one person always maps to one thread:
+A contact can reach you as a phone number, a WhatsApp `@username`, or an opaque 15-digit `@lid`, and the same person can expose additional identifiers over time. `ChatMapStore` (`src/receiver/stores.ts`) indexes every thread under one canonical `chatKey`:
 
-1. **Pick the canonical key in this order**: phone digits (when known) → `@username` → raw LID digits. Never store LID digits in a "phone" field.
-2. **Promote, never demote**: when a thread keyed by LID digits later reveals a `@username`, or a `@username` thread reveals a phone number, move the old key's history, flows, contact profile, pause timer, and quota counters to the new key and re-point every `chat_map.json` index (`byLid`, `byUsername`, `byJid`).
-3. **Usernames change**: if a known JID arrives with a different `senderUsername`, replace the old handle (the gateway already evicts stale handles from `data/usernames.json`).
+1. **Pick the canonical key in priority order**: phone digits (when known) -> `@username` -> raw LID digits. Never store LID digits in a phone field.
+2. **Promote, never demote**: when a thread keyed by LID digits later reveals a `@username`, or a `@username` thread reveals a phone number, `migrateAllStores()` moves the old key's SQLite history, sessions, flows, contacts profile, pause timers, and quota counters to the canonical key and updates all indexes (`byLid`, `byUsername`, `byJid`, `byPhone`).
+3. **Usernames change**: if a known JID arrives with a different `senderUsername`, the old username alias is replaced automatically.
 4. **Outbound lookups**: resolve `@username` / `@username#1234` via `chat_map.json` first, then `GET /api/usernames`, then pass it straight to `/api/send*` (or `GET /api/resolve`) and store the returned `jid`.
 
 ### Gateway send results to handle
@@ -204,11 +128,11 @@ A contact can reach you as a phone number, a WhatsApp `@username`, or an opaque 
 | HTTP | Meaning | What to do |
 | --- | --- | --- |
 | `400` | Bad recipient or PIN format (PIN must be exactly 4 digits; JSON numbers like `412` are read as `"0412"`) | Fix the input; do not retry as-is |
-| `403` | `@username` needs a 4-digit PIN, the PIN was wrong, or a local media path is outside `ALLOWED_MEDIA_DIR` | Ask owner for PIN or use a URL / data URI / file inside `ALLOWED_MEDIA_DIR` (`./data/media`) |
+| `403` | `@username` needs a 4-digit PIN, the PIN was wrong, or a raw local media path is outside `ALLOWED_MEDIA_DIR` | Ask owner for PIN, or send via `~/.local/bin/wa-send` (auto base64 data URI) / URL |
 | `404` | `@username` not found, or phone number not on WhatsApp | Report it; do not retry |
 | `413` | Media exceeds `MAX_MEDIA_BYTES` (25 MiB) or request body limit | Compress/resize or stay within limit; do not retry as-is |
 | `429` | WhatsApp rate-limited username lookups | Back off before retrying |
-| `502` | WhatsApp rejected the message (Error `463` cold-outreach restriction, Error `479` stanza rejected) | Ledger as failed, alert the owner, never auto-retry |
-| `503` | Gateway not connected, or WhatsApp timed out | Retry later |
+| `502` | WhatsApp rejected the message (Error `463` cold-outreach restriction, Error `479` stanza rejected) | Ledger as `failed-502`, alert `MASTER_PHONE`, never auto-retry |
+| `503` | Gateway not connected, or WhatsApp timed out | Retry with backoff (up to 6 attempts) |
 
 The gateway waits briefly for WhatsApp's server acknowledgement before answering, so an immediate `463`/`479` rejection comes back as `502` instead of a false success. Late rejections are shown as **Failed** in the dashboard.

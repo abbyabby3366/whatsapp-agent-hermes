@@ -1,55 +1,82 @@
 # WhatsApp Agent for Hermes
 
-A small gateway that links a WhatsApp account to your **Hermes agent**. It runs next to Hermes on the same server:
+A Baileys WhatsApp gateway **and** built-in Node webhook receiver that connects a WhatsApp account to your **Hermes agent** on the same server (Node.js `>= 22.5.0`, zero Python dependencies):
 
-1. A WhatsApp message arrives → the gateway `POST`s it to Hermes (`HERMES_WEBHOOK_URL`).
-2. Hermes decides: reply right away, stay silent, or think longer and answer later through the REST API.
+1. A WhatsApp message arrives → the gateway (`:3100`) `POST`s it to the built-in receiver (`:5000`, `HERMES_WEBHOOK_URL`).
+2. The receiver coalesces bursts (`2.5s`), transcribes voice notes locally in pure Node (`@huggingface/transformers` + `ffmpeg-static`, `onnx-community/whisper-base`), runs `hermes chat -Q` cleanly in a sandboxed or verified 1:1 Master turn, and replies with human typing cadence.
 3. The dashboard at `http://localhost:3100` shows the QR code, connection state, and every message with what Hermes did with it.
 
 Built on Express + the Baileys fork [`github:JonathanChuahE-Jay/Baileys`](https://github.com/JonathanChuahE-Jay/Baileys).
 
-## Quick start
+## One-Command Hermes Server Install (Production)
+
+Requires **Node.js `>= 22.5.0`**, `npm`, and the `hermes` CLI:
+
+```bash
+git clone https://github.com/abbyabby3366/whatsapp-agent-hermes.git ~/whatsapp-agent-hermes
+cd ~/whatsapp-agent-hermes
+bash scripts/install.sh --master-phone 60123456789 --master-name "Alex"
+```
+
+This idempotently generates `chmod 600` `.env` & `~/whatsapp-hermes-receiver/receiver.env`, builds `dist/`, installs Hermes global skills (`~/.hermes/skills/`), creates `~/.local/bin/{wa-send,wa-history,wa-flow,wa-qr}`, pre-warms ONNX Whisper, configures & starts both `systemd --user` services (`whatsapp-agent-hermes` + `hermes-wa-receiver`), and verifies health, `401` auth lock, and webhook ping.
+
+Pair WhatsApp via PNG export or the dashboard:
+
+```bash
+~/.local/bin/wa-qr /tmp/wa-qr.png
+```
+
+## Quick Local Dev Start
 
 ```bash
 npm install
-cp .env.example .env     # then edit HERMES_WEBHOOK_URL / HERMES_SECRET_TOKEN
-npm run dev              # hot-reloading dev server
-```
-
-Open [http://localhost:3100](http://localhost:3100), scan the QR code (WhatsApp → **Linked devices** → **Link a device**), and press **Test connection to Hermes**.
-
-To try the whole loop without a real Hermes, run the bundled demo agent in a second terminal:
-
-```bash
+cp .env.example .env            # then edit GATEWAY_API_KEY / HERMES_SECRET_TOKEN
+npm run dev                     # hot-reloading gateway (:3100)
+# optional in a second terminal:
+npm run dev:receiver            # hot-reloading built-in receiver (:5000)
+# or run the minimal demo webhook instead:
 npm run demo:hermes
 ```
 
-Production:
+Production build & run without `systemd`:
 
 ```bash
-npm run build && npm start
-# or keep it alive with pm2:
-pm2 start npm --name whatsapp-agent-hermes -- start
+npm run build
+npm start                       # gateway (:3100)
+npm run start:receiver          # built-in receiver (:5000)
 ```
 
-## Configuration (`.env`)
+## Built-In CLI Tools (`~/.local/bin/`)
+
+```bash
+wa-qr /tmp/wa-qr.png
+wa-send text    <phone|@username|@username#PIN|chatJid> "Message"
+wa-send image   <recipient> /path/to/photo.jpg "Caption"
+wa-send doc     <recipient> /path/to/file.pdf "Caption" --name report.pdf
+wa-send sticker <recipient> /path/to/sticker.png "Pack" "Author"
+wa-history stats | chats [limit] | recent <chat_key> [limit] | search "<keyword>"
+wa-flow contacts | show <key> | open <key> "<item>" | close <key> "<item>" | fact <key> "<fact>" | event <key> "<event>"
+```
+
+(`wa-send` automatically encodes local files outside `ALLOWED_MEDIA_DIR` as `data:<mime>;base64,...` URIs up to `MAX_MEDIA_BYTES`, eliminating any separate local media server.)
+
+## Configuration (`.env` & `receiver.env`)
+
+See [`.env.example`](.env.example) for gateway settings, [`receiver.env.example`](receiver.env.example) for built-in receiver settings, and [`skill/references/deployment-and-env.md`](skill/references/deployment-and-env.md) for the full tunables table:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PORT` | `3100` | Gateway port |
-| `HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` to open the dashboard to other machines (then set `GATEWAY_API_KEY`). |
-| `GATEWAY_API_KEY` | *(empty)* | Shared key required on every `/api/*` call (`x-api-key` header, except `/api/health`). Recommended even on `127.0.0.1` to block local SSRF. |
-| `HERMES_WEBHOOK_URL` | *(empty)* | Where incoming messages are posted. Empty = messages are only shown in the dashboard. |
-| `HERMES_SECRET_TOKEN` | *(empty)* | Sent to Hermes as `x-hermes-token` so Hermes can reject other callers. |
-| `HERMES_WEBHOOK_TIMEOUT_MS` | `15000` | Wait time per webhook call |
-| `HERMES_WEBHOOK_RETRIES` | `2` | Retries on network errors / HTTP 5xx |
+| `PORT` / `HOST` | `3100` / `127.0.0.1` | Gateway bind port and host |
+| `GATEWAY_API_KEY` | *(recommended)* | Shared key required on every `/api/*` call (`x-api-key` or Bearer, except `/api/health`) |
+| `HERMES_WEBHOOK_URL` | `http://127.0.0.1:5000/api/webhook` | Webhook target for inbound messages |
+| `HERMES_SECRET_TOKEN` | *(recommended)* | Sent as `x-hermes-token` so the receiver rejects unauthorized callers |
+| `HERMES_WEBHOOK_TIMEOUT_MS` / `HERMES_WEBHOOK_RETRIES` | `15000` / `2` | Webhook HTTP timeout and retry count on 5xx/network errors |
 | `WEBHOOK_CONCURRENCY` | `8` | Max concurrent outbound webhooks to Hermes |
-| `ALLOWED_MEDIA_DIR` | `./data/media` | Allowed directory root for local filesystem media paths |
-| `MAX_MEDIA_BYTES` | `26214400` | Maximum media byte size (outbound fetch/file and inbound downloads, 25 MiB) |
+| `ALLOWED_MEDIA_DIR` / `MAX_MEDIA_BYTES` | `./data/media` / `26214400` | Allowed directory for raw path sends and 25 MiB media ceiling |
 | `DEFAULT_COUNTRY_CODE` | `60` | Prefix for numbers starting with `0` |
-| `ALLOWED_NUMBERS` | *(empty)* | Comma-separated phone numbers and/or `@usernames` allowed to reach Hermes (e.g. `60123456789, @alex_tan`) |
+| `ALLOWED_NUMBERS` | *(empty)* | Comma-separated phone numbers and/or `@usernames` allowed to reach Hermes |
 | `FORWARD_GROUPS` | `true` | Forward group chats to Hermes |
-| `TIMEZONE` | `Asia/Kuala_Lumpur` | IANA timezone of timestamps |
+| `TIMEZONE` | `Asia/Kuala_Lumpur` | IANA timezone (`GMT+8`) of timestamps (`DD-MM-YY`) |
 | `SESSIONS_DIR` / `DATA_DIR` | `./sessions` / `./data` | WhatsApp credentials / persisted settings, username directory, and activity log |
 
 ## Webhook: gateway → Hermes
@@ -86,17 +113,9 @@ pm2 start npm --name whatsapp-agent-hermes -- start
 - `messageType` is one of `text | image | video | voice | audio | document | sticker | location | contact | other`. For media, `message` holds the caption or a placeholder like `[Voice message]`; download the file with `GET /api/media/:messageId`.
 - `event: "test.ping"` is sent by the dashboard's **Test connection** button; answer with any HTTP 200.
 
-### What Hermes answers
-
-| Hermes wants to… | HTTP 200 body |
-| --- | --- |
-| Reply immediately | `{ "reply": "Hi John!" }` (add `"quote": true` to quote the incoming message) |
-| Stay silent | `{ "reply": null, "ignored": true }` |
-| Think longer, answer later | `{ "reply": null, "status": "processing" }` then call `POST /api/send` |
-
 ## REST API (Hermes → gateway)
 
-All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>` when that is set.
+All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>` when set (required for every route except `/api/health`).
 
 | Endpoint | Body / Query | Purpose |
 | --- | --- | --- |
@@ -109,6 +128,7 @@ All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>`
 | `POST /api/presence` | `{ "recipient": "<chatJid or @username>", "presence": "composing" \| "paused" \| "recording" \| "available" \| "unavailable" }` | Typing indicator |
 | `POST /api/read` | `{ "messageId": "..." }` | Mark a received message as read (blue ticks) |
 | `GET /api/media/:messageId` | – | Download the media of a recent message (raw bytes, correct `Content-Type`) |
+| `GET /api/qr.png` | – | Download current pairing QR code as raw `image/png` (`404` if not ready, `409` if connected) |
 | `POST /api/forwarding` | `{ "enabled": true \| false }` | Pause / resume forwarding to Hermes |
 | `POST /api/webhook/test` | – | Ping Hermes |
 | `GET /api/status` | – | Connection state, QR code, stats, recent messages |
@@ -118,12 +138,4 @@ All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>`
 
 Errors always come back as JSON `{ "success": false, "error": "..." }` with a matching HTTP status (400 bad input, 404 not on WhatsApp, 503 not connected).
 
-Example:
-
-```bash
-curl -X POST http://127.0.0.1:3100/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"to": "60123456789", "message": "Hello from Hermes!"}'
-```
-
-See [HERMES_AGENT_INSTALL_PROMPT.md](HERMES_AGENT_INSTALL_PROMPT.md) for the complete prompt to set up Hermes, [wa-agent-SKILL.md](wa-agent-SKILL.md) (plus companion templates/references in [`skill/`](skill/)) for the operational Hermes skill, [skill-crafter-SKILL.md](skill-crafter-SKILL.md) for the single-file global skill-persistence meta-skill, and [examples/hermes_agent_demo.ts](examples/hermes_agent_demo.ts) for a working Node.js demo receiver.
+See [HERMES_AGENT_INSTALL_PROMPT.md](HERMES_AGENT_INSTALL_PROMPT.md) for the streamlined installation prompt, [wa-agent-SKILL.md](wa-agent-SKILL.md) (plus companion templates/references in [`skill/`](skill/)) for the operational Hermes skill, [skill-crafter-SKILL.md](skill-crafter-SKILL.md) for the single-file global skill-persistence meta-skill, and [examples/hermes_agent_demo.ts](examples/hermes_agent_demo.ts) for a working Node.js demo receiver.

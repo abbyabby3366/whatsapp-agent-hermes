@@ -4,19 +4,30 @@
   "description": "WhatsApp gateway for the Hermes agent: forwards incoming messages to a webhook and exposes a REST API + dashboard",
   "main": "dist/index.js",
   "type": "module",
+  "bin": {
+    "wa-send": "./dist/cli/wa-send.js",
+    "wa-history": "./dist/cli/wa-history.js",
+    "wa-flow": "./dist/cli/wa-flow.js"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:receiver": "tsx --no-warnings=ExperimentalWarning watch src/receiver/index.ts",
     "demo:hermes": "tsx examples/hermes_agent_demo.ts",
     "prebuild": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx --test test/*.test.ts",
+    "start:receiver": "node --no-warnings=ExperimentalWarning dist/receiver/index.js",
+    "setup": "bash scripts/install.sh",
+    "qr": "bash scripts/fetch-pairing-qr.sh",
+    "test": "node --no-warnings=ExperimentalWarning --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
     "baileys": "git+https://github.com/JonathanChuahE-Jay/Baileys.git#d513958c15be84707be938decedb986fdda0b524",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
+    "ffmpeg-static": "^5.3.0",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4",
     "sharp": "^0.35.5"
@@ -29,6 +40,6 @@
     "typescript": "^5.8.2"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5.0"
   }
 }
