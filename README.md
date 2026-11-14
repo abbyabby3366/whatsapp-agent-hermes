@@ -43,11 +43,14 @@ pm2 start npm --name whatsapp-agent-hermes -- start
 | `HERMES_SECRET_TOKEN` | *(empty)* | Sent to Hermes as `x-hermes-token` so Hermes can reject other callers. |
 | `HERMES_WEBHOOK_TIMEOUT_MS` | `15000` | Wait time per webhook call |
 | `HERMES_WEBHOOK_RETRIES` | `2` | Retries on network errors / HTTP 5xx |
+| `WEBHOOK_CONCURRENCY` | `8` | Max concurrent outbound webhooks to Hermes |
+| `ALLOWED_MEDIA_DIR` | `./data/media` | Allowed directory root for local filesystem media paths |
+| `MAX_MEDIA_BYTES` | `26214400` | Maximum media byte size (outbound fetch/file and inbound downloads, 25 MiB) |
 | `DEFAULT_COUNTRY_CODE` | `60` | Prefix for numbers starting with `0` |
 | `ALLOWED_NUMBERS` | *(empty)* | Comma-separated phone numbers and/or `@usernames` allowed to reach Hermes (e.g. `60123456789, @alex_tan`) |
 | `FORWARD_GROUPS` | `true` | Forward group chats to Hermes |
-| `TIMEZONE` | `Asia/Kuala_Lumpur` | Timezone of timestamps |
-| `SESSIONS_DIR` / `DATA_DIR` | `./sessions` / `./data` | WhatsApp credentials / dashboard settings |
+| `TIMEZONE` | `Asia/Kuala_Lumpur` | IANA timezone of timestamps |
+| `SESSIONS_DIR` / `DATA_DIR` | `./sessions` / `./data` | WhatsApp credentials / persisted settings, username directory, and activity log |
 
 ## Webhook: gateway → Hermes
 
@@ -68,10 +71,11 @@ pm2 start npm --name whatsapp-agent-hermes -- start
   "messageType": "text",
   "hasMedia": false,
   "mimetype": null,
+  "fileName": null,
   "mentionsMe": false,
   "isReplyToMe": false,
   "quoted": null,
-  "timestamp": "08-10-2026 20:15:30",
+  "timestamp": "08-10-26 20:15:30",
   "timezone": "Asia/Kuala_Lumpur",
   "isoTimestamp": "2026-10-08T12:15:30.000Z",
   "rawTimestamp": 1791461730
@@ -108,6 +112,7 @@ All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>`
 | `POST /api/forwarding` | `{ "enabled": true \| false }` | Pause / resume forwarding to Hermes |
 | `POST /api/webhook/test` | – | Ping Hermes |
 | `GET /api/status` | – | Connection state, QR code, stats, recent messages |
+| `GET /api/events` | – | Server-Sent Events (`event: status`) live gateway state stream |
 | `GET /api/health` | – | Liveness probe (no auth) |
 | `POST /api/connect` / `POST /api/logout` | – | Start the connection / unlink the device |
 

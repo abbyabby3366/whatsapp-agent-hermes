@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { config, isLoopbackHost } from './config.js';
+import { config, flushSettings, isLoopbackHost } from './config.js';
 import { postToHermes } from './hermes.js';
 import { PRESENCE_VALUES, waClient, type PresenceValue } from './whatsapp.js';
 
@@ -11,9 +11,43 @@ const startedAt = Date.now();
 const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
 app.disable('x-powered-by');
-app.use(express.json({ limit: '50mb' }));
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  if (!req.path.startsWith('/api')) {
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    );
+  }
+  next();
+});
+
+const MEDIA_UPLOAD_PATHS = new Set(['/api/send-image', '/api/send-document', '/api/send-sticker']);
+const defaultJsonParser = express.json({ limit: '1mb' });
+const mediaJsonParser = express.json({ limit: '35mb' });
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.method === 'POST' && MEDIA_UPLOAD_PATHS.has(req.path)) {
+    mediaJsonParser(req, res, next);
+    return;
+  }
+  defaultJsonParser(req, res, next);
+});
 
 const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest();
+
+const AUTH_WINDOW_MS = 60_000;
+const MAX_FAILED_AUTH_ATTEMPTS = 20;
+const MAX_TRACKED_AUTH_IPS = 2000;
+const failedAuthByIp = new Map<string, { count: number; resetAt: number }>();
+
+export function resetAuthRateLimits(): void {
+  failedAuthByIp.clear();
+}
 
 /** Optional shared-key protection for the API. The dashboard prompts for the key when it is needed. */
 function requireApiKey(req: Request, res: Response, next: NextFunction): void {
@@ -21,12 +55,41 @@ function requireApiKey(req: Request, res: Response, next: NextFunction): void {
     next();
     return;
   }
+
+  const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const existing = failedAuthByIp.get(clientIp);
+  if (existing && existing.resetAt <= now) {
+    failedAuthByIp.delete(clientIp);
+  }
+  const activeEntry = failedAuthByIp.get(clientIp);
+  if (activeEntry && activeEntry.count >= MAX_FAILED_AUTH_ATTEMPTS) {
+    const retryAfterSec = Math.max(1, Math.ceil((activeEntry.resetAt - now) / 1000));
+    res.setHeader('Retry-After', String(retryAfterSec));
+    res.status(429).json({
+      success: false,
+      error: 'Too many failed authentication attempts. Try again shortly.'
+    });
+    return;
+  }
+
   const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '');
   const provided = String(req.headers['x-api-key'] ?? bearer ?? '');
   if (provided && crypto.timingSafeEqual(sha256(provided), sha256(config.apiKey))) {
+    failedAuthByIp.delete(clientIp);
     next();
     return;
   }
+
+  const nextCount = activeEntry ? activeEntry.count + 1 : 1;
+  const resetAt = activeEntry ? activeEntry.resetAt : now + AUTH_WINDOW_MS;
+  failedAuthByIp.delete(clientIp);
+  failedAuthByIp.set(clientIp, { count: nextCount, resetAt });
+  if (failedAuthByIp.size > MAX_TRACKED_AUTH_IPS) {
+    const oldestKey = failedAuthByIp.keys().next().value;
+    if (oldestKey) failedAuthByIp.delete(oldestKey);
+  }
+
   res.status(401).json({ success: false, error: 'Missing or invalid API key', authRequired: true });
 }
 
@@ -45,6 +108,36 @@ app.get('/api/status', (_req: Request, res: Response) => {
   res.json({
     success: true,
     data: { ...waClient.getState(), authRequired: Boolean(config.apiKey) }
+  });
+});
+
+// Server-Sent Events stream for real-time dashboard updates without polling.
+app.get('/api/events', (req: Request, res: Response) => {
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const sendState = () => {
+    if (res.writableEnded) return;
+    const payload = { ...waClient.getState(), authRequired: Boolean(config.apiKey) };
+    res.write(`event: status\ndata: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  sendState();
+  const unsubscribe = waClient.onStateChange(sendState);
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(': ping\n\n');
+    }
+  }, 20_000);
+  heartbeat.unref();
+
+  req.on('close', () => {
+    unsubscribe();
+    clearInterval(heartbeat);
   });
 });
 
@@ -287,14 +380,40 @@ app.post('/api/read', async (req: Request, res: Response) => {
   res.status(ok ? 200 : 404).json({ success: ok, ...(ok ? {} : { error: 'Message not found or WhatsApp not connected' }) });
 });
 
+const MEDIA_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'video/mp4': 'mp4',
+  'audio/ogg': 'ogg',
+  'audio/mpeg': 'mp3',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt',
+  'text/markdown': 'md',
+  'application/json': 'json'
+};
+
+function buildContentDisposition(fileName: string | undefined, messageId: string, mimetype: string): string {
+  const ext = MEDIA_EXTENSIONS[mimetype.split(';')[0].trim().toLowerCase()] ?? 'bin';
+  const safeId = messageId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 48) || 'file';
+  const rawName = fileName ? path.basename(fileName) : `media-${safeId}.${ext}`;
+  const asciiFallback = rawName.replace(/[\r\n"\\/]/g, '_').replace(/[^\x20-\x7e]/g, '_') || `media.${ext}`;
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(rawName)}`;
+}
+
 // Download the media (image, voice note, document...) of a recent incoming message.
 app.get('/api/media/:messageId', async (req: Request, res: Response) => {
-  const result = await waClient.downloadMedia(String(req.params.messageId));
+  const messageId = String(req.params.messageId);
+  const result = await waClient.downloadMedia(messageId);
   if (!result.success) {
     res.status(result.code).json({ success: false, error: result.error });
     return;
   }
   res.setHeader('Content-Type', result.mimetype);
+  res.setHeader('Content-Disposition', buildContentDisposition(result.fileName, messageId, result.mimetype));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
   res.send(result.buffer);
 });
 
@@ -376,6 +495,10 @@ app.use(express.static(publicDir));
 
 // Final error handler: always answer API clients with JSON instead of an HTML stack trace.
 app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+  if (err.type === 'entity.too.large') {
+    res.status(413).json({ success: false, error: 'Request body exceeds the maximum allowed size' });
+    return;
+  }
   if (err.type === 'entity.parse.failed') {
     res.status(400).json({ success: false, error: 'Request body is not valid JSON' });
     return;
@@ -384,35 +507,51 @@ app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Re
   res.status(err.status ?? 500).json({ success: false, error: err.status && err.status < 500 ? err.message : 'Internal server error' });
 });
 
-process.on('unhandledRejection', (reason) => {
-  console.error('[Process] Unhandled promise rejection:', reason);
-});
+export { app };
 
-const server = app.listen(config.port, config.host, () => {
-  console.log(`[WhatsApp Agent Hermes] Dashboard: http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port}`);
-  console.log(`[WhatsApp Agent Hermes] Hermes webhook: ${config.webhookUrl || 'NOT SET (messages will not be forwarded)'}`);
-  if (!isLoopbackHost(config.host) && !config.apiKey) {
+if (process.env.NODE_ENV !== 'test') {
+  process.on('unhandledRejection', (reason) => {
+    console.error('[Process] Unhandled promise rejection:', reason);
+  });
+
+  if (!isLoopbackHost(config.host) && (!config.apiKey || config.hasPlaceholderApiKey)) {
+    console.error(
+      '[WhatsApp Agent Hermes] FATAL: Refusing to listen on non-loopback host without a strong non-placeholder GATEWAY_API_KEY.'
+    );
+    process.exit(1);
+  }
+
+  if (config.hasPlaceholderApiKey) {
     console.warn(
-      '[WhatsApp Agent Hermes] WARNING: listening on a public interface without GATEWAY_API_KEY. ' +
-        'Anyone who can reach this port can send WhatsApp messages as you. Set GATEWAY_API_KEY in .env.'
+      '[WhatsApp Agent Hermes] WARNING: GATEWAY_API_KEY appears to use a placeholder secret ("change-me*"). Generate a strong key in .env.'
     );
   }
-  void waClient.start();
-});
+  if (config.hasPlaceholderWebhookToken) {
+    console.warn(
+      '[WhatsApp Agent Hermes] WARNING: HERMES_SECRET_TOKEN appears to use a placeholder secret ("change-me*"). Generate a strong token in .env.'
+    );
+  }
 
-server.on('error', (err: NodeJS.ErrnoException) => {
-  console.error(
-    err.code === 'EADDRINUSE'
-      ? `[WhatsApp Agent Hermes] Port ${config.port} is already in use. Change PORT in .env or stop the other process.`
-      : `[WhatsApp Agent Hermes] Server error: ${err.message}`
-  );
-  process.exit(1);
-});
-
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => {
-    console.log(`[WhatsApp Agent Hermes] ${signal} received, shutting down...`);
-    void waClient.shutdown().finally(() => server.close(() => process.exit(0)));
-    setTimeout(() => process.exit(0), 3000).unref();
+  const server = app.listen(config.port, config.host, () => {
+    console.log(`[WhatsApp Agent Hermes] Dashboard: http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port}`);
+    console.log(`[WhatsApp Agent Hermes] Hermes webhook: ${config.webhookUrl || 'NOT SET (messages will not be forwarded)'}`);
+    void waClient.start();
   });
+
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    console.error(
+      err.code === 'EADDRINUSE'
+        ? `[WhatsApp Agent Hermes] Port ${config.port} is already in use. Change PORT in .env or stop the other process.`
+        : `[WhatsApp Agent Hermes] Server error: ${err.message}`
+    );
+    process.exit(1);
+  });
+
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(signal, () => {
+      console.log(`[WhatsApp Agent Hermes] ${signal} received, shutting down...`);
+      void Promise.all([waClient.shutdown(), flushSettings()]).finally(() => server.close(() => process.exit(0)));
+      setTimeout(() => process.exit(0), 3000).unref();
+    });
+  }
 }

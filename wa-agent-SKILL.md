@@ -93,7 +93,7 @@ curl -s -X POST http://127.0.0.1:3100/api/webhook/test \
 bash ~/.hermes/skills/whatsapp-agent-hermes-gateway/scripts/fetch-pairing-qr.sh /tmp/wa-qr.png
 
 # Updating gateway code
-cd ~/whatsapp-agent-hermes && git pull && npm install && npm run build && systemctl --user restart whatsapp-agent-hermes
+cd ~/whatsapp-agent-hermes && git pull && npm ci && npm run build && systemctl --user restart whatsapp-agent-hermes
 ```
 
 ---
@@ -298,6 +298,7 @@ wa_send.py doc     <recipient> /path/to/document.pdf "Caption"
 wa_send.py sticker <recipient> "http://127.0.0.1:8099/sticker.webp" "Pack" "Author"
 ```
 Serve local HTTP media over HTTP/1.1 with valid `Content-Length` headers (`media_server.py`) and include `x-api-key: $GATEWAY_API_KEY` when calling `/api/send*`. Never use Python's `http.server` (HTTP/1.0 framing issues).
+Raw local filesystem paths passed to `/api/send-image`, `/api/send-document`, or `/api/send-sticker` must reside inside `ALLOWED_MEDIA_DIR` (`./data/media` by default, returning HTTP `403` otherwise); for files elsewhere on disk, `wa_send.py` should encode them as `data:<mime>;base64,...` URIs (up to `MAX_MEDIA_BYTES`, 25 MiB) or serve them via `media_server.py`.
 
 ---
 

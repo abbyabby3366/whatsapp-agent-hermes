@@ -7,6 +7,7 @@
   <title>WhatsApp Agent for Hermes</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2325D366'/%3E%3Cpath d='M16 7a9 9 0 0 0-7.7 13.6L7 25l4.5-1.2A9 9 0 1 0 16 7z' fill='none' stroke='white' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
+  <script defer src="/app.js"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -108,7 +109,7 @@
 
           <div class="field">
             <label class="label" for="recipientInput">Recipient (phone number or @username)</label>
-            <input id="recipientInput" name="recipient" type="text" autocomplete="off" placeholder="60123456789 or @username" aria-describedby="recipientHint recipientError" required>
+            <input id="recipientInput" name="recipient" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="60123456789 or @username" aria-describedby="recipientHint recipientError" required>
             <p class="hint" id="recipientHint">Phone number with country code (e.g. 60123456789), WhatsApp <code>@username</code> (or <code>@username#1234</code> with PIN), or JID.</p>
             <p class="field-error" id="recipientError" role="alert" hidden></p>
           </div>
@@ -129,11 +130,12 @@
             <div class="field">
               <label class="label" for="imageUrlInput">Image URL or file</label>
               <div class="input-with-action">
-                <input id="imageUrlInput" name="imageUrl" type="text" placeholder="https://example.com/image.jpg or local path" aria-describedby="imageUrlHint imageUrlError">
+                <input id="imageUrlInput" name="imageUrl" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="https://example.com/image.jpg or path in media/" aria-describedby="imageUrlHint imageUrlError">
                 <button type="button" id="imagePickBtn" class="btn btn-secondary btn-small file-btn">Choose file</button>
                 <input id="imageFileInput" type="file" accept="image/*" class="visually-hidden">
               </div>
-              <p class="hint" id="imageUrlHint">Enter an image URL, data URI, local path, or select a file.</p>
+              <div id="imageFileBadge" class="file-badge" hidden></div>
+              <p class="hint" id="imageUrlHint">Enter an image URL, data URI, path inside <code>ALLOWED_MEDIA_DIR</code>, or select a file.</p>
               <p class="field-error" id="imageUrlError" role="alert" hidden></p>
             </div>
             <div class="field">
@@ -146,11 +148,12 @@
             <div class="field">
               <label class="label" for="docUrlInput">Document URL or file</label>
               <div class="input-with-action">
-                <input id="docUrlInput" name="docUrl" type="text" placeholder="https://example.com/report.pdf or local path" aria-describedby="docUrlHint docUrlError">
+                <input id="docUrlInput" name="docUrl" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="https://example.com/report.pdf or path in media/" aria-describedby="docUrlHint docUrlError">
                 <button type="button" id="docPickBtn" class="btn btn-secondary btn-small file-btn">Choose file</button>
                 <input id="docFileInput" type="file" class="visually-hidden">
               </div>
-              <p class="hint" id="docUrlHint">Enter a document URL, data URI, local path, or select a file (PDF, DOCX, XLSX, etc.).</p>
+              <div id="docFileBadge" class="file-badge" hidden></div>
+              <p class="hint" id="docUrlHint">Enter a document URL, data URI, path inside <code>ALLOWED_MEDIA_DIR</code>, or select a file (PDF, DOCX, XLSX, etc.).</p>
               <p class="field-error" id="docUrlError" role="alert" hidden></p>
             </div>
             <div class="field">
@@ -168,11 +171,12 @@
             <div class="field">
               <label class="label" for="stickerUrlInput">Sticker image URL or file</label>
               <div class="input-with-action">
-                <input id="stickerUrlInput" name="stickerUrl" type="text" placeholder="https://example.com/sticker.webp, png, or local path" aria-describedby="stickerUrlHint stickerUrlError">
+                <input id="stickerUrlInput" name="stickerUrl" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="https://example.com/sticker.webp, png, or path in media/" aria-describedby="stickerUrlHint stickerUrlError">
                 <button type="button" id="stickerPickBtn" class="btn btn-secondary btn-small file-btn">Choose file</button>
                 <input id="stickerFileInput" type="file" accept="image/*,.webp" class="visually-hidden">
               </div>
-              <p class="hint" id="stickerUrlHint">Enter an image URL, data URI, local path, or select a file (WebP, PNG, JPG, GIF). Formatted to 512x512 WebP.</p>
+              <div id="stickerFileBadge" class="file-badge" hidden></div>
+              <p class="hint" id="stickerUrlHint">Enter an image URL, data URI, path inside <code>ALLOWED_MEDIA_DIR</code>, or select a file (WebP, PNG, JPG, GIF). Formatted to 512x512 WebP.</p>
               <p class="field-error" id="stickerUrlError" role="alert" hidden></p>
             </div>
             <div class="field">
@@ -196,8 +200,20 @@
       <section class="card" aria-labelledby="activityTitle">
         <div class="card-head">
           <h2 id="activityTitle">Recent activity</h2>
-          <span class="muted small" id="activityNote">Updates automatically</span>
+          <span class="muted small" id="activityNote">Connecting live updates…</span>
         </div>
+        <search class="activity-search" aria-label="Filter recent activity">
+          <input id="activitySearchInput" type="search" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="Search sender, message, or reply…" aria-label="Search recent activity">
+          <select id="activityFilterSelect" aria-label="Filter messages by status">
+            <option value="all">All messages</option>
+            <option value="inbound">Inbound only</option>
+            <option value="outbound">Outbound only</option>
+            <option value="replied">Replied by Hermes</option>
+            <option value="processing">Processing</option>
+            <option value="failed">Failed</option>
+            <option value="filtered">Filtered / paused</option>
+          </select>
+        </search>
         <ul id="activityList" class="activity" aria-live="polite">
           <li class="empty">No messages yet. New WhatsApp messages and your replies will show up here.</li>
         </ul>
@@ -235,7 +251,5 @@
       </div>
     </form>
   </dialog>
-
-  <script src="/app.js"></script>
 </body>
 </html>

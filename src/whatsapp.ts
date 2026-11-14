@@ -34,8 +34,10 @@ import pino from 'pino';
 import QRCode from 'qrcode';
 import fs from 'fs';
 import path from 'path';
-import { config, loadSettings, saveSettings, type RuntimeSettings } from './config.js';
+import { config, formatDateTimeParts, loadSettings, saveSettings, type RuntimeSettings } from './config.js';
 import { postToHermes } from './hermes.js';
+import { MediaResolutionError, resolveMediaInput } from './media.js';
+import { DebouncedJsonWriter } from './persistence.js';
 import { prepareSticker } from './sticker.js';
 
 export type WebhookStatus =
@@ -56,11 +58,13 @@ export interface RecentMessage {
   recipient: string;
   content: string;
   timestamp: string;
+  isoTimestamp: string;
   fromMe: boolean;
   isGroup: boolean;
   /** JID of the chat an inbound message came from (where a reply must go). */
   chatJid?: string;
   messageType?: string;
+  hasMedia?: boolean;
   webhookStatus?: WebhookStatus;
   webhookError?: string;
   hermesReply?: string;
@@ -81,7 +85,7 @@ export interface UsernameDirectoryEntry {
   updatedAt: string;
 }
 
-export type RecipientErrorCode = 400 | 403 | 404 | 429 | 502 | 503;
+export type RecipientErrorCode = 400 | 403 | 404 | 413 | 429 | 502 | 503;
 
 export type ResolveRecipientResult =
   | {
@@ -105,7 +109,9 @@ export interface WhatsAppClientState {
   qrCodeDataUrl: string | null;
   user: { id: string; name?: string } | null;
   lastConnectedAt: string | null;
+  lastConnectedIso: string | null;
   lastError: string | null;
+  stateVersion: number;
   recentMessages: RecentMessage[];
   stats: {
     receivedCount: number;
@@ -135,7 +141,57 @@ interface ParsedContent {
   text: string;
   hasMedia: boolean;
   mimetype?: string;
+  fileName?: string;
+  fileLength?: number;
   contextInfo?: proto.IContextInfo | null;
+}
+
+const DOCUMENT_MIME_TYPES: Record<string, string> = {
+  pdf: 'application/pdf',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  csv: 'text/csv',
+  txt: 'text/plain',
+  log: 'text/plain',
+  md: 'text/markdown',
+  markdown: 'text/markdown',
+  json: 'application/json',
+  yaml: 'application/yaml',
+  yml: 'application/yaml',
+  xml: 'application/xml',
+  html: 'text/html',
+  htm: 'text/html',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  svg: 'image/svg+xml',
+  mp3: 'audio/mpeg',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  wav: 'audio/wav',
+  m4a: 'audio/mp4',
+  mp4: 'video/mp4',
+  zip: 'application/zip',
+  gz: 'application/gzip',
+  tgz: 'application/gzip',
+  tar: 'application/x-tar',
+  '7z': 'application/x-7z-compressed'
+};
+
+export function inferDocumentMimetype(filename: string): string {
+  const dotIdx = filename.lastIndexOf('.');
+  if (dotIdx === -1 || dotIdx === filename.length - 1) {
+    return 'application/octet-stream';
+  }
+  const ext = filename.slice(dotIdx + 1).toLowerCase();
+  return DOCUMENT_MIME_TYPES[ext] ?? 'application/octet-stream';
 }
 
 /**
@@ -143,17 +199,23 @@ interface ParsedContent {
  * 1. Converts standard Markdown **bold** to WhatsApp *bold*.
  * 2. Ensures space boundaries before opening * and after closing * when adjacent to alphanumeric/CJK characters,
  *    preventing WhatsApp from rendering raw asterisks (e.g. "be*bold*" -> "be *bold*", "字*粗体*" -> "字 *粗体*").
- * 3. Preserves isolated multiplication/asterisk operators (e.g. "2 * 3 = 6") and URLs.
+ * 3. Preserves fenced code blocks, inline code spans, isolated multiplication/asterisk operators (e.g. "2 * 3 = 6"), and URLs.
  */
 export function formatWhatsAppText(text: string): string {
   if (!text) return text;
 
-  // Temporarily shield URLs so formatting inside URLs is never altered
-  const urls: string[] = [];
-  let formatted = text.replace(/https?:\/\/[^\s)>]+/g, (match) => {
-    urls.push(match);
-    return `\x00URL${urls.length - 1}\x00`;
-  });
+  // Temporarily shield fenced code blocks, inline code spans, and URLs so inner asterisks are never altered
+  const shielded: string[] = [];
+  const stash = (match: string): string => {
+    const token = `\x00SHIELD${shielded.length}\x00`;
+    shielded.push(match);
+    return token;
+  };
+
+  let formatted = text
+    .replace(/```[\s\S]*?```/g, stash)
+    .replace(/`[^`\n]+`/g, stash)
+    .replace(/https?:\/\/[^\s)>]+/g, stash);
 
   // Convert Markdown **bold** to *bold*
   formatted = formatted.replace(/\*\*([^\n*]+?)\*\*/g, '*$1*');
@@ -164,12 +226,8 @@ export function formatWhatsAppText(text: string): string {
   // Ensure trailing space after closing * if followed by alphanumeric/CJK letter/number
   formatted = formatted.replace(/\*([^\s*](?:[^*\n]*?[^\s*])?)\*([\p{L}\p{N}])/gu, '*$1* $2');
 
-  // Restore shielded URLs
-  for (let i = 0; i < urls.length; i++) {
-    formatted = formatted.replace(`\x00URL${i}\x00`, urls[i]);
-  }
-
-  return formatted;
+  // Restore shielded blocks via replacer function so literal "$" characters stay untouched
+  return formatted.replace(/\x00SHIELD(\d+)\x00/g, (_match, idx) => shielded[Number(idx)] ?? '');
 }
 
 /** Message kinds that are protocol noise rather than something a person wrote. */
@@ -184,6 +242,8 @@ const IGNORED_CONTENT_TYPES = new Set([
 ]);
 
 const MAX_CACHED_MESSAGES = 300;
+const MAX_RECENT_MESSAGES = 50;
+const MAX_PROCESSED_MESSAGE_IDS = 2000;
 
 /** How long to wait for WhatsApp's server <ack class="message"> before optimistically reporting success. */
 const OUTBOUND_ACK_TIMEOUT_MS = 4000;
@@ -191,6 +251,26 @@ const OUTBOUND_ACK_TIMEOUT_MS = 4000;
 const LID_USERNAME_LOOKUP_TIMEOUT_MS = 2500;
 /** Avoid re-querying WhatsApp for LIDs that recently returned no @username. */
 const EMPTY_LID_USERNAME_TTL_MS = 6 * 3600_000;
+/** TTL and capacity for cached onWhatsApp() verification results. */
+const VERIFIED_PHONE_TTL_MS = 6 * 3600_000;
+const MAX_VERIFIED_PHONE_CACHE = 2000;
+
+interface PersistedActivity {
+  stats: WhatsAppClientState['stats'];
+  recentMessages: RecentMessage[];
+  processedMessageIds: string[];
+}
+
+function readFileLength(raw: unknown): number | undefined {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return raw;
+  if (typeof raw === 'bigint') return Number(raw);
+  if (typeof raw === 'string' && /^\d+$/.test(raw)) return Number.parseInt(raw, 10);
+  if (raw && typeof raw === 'object' && 'toNumber' in raw && typeof (raw as { toNumber: unknown }).toNumber === 'function') {
+    const val = (raw as { toNumber: () => number }).toNumber();
+    return Number.isFinite(val) && val >= 0 ? val : undefined;
+  }
+  return undefined;
+}
 
 const digitsOfJid = (jid: string | null | undefined): string =>
   jid ? jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') : '';
@@ -304,20 +384,42 @@ export function parseRecipientInput(recipient: string, explicitPin?: string): Pa
 export class WhatsAppClient {
   private sock: WASocket | null = null;
   private starting = false;
+  private connectionEpoch = 0;
   private sessionDir: string;
+  private dataDir: string;
   private usernamesFile: string;
+  private activityFile: string;
+  private usernamesWriter: DebouncedJsonWriter<Record<string, UsernameDirectoryEntry>>;
+  private activityWriter: DebouncedJsonWriter<PersistedActivity>;
   private usernameDirectory = new Map<string, UsernameDirectoryEntry>();
+  private jidToUsername = new Map<string, string>();
+  private phoneToUsername = new Map<string, string>();
+  /** Cached verified phone JIDs (`...@s.whatsapp.net`) -> expiry epoch ms. */
+  private verifiedPhoneJids = new Map<string, { jid: string; expiresAt: number }>();
   /** LID JIDs whose reverse @username lookup returned nothing recently (jid -> epoch ms). */
   private emptyLidUsernameCache = new Map<string, number>();
   /** In-flight reverse lookups, so a burst of messages from one LID triggers a single query. */
   private pendingLidUsernameLookups = new Map<string, Promise<string | undefined>>();
+  /** In-flight media downloads deduplicated by messageId. */
+  private pendingMediaDownloads = new Map<
+    string,
+    Promise<{ success: true; buffer: Buffer; mimetype: string; fileName?: string } | { success: false; error: string; code: number }>
+  >();
+  /** Per-chat processing queues to keep inbound message delivery strictly ordered per chat. */
+  private chatQueues = new Map<string, Promise<void>>();
+  private activeWebhooks = 0;
+  private webhookWaiters: Array<() => void> = [];
   /** Outbound Hermes reply id -> inbound message id it answered (to undo "replied" on a late rejection). */
   private hermesReplyLinks = new Map<string, string>();
   private status: WhatsAppConnectionStatus = 'disconnected';
   private qrCodeDataUrl: string | null = null;
   private user: { id: string; name?: string } | null = null;
   private lastConnectedAt: string | null = null;
+  private lastConnectedIso: string | null = null;
   private lastError: string | null = null;
+  private stateVersion = 0;
+  private stateListeners = new Set<() => void>();
+  private notifyQueued = false;
   private recentMessages: RecentMessage[] = [];
   private processedMessageIds = new Set<string>();
   /** Raw messages kept so replies can quote them and media can be downloaded on request. */
@@ -339,13 +441,144 @@ export class WhatsAppClient {
   private shuttingDown = false;
   private logger = pino({ level: 'warn' });
 
-  constructor(sessionDir: string = './sessions') {
+  constructor(sessionDir: string = './sessions', dataDir: string = config.dataDir) {
     this.sessionDir = path.resolve(sessionDir);
+    this.dataDir = path.resolve(dataDir);
     if (!fs.existsSync(this.sessionDir)) {
       fs.mkdirSync(this.sessionDir, { recursive: true });
     }
-    this.usernamesFile = path.resolve(config.dataDir, 'usernames.json');
+    this.usernamesFile = path.resolve(this.dataDir, 'usernames.json');
+    this.activityFile = path.resolve(this.dataDir, 'activity.json');
+    this.usernamesWriter = new DebouncedJsonWriter(this.usernamesFile, 400, (err) => {
+      console.error('[WhatsApp] Could not persist usernames directory:', err instanceof Error ? err.message : err);
+    });
+    this.activityWriter = new DebouncedJsonWriter(this.activityFile, 500, (err) => {
+      console.error('[WhatsApp] Could not persist activity state:', err instanceof Error ? err.message : err);
+    });
     this.loadUsernameDirectory();
+    this.loadActivityState();
+  }
+
+  public onStateChange(listener: () => void): () => void {
+    this.stateListeners.add(listener);
+    return () => {
+      this.stateListeners.delete(listener);
+    };
+  }
+
+  private notifyStateChange(): void {
+    this.stateVersion++;
+    if (this.notifyQueued || this.stateListeners.size === 0) return;
+    this.notifyQueued = true;
+    queueMicrotask(() => {
+      this.notifyQueued = false;
+      for (const listener of this.stateListeners) {
+        try {
+          listener();
+        } catch {
+          // Ignore subscriber errors.
+        }
+      }
+    });
+  }
+
+  private loadActivityState(): void {
+    if (!fs.existsSync(this.activityFile)) return;
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.activityFile, 'utf8')) as Partial<PersistedActivity>;
+      if (raw.stats && typeof raw.stats === 'object') {
+        if (typeof raw.stats.receivedCount === 'number') this.stats.receivedCount = raw.stats.receivedCount;
+        if (typeof raw.stats.forwardedToHermesCount === 'number') {
+          this.stats.forwardedToHermesCount = raw.stats.forwardedToHermesCount;
+        }
+        if (typeof raw.stats.hermesRepliesCount === 'number') {
+          this.stats.hermesRepliesCount = raw.stats.hermesRepliesCount;
+        }
+        if (typeof raw.stats.sentCount === 'number') this.stats.sentCount = raw.stats.sentCount;
+      }
+      if (Array.isArray(raw.recentMessages)) {
+        this.recentMessages = raw.recentMessages
+          .filter(
+            (m): m is RecentMessage =>
+              Boolean(m && typeof m.id === 'string' && typeof m.timestamp === 'string' && typeof m.isoTimestamp === 'string')
+          )
+          .slice(0, MAX_RECENT_MESSAGES)
+          .map((m) =>
+            m.webhookStatus === 'forwarded'
+              ? { ...m, webhookStatus: 'failed', webhookError: 'Gateway restarted before Hermes responded' }
+              : m
+          );
+      }
+      if (Array.isArray(raw.processedMessageIds)) {
+        for (const id of raw.processedMessageIds.slice(-MAX_PROCESSED_MESSAGE_IDS)) {
+          if (typeof id === 'string' && id) {
+            this.processedMessageIds.add(id);
+          }
+        }
+      }
+    } catch (err: unknown) {
+      console.warn('[WhatsApp] Could not read persisted activity state:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private scheduleActivitySave(): void {
+    this.notifyStateChange();
+    this.activityWriter.schedule(() => ({
+      stats: { ...this.stats },
+      recentMessages: this.recentMessages.map((m) => ({ ...m })),
+      processedMessageIds: Array.from(this.processedMessageIds)
+    }));
+  }
+
+  private async withWebhookSlot<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.activeWebhooks >= config.webhookConcurrency) {
+      await new Promise<void>((resolve) => {
+        this.webhookWaiters.push(resolve);
+      });
+    }
+    this.activeWebhooks++;
+    try {
+      return await fn();
+    } finally {
+      this.activeWebhooks--;
+      const next = this.webhookWaiters.shift();
+      if (next) next();
+    }
+  }
+
+  private indexUsernameEntry(entry: UsernameDirectoryEntry): void {
+    this.jidToUsername.set(entry.jid, entry.username);
+    if (entry.phoneNumber) {
+      this.phoneToUsername.set(entry.phoneNumber, entry.username);
+    } else if (isPnUser(entry.jid)) {
+      const digits = digitsOfJid(entry.jid);
+      if (digits) this.phoneToUsername.set(digits, entry.username);
+    }
+  }
+
+  private unindexUsernameEntry(username: string, entry: UsernameDirectoryEntry): void {
+    if (this.jidToUsername.get(entry.jid) === username) {
+      this.jidToUsername.delete(entry.jid);
+    }
+    const phone = entry.phoneNumber || (isPnUser(entry.jid) ? digitsOfJid(entry.jid) : '');
+    if (phone && this.phoneToUsername.get(phone) === username) {
+      this.phoneToUsername.delete(phone);
+    }
+  }
+
+  private recordVerifiedPhoneJid(rawJid: string | null | undefined): void {
+    if (!rawJid) return;
+    const normalized = jidNormalizedUser(rawJid);
+    if (!normalized || !isPnUser(normalized)) return;
+    this.verifiedPhoneJids.delete(normalized);
+    this.verifiedPhoneJids.set(normalized, {
+      jid: normalized,
+      expiresAt: Date.now() + VERIFIED_PHONE_TTL_MS
+    });
+    if (this.verifiedPhoneJids.size > MAX_VERIFIED_PHONE_CACHE) {
+      const oldest = this.verifiedPhoneJids.keys().next().value;
+      if (oldest) this.verifiedPhoneJids.delete(oldest);
+    }
   }
 
   private loadUsernameDirectory(): void {
@@ -355,13 +588,15 @@ export class WhatsAppClient {
       for (const [key, entry] of Object.entries(raw)) {
         const clean = (entry?.username || key).trim().replace(/^@+/, '').toLowerCase();
         if (clean && entry?.jid && isValidWhatsAppUsername(clean)) {
-          this.usernameDirectory.set(clean, {
+          const normalizedEntry: UsernameDirectoryEntry = {
             username: clean,
             jid: jidNormalizedUser(entry.jid),
             ...(entry.phoneNumber ? { phoneNumber: entry.phoneNumber } : {}),
             ...(entry.name ? { name: entry.name } : {}),
             updatedAt: entry.updatedAt || new Date().toISOString()
-          });
+          };
+          this.usernameDirectory.set(clean, normalizedEntry);
+          this.indexUsernameEntry(normalizedEntry);
         }
       }
     } catch (err: unknown) {
@@ -370,16 +605,13 @@ export class WhatsAppClient {
   }
 
   private saveUsernameDirectory(): void {
-    try {
-      fs.mkdirSync(path.dirname(this.usernamesFile), { recursive: true });
+    this.usernamesWriter.schedule(() => {
       const serialized: Record<string, UsernameDirectoryEntry> = {};
       for (const [key, value] of this.usernameDirectory.entries()) {
         serialized[key] = value;
       }
-      fs.writeFileSync(this.usernamesFile, JSON.stringify(serialized, null, 2));
-    } catch (err: unknown) {
-      console.error('[WhatsApp] Could not persist usernames directory:', err instanceof Error ? err.message : err);
-    }
+      return serialized;
+    });
   }
 
   private upsertUsernameMapping(
@@ -403,9 +635,12 @@ export class WhatsAppClient {
 
     // Evict any older handle previously mapped to the same JID (the contact changed their @username)
     let staleRemoved = false;
-    for (const [otherKey, otherEntry] of this.usernameDirectory.entries()) {
-      if (otherKey !== cleanUsername && otherEntry.jid === normalizedJid) {
-        this.usernameDirectory.delete(otherKey);
+    const prevUsernameForJid = this.jidToUsername.get(normalizedJid);
+    if (prevUsernameForJid && prevUsernameForJid !== cleanUsername) {
+      const prevEntry = this.usernameDirectory.get(prevUsernameForJid);
+      if (prevEntry) {
+        this.usernameDirectory.delete(prevUsernameForJid);
+        this.unindexUsernameEntry(prevUsernameForJid, prevEntry);
         staleRemoved = true;
       }
     }
@@ -419,13 +654,19 @@ export class WhatsAppClient {
 
     if (unchanged) return false;
 
-    this.usernameDirectory.set(cleanUsername, {
+    if (existing) {
+      this.unindexUsernameEntry(cleanUsername, existing);
+    }
+
+    const updatedEntry: UsernameDirectoryEntry = {
       username: cleanUsername,
       jid: normalizedJid,
       ...(cleanPhone ? { phoneNumber: cleanPhone } : {}),
       ...(cleanName ? { name: cleanName } : {}),
       updatedAt: new Date().toISOString()
-    });
+    };
+    this.usernameDirectory.set(cleanUsername, updatedEntry);
+    this.indexUsernameEntry(updatedEntry);
     this.emptyLidUsernameCache.delete(normalizedJid);
 
     if (persist) {
@@ -437,13 +678,18 @@ export class WhatsAppClient {
   /** Finds a cached @username for a sender by JID, alternate JID (LID <-> PN), or phone digits. */
   private findUsernameForSender(senderJid: string, senderAlt?: string | null, phone?: string | null): string | undefined {
     const normSender = senderJid ? jidNormalizedUser(senderJid) : '';
+    if (normSender) {
+      const hit = this.jidToUsername.get(normSender);
+      if (hit) return hit;
+    }
     const normAlt = senderAlt ? jidNormalizedUser(senderAlt) : '';
+    if (normAlt) {
+      const hit = this.jidToUsername.get(normAlt);
+      if (hit) return hit;
+    }
     const cleanPhone = phone?.replace(/[^0-9]/g, '') || '';
-    for (const entry of this.usernameDirectory.values()) {
-      if (entry.jid === normSender || (normAlt && entry.jid === normAlt)) return entry.username;
-      if (cleanPhone && (entry.phoneNumber === cleanPhone || (isPnUser(entry.jid) && digitsOfJid(entry.jid) === cleanPhone))) {
-        return entry.username;
-      }
+    if (cleanPhone) {
+      return this.phoneToUsername.get(cleanPhone);
     }
     return undefined;
   }
@@ -460,9 +706,8 @@ export class WhatsAppClient {
       if (opts.historical) {
         const normalized = jidNormalizedUser(jid);
         const cleanUsername = username.trim().replace(/^@+/, '').toLowerCase();
-        for (const entry of this.usernameDirectory.values()) {
-          if (entry.jid === normalized && entry.username !== cleanUsername) return;
-        }
+        const existingUsername = this.jidToUsername.get(normalized);
+        if (existingUsername && existingUsername !== cleanUsername) return;
       }
       if (this.upsertUsernameMapping(username, jid, pn, name, false)) changed = true;
     };
@@ -473,13 +718,19 @@ export class WhatsAppClient {
       // pushName on fromMe messages is our own name, never the peer's
       const peerName = key.fromMe ? undefined : msg.pushName ?? undefined;
       if (isJidGroup(chatJid)) {
+        if (key.participant && isPnUser(key.participant)) this.recordVerifiedPhoneJid(key.participant);
+        if (key.participantAlt && isPnUser(key.participantAlt)) this.recordVerifiedPhoneJid(key.participantAlt);
         if (key.participantUsername && key.participant) {
           const pn = key.participantAlt && isPnUser(key.participantAlt) ? key.participantAlt : isPnUser(key.participant) ? key.participant : undefined;
           learn(key.participantUsername, key.participant, digitsOfJid(pn) || undefined, peerName);
         }
-      } else if (key.remoteJidUsername) {
-        const pn = key.remoteJidAlt && isPnUser(key.remoteJidAlt) ? key.remoteJidAlt : isPnUser(chatJid) ? chatJid : undefined;
-        learn(key.remoteJidUsername, chatJid, digitsOfJid(pn) || undefined, peerName);
+      } else {
+        if (isPnUser(chatJid)) this.recordVerifiedPhoneJid(chatJid);
+        if (key.remoteJidAlt && isPnUser(key.remoteJidAlt)) this.recordVerifiedPhoneJid(key.remoteJidAlt);
+        if (key.remoteJidUsername) {
+          const pn = key.remoteJidAlt && isPnUser(key.remoteJidAlt) ? key.remoteJidAlt : isPnUser(chatJid) ? chatJid : undefined;
+          learn(key.remoteJidUsername, chatJid, digitsOfJid(pn) || undefined, peerName);
+        }
       }
     }
     if (changed) this.saveUsernameDirectory();
@@ -489,7 +740,10 @@ export class WhatsAppClient {
   private ingestGroupParticipants(participants: Array<Partial<GroupParticipant>>): boolean {
     let changed = false;
     for (const p of participants) {
-      if (!p?.username) continue;
+      if (!p) continue;
+      if (p.id && isPnUser(p.id)) this.recordVerifiedPhoneJid(p.id);
+      if (p.phoneNumber && isPnUser(p.phoneNumber)) this.recordVerifiedPhoneJid(p.phoneNumber);
+      if (!p.username) continue;
       const targetJid = p.lid || p.id || p.phoneNumber;
       if (!targetJid) continue;
       const pnSource = p.phoneNumber || (p.id && isPnUser(p.id) ? p.id : undefined);
@@ -511,6 +765,8 @@ export class WhatsAppClient {
         [g.authorUsername, g.author, g.authorPn]
       ];
       for (const [username, jid, pn] of owners) {
+        if (jid && isPnUser(jid)) this.recordVerifiedPhoneJid(jid);
+        if (pn && isPnUser(pn)) this.recordVerifiedPhoneJid(pn);
         if (username && jid && this.upsertUsernameMapping(username, jid, digitsOfJid(pn) || undefined, undefined, false)) {
           changed = true;
         }
@@ -601,7 +857,10 @@ export class WhatsAppClient {
   private ingestContacts(contacts: Array<Partial<Contact>>): void {
     let changed = false;
     for (const contact of contacts) {
-      if (!contact?.username) continue;
+      if (!contact) continue;
+      if (contact.id && isPnUser(contact.id)) this.recordVerifiedPhoneJid(contact.id);
+      if (contact.phoneNumber && isPnUser(contact.phoneNumber)) this.recordVerifiedPhoneJid(contact.phoneNumber);
+      if (!contact.username) continue;
       const targetJid = contact.lid || contact.id || contact.phoneNumber;
       if (!targetJid) continue;
       const pnSource = contact.phoneNumber || (contact.id && isPnUser(contact.id) ? contact.id : undefined);
@@ -621,19 +880,7 @@ export class WhatsAppClient {
   }
 
   private formatDateTime(date: Date = new Date()): string {
-    return new Intl.DateTimeFormat('en-GB', {
-      timeZone: config.timezone,
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false
-    })
-      .format(date)
-      .replace(/\//g, '-')
-      .replace(',', '');
+    return formatDateTimeParts(date).full;
   }
 
   // ---------------------------------------------------------------------------
@@ -645,6 +892,7 @@ export class WhatsAppClient {
       return;
     }
     this.starting = true;
+    const epoch = ++this.connectionEpoch;
 
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
@@ -653,9 +901,12 @@ export class WhatsAppClient {
 
     this.status = 'connecting';
     this.lastError = null;
+    this.notifyStateChange();
 
     try {
       const { state, saveCreds } = await useMultiFileAuthState(this.sessionDir);
+      if (this.shuttingDown || epoch !== this.connectionEpoch) return;
+
       this.registered = Boolean(state.creds.registered);
       // Looked up once per process; reconnects should not depend on GitHub being reachable.
       if (!this.waVersion) {
@@ -668,6 +919,7 @@ export class WhatsAppClient {
           );
         }
       }
+      if (this.shuttingDown || epoch !== this.connectionEpoch) return;
 
       const sock = makeWASocket({
         version: this.waVersion,
@@ -695,22 +947,26 @@ export class WhatsAppClient {
           try {
             this.qrCodeDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 280 });
             this.status = 'qr_ready';
+            this.notifyStateChange();
           } catch (qrErr: unknown) {
             console.error('Failed to generate QR data URL:', qrErr);
           }
         }
 
         if (connection === 'open') {
+          const connectedNow = new Date();
           this.status = 'connected';
           this.qrCodeDataUrl = null;
           this.reconnectAttempts = 0;
           this.registered = true;
           this.lastError = null;
-          this.lastConnectedAt = this.formatDateTime();
+          this.lastConnectedIso = connectedNow.toISOString();
+          this.lastConnectedAt = this.formatDateTime(connectedNow);
           this.user = {
             id: sock.user?.id || 'Connected Account',
             name: sock.user?.name || undefined
           };
+          this.notifyStateChange();
           console.log(`[WhatsApp] Connected successfully as ${this.user.id}`);
         } else if (connection === 'close') {
           await this.handleClose(lastDisconnect?.error);
@@ -722,11 +978,22 @@ export class WhatsAppClient {
         this.ingestMessageUsernames(messages, { historical: type !== 'notify' });
         if (type !== 'notify') return;
 
-        // Do not await: a slow Hermes webhook must never hold up the WhatsApp event loop.
+        // Serialize per chatJid so messages in the same thread keep arrival order without blocking other chats.
         for (const msg of messages) {
-          this.handleIncomingMessage(msg).catch((err: unknown) => {
-            console.error('[WhatsApp] Failed to process incoming message:', err);
-          });
+          const queueKey = msg?.key?.remoteJid || msg?.key?.id || 'default';
+          const prev = this.chatQueues.get(queueKey) ?? Promise.resolve();
+          const next = prev
+            .catch(() => {})
+            .then(() => this.handleIncomingMessage(msg))
+            .catch((err: unknown) => {
+              console.error('[WhatsApp] Failed to process incoming message:', err);
+            })
+            .finally(() => {
+              if (this.chatQueues.get(queueKey) === next) {
+                this.chatQueues.delete(queueKey);
+              }
+            });
+          this.chatQueues.set(queueKey, next);
         }
       });
 
@@ -773,6 +1040,7 @@ export class WhatsAppClient {
       const errMsg = err instanceof Error ? err.message : String(err);
       this.status = 'disconnected';
       this.lastError = errMsg;
+      this.notifyStateChange();
       console.error('[WhatsApp] Initialization error:', errMsg);
     } finally {
       this.starting = false;
@@ -783,10 +1051,14 @@ export class WhatsAppClient {
     const statusCode = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
 
     console.log(`[WhatsApp] Connection closed (code ${statusCode}).`);
+    this.connectionEpoch++;
     this.cleanupSocket();
     this.qrCodeDataUrl = null;
 
-    if (this.shuttingDown) return;
+    if (this.shuttingDown) {
+      this.notifyStateChange();
+      return;
+    }
 
     // Cases where the saved session is no longer usable: wipe it and ask for a new QR scan.
     const sessionDead: Partial<Record<number, string>> = {
@@ -801,39 +1073,46 @@ export class WhatsAppClient {
       this.user = null;
       this.registered = false;
       await this.clearSavedSession();
+      this.notifyStateChange();
       return;
     }
 
     if (statusCode === DisconnectReason.connectionReplaced) {
       this.status = 'disconnected';
       this.lastError = 'This WhatsApp session was opened somewhere else. Press "Reconnect" to take it back.';
+      this.notifyStateChange();
       return;
     }
 
     if (statusCode === DisconnectReason.forbidden) {
       this.status = 'disconnected';
       this.lastError = 'WhatsApp refused the connection (403). The account may be blocked from using linked devices.';
+      this.notifyStateChange();
       return;
     }
 
     // WhatsApp asks for an immediate restart right after a QR scan; that is not a failure.
     if (statusCode === DisconnectReason.restartRequired) {
       this.status = 'connecting';
+      this.notifyStateChange();
       this.scheduleReconnect(500);
       return;
     }
 
-    // A linked account keeps retrying (with a capped back-off) so an unattended server heals itself.
+    // A linked account keeps retrying (with exponential back-off + jitter) so an unattended server heals itself.
     // An account that was never paired gives up after a few QR cycles instead of looping forever.
     if (this.registered || this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      const delay = Math.min(this.reconnectAttempts * 3000, 60_000);
-      console.log(`[WhatsApp] Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts})...`);
+      const baseDelay = Math.min(2000 * 2 ** Math.min(this.reconnectAttempts - 1, 6), 60_000);
+      const delay = baseDelay + Math.floor(Math.random() * 1000);
+      console.log(`[WhatsApp] Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${this.reconnectAttempts})...`);
       this.status = 'connecting';
+      this.notifyStateChange();
       this.scheduleReconnect(delay);
     } else {
       this.status = 'disconnected';
       this.lastError = 'The QR code expired before it was scanned. Press "Reconnect" to get a new one.';
+      this.notifyStateChange();
     }
   }
 
@@ -848,14 +1127,17 @@ export class WhatsAppClient {
   /** Drops the socket without unlinking the device, so the session survives a restart. */
   public async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.connectionEpoch++;
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
     }
     this.cleanupSocket();
+    await Promise.all([this.usernamesWriter.flush(), this.activityWriter.flush()]);
   }
 
   public async logout(): Promise<{ success: boolean; message: string }> {
+    this.connectionEpoch++;
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -879,8 +1161,12 @@ export class WhatsAppClient {
       this.user = null;
       this.registered = false;
       this.qrCodeDataUrl = null;
+      this.lastConnectedAt = null;
+      this.lastConnectedIso = null;
       this.lastError = null;
       this.reconnectAttempts = 0;
+      await Promise.all([this.usernamesWriter.flush(), this.activityWriter.flush()]);
+      this.notifyStateChange();
       return { success: true, message: 'Logged out and session cleared successfully' };
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -940,6 +1226,8 @@ export class WhatsAppClient {
           text?: string | null;
           mimetype?: string | null;
           ptt?: boolean | null;
+          fileName?: string | null;
+          fileLength?: unknown;
           contextInfo?: proto.IContextInfo | null;
           name?: string | null;
           displayName?: string | null;
@@ -948,6 +1236,17 @@ export class WhatsAppClient {
           selectedDisplayText?: string | null;
           title?: string | null;
           singleSelectReply?: { selectedRowId?: string | null } | null;
+          options?: Array<{ optionName?: string | null }> | null;
+          message?: {
+            documentMessage?: {
+              caption?: string | null;
+              mimetype?: string | null;
+              fileName?: string | null;
+              title?: string | null;
+              fileLength?: unknown;
+              contextInfo?: proto.IContextInfo | null;
+            } | null;
+          } | null;
         }
       | string
       | null
@@ -961,22 +1260,69 @@ export class WhatsAppClient {
       case 'extendedTextMessage':
         return { type: 'text', text: p.text ?? '', hasMedia: false, contextInfo };
       case 'imageMessage':
-        return { type: 'image', text: p.caption || '[Image]', hasMedia: true, mimetype: p.mimetype ?? undefined, contextInfo };
+        return {
+          type: 'image',
+          text: p.caption || '[Image]',
+          hasMedia: true,
+          mimetype: p.mimetype ?? undefined,
+          fileLength: readFileLength(p.fileLength),
+          contextInfo
+        };
       case 'videoMessage':
-        return { type: 'video', text: p.caption || '[Video]', hasMedia: true, mimetype: p.mimetype ?? undefined, contextInfo };
+        return {
+          type: 'video',
+          text: p.caption || '[Video]',
+          hasMedia: true,
+          mimetype: p.mimetype ?? undefined,
+          fileLength: readFileLength(p.fileLength),
+          contextInfo
+        };
       case 'audioMessage':
         return {
           type: p.ptt ? 'voice' : 'audio',
           text: p.ptt ? '[Voice message]' : '[Audio]',
           hasMedia: true,
           mimetype: p.mimetype ?? undefined,
+          fileLength: readFileLength(p.fileLength),
           contextInfo
         };
       case 'documentMessage':
-      case 'documentWithCaptionMessage':
-        return { type: 'document', text: p.caption || `[Document${p.title ? `: ${p.title}` : ''}]`, hasMedia: true, mimetype: p.mimetype ?? undefined, contextInfo };
+      case 'documentWithCaptionMessage': {
+        const doc = p.message?.documentMessage ?? p;
+        const docName = doc.fileName || doc.title || p.fileName || p.title || undefined;
+        return {
+          type: 'document',
+          text: doc.caption || p.caption || `[Document${docName ? `: ${docName}` : ''}]`,
+          hasMedia: true,
+          mimetype: doc.mimetype ?? p.mimetype ?? undefined,
+          fileName: docName,
+          fileLength: readFileLength(doc.fileLength ?? p.fileLength),
+          contextInfo: doc.contextInfo ?? contextInfo
+        };
+      }
       case 'stickerMessage':
-        return { type: 'sticker', text: '[Sticker]', hasMedia: true, mimetype: p.mimetype ?? undefined, contextInfo };
+        return {
+          type: 'sticker',
+          text: '[Sticker]',
+          hasMedia: true,
+          mimetype: p.mimetype ?? undefined,
+          fileLength: readFileLength(p.fileLength),
+          contextInfo
+        };
+      case 'pollCreationMessage':
+      case 'pollCreationMessageV2':
+      case 'pollCreationMessageV3': {
+        const options = (p.options ?? [])
+          .map((opt) => opt?.optionName?.trim())
+          .filter((v): v is string => Boolean(v));
+        const optionSuffix = options.length > 0 ? ` (${options.join(', ')})` : '';
+        return {
+          type: 'poll',
+          text: `[Poll] ${p.name || 'Untitled'}${optionSuffix}`,
+          hasMedia: false,
+          contextInfo
+        };
+      }
       case 'locationMessage':
       case 'liveLocationMessage':
         return {
@@ -1020,7 +1366,7 @@ export class WhatsAppClient {
     }
     if (msgId) {
       this.processedMessageIds.add(msgId);
-      if (this.processedMessageIds.size > 2000) {
+      if (this.processedMessageIds.size > MAX_PROCESSED_MESSAGE_IDS) {
         const oldest = this.processedMessageIds.values().next().value;
         if (oldest) this.processedMessageIds.delete(oldest);
       }
@@ -1048,6 +1394,9 @@ export class WhatsAppClient {
     // WhatsApp now addresses many people by an opaque "LID" instead of their phone number.
     // Only report a phone number when we actually know it; replies always go to chatJid.
     const phoneJid = isLidUser(senderJid) ? senderAlt : senderJid;
+    if (phoneJid && isPnUser(phoneJid)) {
+      this.recordVerifiedPhoneJid(phoneJid);
+    }
     const phone = phoneJid ? phoneJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') || null : null;
     const senderId = senderJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
 
@@ -1082,10 +1431,12 @@ export class WhatsAppClient {
       recipient: 'Hermes Agent',
       content: parsed.text,
       timestamp: this.formatDateTime(eventDate),
+      isoTimestamp: eventDate.toISOString(),
       fromMe: false,
       isGroup,
       chatJid,
       messageType: parsed.type,
+      hasMedia: parsed.hasMedia,
       webhookStatus: 'disabled'
     };
 
@@ -1096,6 +1447,7 @@ export class WhatsAppClient {
     if (!config.webhookUrl) return;
     if (!this.settings.forwardingEnabled) {
       record.webhookStatus = 'paused';
+      this.scheduleActivitySave();
       return;
     }
     if (
@@ -1106,10 +1458,12 @@ export class WhatsAppClient {
         ))
     ) {
       record.webhookStatus = 'filtered';
+      this.scheduleActivitySave();
       return;
     }
 
     record.webhookStatus = 'forwarded';
+    this.scheduleActivitySave();
 
     const payload = {
       event: 'message.received',
@@ -1129,26 +1483,29 @@ export class WhatsAppClient {
       messageType: parsed.type,
       hasMedia: parsed.hasMedia,
       mimetype: parsed.mimetype ?? null,
+      fileName: parsed.fileName ?? null,
       mentionsMe,
       isReplyToMe,
       quoted: ctx?.stanzaId ? { messageId: ctx.stanzaId, message: quotedContent?.text ?? null } : null,
       timestamp: record.timestamp,
       timezone: config.timezone,
-      isoTimestamp: eventDate.toISOString(),
+      isoTimestamp: record.isoTimestamp,
       rawTimestamp: tsSeconds
     };
 
     try {
-      const result = await postToHermes(payload);
+      const result = await this.withWebhookSlot(() => postToHermes(payload));
 
       if (!result.ok) {
         record.webhookStatus = 'failed';
         record.webhookError = `Hermes answered HTTP ${result.status}`;
+        this.scheduleActivitySave();
         console.warn(`[Webhook] Hermes returned HTTP ${result.status} for message ${id}`);
         return;
       }
 
       this.stats.forwardedToHermesCount++;
+      this.scheduleActivitySave();
       const reply = typeof result.json?.reply === 'string' ? result.json.reply.trim() : '';
       const stickerReply =
         typeof result.json?.sticker === 'string' && (result.json.sticker as string).trim()
@@ -1169,6 +1526,7 @@ export class WhatsAppClient {
         if (!sent.success) {
           record.webhookStatus = 'failed';
           record.webhookError = `Reply could not be sent: ${sent.error}`;
+          this.scheduleActivitySave();
         }
       } else if (stickerReply) {
         record.hermesReply = '[Sticker]';
@@ -1184,22 +1542,26 @@ export class WhatsAppClient {
         if (!sent.success) {
           record.webhookStatus = 'failed';
           record.webhookError = `Sticker reply could not be sent: ${sent.error}`;
+          this.scheduleActivitySave();
         }
       } else {
         record.webhookStatus = result.json?.status === 'processing' ? 'processing' : 'ignored';
+        this.scheduleActivitySave();
       }
     } catch (err: unknown) {
       record.webhookStatus = 'failed';
       record.webhookError = err instanceof Error ? err.message : String(err);
+      this.scheduleActivitySave();
       console.error(`[Webhook] Could not reach Hermes at ${config.webhookUrl}: ${record.webhookError}`);
     }
   }
 
   private addRecentMessage(message: RecentMessage): void {
     this.recentMessages.unshift(message);
-    if (this.recentMessages.length > 50) {
+    if (this.recentMessages.length > MAX_RECENT_MESSAGES) {
       this.recentMessages.pop();
     }
+    this.scheduleActivitySave();
   }
 
   /**
@@ -1215,6 +1577,7 @@ export class WhatsAppClient {
     target.hermesReply = replyText;
     delete target.webhookError;
     this.stats.hermesRepliesCount++;
+    this.scheduleActivitySave();
     return target.id;
   }
 
@@ -1285,16 +1648,24 @@ export class WhatsAppClient {
     if (parsed.kind === 'jid' || parsed.kind === 'phone') {
       let jid = parsed.jid;
       if (jid.endsWith('@s.whatsapp.net')) {
-        try {
-          const results = await this.sock.onWhatsApp(jid);
-          // Baileys returns [] (or entries with exists=false) for numbers that are not on WhatsApp
-          const match = results?.[0];
-          if (Array.isArray(results) && (!match || !match.exists)) {
-            return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
+        const normalized = jidNormalizedUser(jid);
+        const cachedVerified = this.verifiedPhoneJids.get(normalized);
+        if (cachedVerified && !opts.forceRefresh && cachedVerified.expiresAt > Date.now()) {
+          jid = cachedVerified.jid;
+        } else {
+          if (cachedVerified) this.verifiedPhoneJids.delete(normalized);
+          try {
+            const results = await this.sock.onWhatsApp(jid);
+            // Baileys returns [] (or entries with exists=false) for numbers that are not on WhatsApp
+            const match = results?.[0];
+            if (Array.isArray(results) && (!match || !match.exists)) {
+              return { success: false, code: 404, error: `${jid.split('@')[0]} is not registered on WhatsApp` };
+            }
+            if (match?.exists && match.jid) jid = match.jid;
+            this.recordVerifiedPhoneJid(jid);
+          } catch {
+            // Lookup is best effort for phone numbers; proceed with constructed JID.
           }
-          if (match?.exists && match.jid) jid = match.jid;
-        } catch {
-          // Lookup is best effort for phone numbers; proceed with constructed JID.
         }
       }
       const isGroup = jid.endsWith('@g.us');
@@ -1529,14 +1900,21 @@ export class WhatsAppClient {
   ): Promise<{ success: true } | { success: false; code: RecipientErrorCode; error: string }> {
     const precheck = this.precheckSend(recipient, pin);
     if (precheck) return precheck;
-    const resolved = await this.resolveRecipient(recipient, { pin });
-    if (!resolved.success) return resolved;
+    const parsed = parseRecipientInput(recipient, pin);
+    let targetJid: string;
+    if (parsed.kind === 'jid') {
+      targetJid = parsed.jid;
+    } else {
+      const resolved = await this.resolveRecipient(recipient, { pin });
+      if (!resolved.success) return resolved;
+      targetJid = resolved.jid;
+    }
     const sock = this.sock;
     if (!sock || this.status !== 'connected') {
       return { success: false, code: 503, error: 'WhatsApp disconnected before the presence update could be sent.' };
     }
     try {
-      await sock.sendPresenceUpdate(presence, resolved.jid);
+      await sock.sendPresenceUpdate(presence, targetJid);
       return { success: true };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1623,12 +2001,14 @@ export class WhatsAppClient {
 
       if (ack?.error) {
         const error = describeOutboundAckError(ack.error, displayRecipient);
+        const ackDate = new Date();
         this.addRecentMessage({
           id: messageId,
           sender: params.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
           recipient: displayRecipient,
           content: params.summaryText,
-          timestamp: this.formatDateTime(),
+          timestamp: this.formatDateTime(ackDate),
+          isoTimestamp: ackDate.toISOString(),
           fromMe: true,
           isGroup,
           ...(params.messageType ? { messageType: params.messageType } : {}),
@@ -1648,12 +2028,14 @@ export class WhatsAppClient {
           }
         }
       }
+      const sentDate = new Date();
       this.addRecentMessage({
         id: messageId,
         sender: params.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
         recipient: displayRecipient,
         content: params.summaryText,
-        timestamp: this.formatDateTime(),
+        timestamp: this.formatDateTime(sentDate),
+        isoTimestamp: sentDate.toISOString(),
         fromMe: true,
         isGroup,
         ...(params.messageType ? { messageType: params.messageType } : {})
@@ -1670,6 +2052,7 @@ export class WhatsAppClient {
 
   /** Rolls back optimistic "Sent" records when WhatsApp later reports a delivery error for them. */
   private handleMessageUpdates(updates: WAMessageUpdate[]): void {
+    let changed = false;
     for (const { key, update } of updates) {
       if (!key?.fromMe || !key.id || update?.status !== WAMessageStatus.ERROR) continue;
       const record = this.recentMessages.find((m) => m.fromMe && m.id === key.id);
@@ -1677,6 +2060,7 @@ export class WhatsAppClient {
       const code = String(update.messageStubParameters?.[0] ?? 'unknown');
       record.deliveryError = describeOutboundAckError(code, record.recipient);
       this.stats.sentCount = Math.max(0, this.stats.sentCount - 1);
+      changed = true;
 
       // If this was a Hermes reply, the inbound message it answered was not actually answered
       const answeredId = this.hermesReplyLinks.get(key.id);
@@ -1690,6 +2074,9 @@ export class WhatsAppClient {
         }
       }
       console.warn(`[WhatsApp] Message ${key.id} to ${record.recipient} was rejected by WhatsApp (error ${code}).`);
+    }
+    if (changed) {
+      this.scheduleActivitySave();
     }
   }
 
@@ -1754,16 +2141,30 @@ export class WhatsAppClient {
     }
 
     const cleanImageUrl = imageUrl.trim();
+    let resolvedMedia: { buffer: Buffer; mimetype?: string; fileName?: string };
+    try {
+      resolvedMedia = await resolveMediaInput(cleanImageUrl);
+    } catch (err: unknown) {
+      if (err instanceof MediaResolutionError) {
+        return { success: false, code: err.statusCode, error: err.message };
+      }
+      return { success: false, code: 400, error: err instanceof Error ? err.message : String(err) };
+    }
+
     const cleanCaption = caption?.trim() ? formatWhatsAppText(caption.trim()) : undefined;
     const summaryText = cleanCaption
       ? `[Image] ${cleanCaption}`
       : cleanImageUrl.startsWith('data:')
         ? '[Image]'
-        : `[Image] ${cleanImageUrl}`;
+        : `[Image] ${resolvedMedia.fileName ?? cleanImageUrl}`;
 
     return this.dispatchOutboundMessage({
       resolved,
-      content: { image: { url: cleanImageUrl }, ...(cleanCaption ? { caption: cleanCaption } : {}) },
+      content: {
+        image: resolvedMedia.buffer,
+        ...(resolvedMedia.mimetype ? { mimetype: resolvedMedia.mimetype } : {}),
+        ...(cleanCaption ? { caption: cleanCaption } : {})
+      },
       summaryText,
       messageType: 'image',
       quotedMessageId: opts.quotedMessageId,
@@ -1803,16 +2204,27 @@ export class WhatsAppClient {
     const cleanFileName = opts.fileName?.trim();
     const cleanUrl = documentUrl.trim();
 
+    let resolvedMedia: { buffer: Buffer; mimetype?: string; fileName?: string };
+    try {
+      resolvedMedia = await resolveMediaInput(cleanUrl);
+    } catch (err: unknown) {
+      if (err instanceof MediaResolutionError) {
+        return { success: false, code: err.statusCode, error: err.message };
+      }
+      return { success: false, code: 400, error: err instanceof Error ? err.message : String(err) };
+    }
+
     // Determine filename if not provided
-    let resolvedFileName = cleanFileName;
+    let resolvedFileName = cleanFileName || resolvedMedia.fileName;
     if (!resolvedFileName) {
       if (cleanUrl.startsWith('data:')) {
-        const mimeMatch = cleanUrl.match(/^data:([^;,]+)/)?.[1];
+        const mimeMatch = resolvedMedia.mimetype ?? cleanUrl.match(/^data:([^;,]+)/)?.[1];
         let ext = 'bin';
         if (mimeMatch === 'application/pdf') ext = 'pdf';
         else if (mimeMatch === 'text/plain') ext = 'txt';
+        else if (mimeMatch === 'text/markdown') ext = 'md';
         else if (mimeMatch === 'application/json') ext = 'json';
-        else if (mimeMatch?.includes('/')) ext = mimeMatch.split('/')[1];
+        else if (mimeMatch?.includes('/')) ext = mimeMatch.split('/')[1].split('+')[0];
         resolvedFileName = `document.${ext}`;
       } else {
         const candidate = cleanUrl.split('/').pop()?.split('?')[0]?.split('#')[0];
@@ -1820,17 +2232,7 @@ export class WhatsAppClient {
       }
     }
 
-    // Determine mimetype
-    let mimetype = opts.mimetype?.trim();
-    if (!mimetype && cleanUrl.startsWith('data:')) {
-      const match = cleanUrl.match(/^data:([^;,]+)/);
-      if (match && match[1]) {
-        mimetype = match[1];
-      }
-    }
-    if (!mimetype) {
-      mimetype = this.inferDocumentMimetype(resolvedFileName);
-    }
+    const mimetype = opts.mimetype?.trim() || resolvedMedia.mimetype || inferDocumentMimetype(resolvedFileName);
 
     const summaryText = cleanCaption
       ? `[Document: ${resolvedFileName}] ${cleanCaption}`
@@ -1839,7 +2241,7 @@ export class WhatsAppClient {
     return this.dispatchOutboundMessage({
       resolved,
       content: {
-        document: { url: cleanUrl },
+        document: resolvedMedia.buffer,
         mimetype,
         fileName: resolvedFileName,
         ...(cleanCaption ? { caption: cleanCaption } : {})
@@ -1850,38 +2252,6 @@ export class WhatsAppClient {
       inReplyTo: opts.inReplyTo,
       source: opts.source
     });
-  }
-
-  private inferDocumentMimetype(filename: string): string {
-    const ext = filename.split('.').pop()?.toLowerCase();
-    switch (ext) {
-      case 'pdf':
-        return 'application/pdf';
-      case 'doc':
-        return 'application/msword';
-      case 'docx':
-        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-      case 'xls':
-        return 'application/vnd.ms-excel';
-      case 'xlsx':
-        return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-      case 'ppt':
-        return 'application/vnd.ms-powerpoint';
-      case 'pptx':
-        return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
-      case 'csv':
-        return 'text/csv';
-      case 'txt':
-        return 'text/plain';
-      case 'json':
-        return 'application/json';
-      case 'zip':
-        return 'application/zip';
-      case 'xml':
-        return 'application/xml';
-      default:
-        return 'application/pdf';
-    }
   }
 
   public async sendSticker(
@@ -1921,6 +2291,9 @@ export class WhatsAppClient {
         isAnimated: opts.isAnimated
       });
     } catch (err: unknown) {
+      if (err instanceof MediaResolutionError) {
+        return { success: false, code: err.statusCode, error: err.message };
+      }
       return { success: false, code: 400, error: `Failed to prepare sticker: ${err instanceof Error ? err.message : String(err)}` };
     }
 
@@ -1938,32 +2311,64 @@ export class WhatsAppClient {
     });
   }
 
-
   /** Downloads the media of a recently received message (the last few hundred are kept in memory). */
   public async downloadMedia(
     messageId: string
-  ): Promise<{ success: true; buffer: Buffer; mimetype: string } | { success: false; error: string; code: number }> {
-    const msg = this.rawMessages.get(messageId);
-    if (!msg) {
-      return { success: false, code: 404, error: 'Message not found. Only the most recent messages are kept.' };
-    }
-    if (!this.sock || this.status !== 'connected') {
-      return { success: false, code: 503, error: 'WhatsApp is not connected' };
-    }
-    const parsed = this.parseContent(msg.message);
-    if (!parsed?.hasMedia) {
-      return { success: false, code: 400, error: 'This message has no downloadable media' };
-    }
+  ): Promise<{ success: true; buffer: Buffer; mimetype: string; fileName?: string } | { success: false; error: string; code: number }> {
+    const inflight = this.pendingMediaDownloads.get(messageId);
+    if (inflight) return inflight;
+
+    const task = (async (): Promise<
+      { success: true; buffer: Buffer; mimetype: string; fileName?: string } | { success: false; error: string; code: number }
+    > => {
+      const msg = this.rawMessages.get(messageId);
+      if (!msg) {
+        return { success: false, code: 404, error: 'Message not found. Only the most recent messages are kept.' };
+      }
+      if (!this.sock || this.status !== 'connected') {
+        return { success: false, code: 503, error: 'WhatsApp is not connected' };
+      }
+      const parsed = this.parseContent(msg.message);
+      if (!parsed?.hasMedia) {
+        return { success: false, code: 400, error: 'This message has no downloadable media' };
+      }
+      if (parsed.fileLength !== undefined && parsed.fileLength > config.maxMediaBytes) {
+        return {
+          success: false,
+          code: 413,
+          error: `Inbound media (${parsed.fileLength} bytes) exceeds MAX_MEDIA_BYTES (${config.maxMediaBytes} bytes)`
+        };
+      }
+      try {
+        const buffer = await downloadMediaMessage(
+          msg,
+          'buffer',
+          {},
+          { logger: this.logger, reuploadRequest: this.sock.updateMediaMessage }
+        );
+        if (buffer.length > config.maxMediaBytes) {
+          return {
+            success: false,
+            code: 413,
+            error: `Inbound media (${buffer.length} bytes) exceeds MAX_MEDIA_BYTES (${config.maxMediaBytes} bytes)`
+          };
+        }
+        return {
+          success: true,
+          buffer,
+          mimetype: parsed.mimetype || 'application/octet-stream',
+          ...(parsed.fileName ? { fileName: parsed.fileName } : {})
+        };
+      } catch (err: unknown) {
+        return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+      }
+    })();
+
+    this.pendingMediaDownloads.set(messageId, task);
     try {
-      const buffer = await downloadMediaMessage(
-        msg,
-        'buffer',
-        {},
-        { logger: this.logger, reuploadRequest: this.sock.updateMediaMessage }
-      );
-      return { success: true, buffer, mimetype: parsed.mimetype || 'application/octet-stream' };
-    } catch (err: unknown) {
-      return { success: false, code: 502, error: err instanceof Error ? err.message : String(err) };
+      return await task;
+    } finally {
+      this.pendingMediaDownloads.delete(messageId);
     }
   }
 
@@ -1974,6 +2379,7 @@ export class WhatsAppClient {
   public setForwardingEnabled(enabled: boolean): void {
     this.settings = { ...this.settings, forwardingEnabled: enabled };
     saveSettings(this.settings);
+    this.notifyStateChange();
   }
 
   public getState(): WhatsAppClientState {
@@ -1982,7 +2388,9 @@ export class WhatsAppClient {
       qrCodeDataUrl: this.qrCodeDataUrl,
       user: this.user,
       lastConnectedAt: this.lastConnectedAt,
+      lastConnectedIso: this.lastConnectedIso,
       lastError: this.lastError,
+      stateVersion: this.stateVersion,
       recentMessages: this.recentMessages.map((m) => ({ ...m })),
       stats: { ...this.stats },
       webhookConfig: {

@@ -7,14 +7,16 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "demo:hermes": "tsx examples/hermes_agent_demo.ts",
+    "prebuild": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc",
     "start": "node dist/index.js",
+    "test": "tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "baileys": "git+https://github.com/JonathanChuahE-Jay/Baileys.git",
+    "baileys": "git+https://github.com/JonathanChuahE-Jay/Baileys.git#d513958c15be84707be938decedb986fdda0b524",
     "dotenv": "^16.4.7",
-    "express": "^4.21.2",
+    "express": "^5.1.0",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4",
     "sharp": "^0.35.5"

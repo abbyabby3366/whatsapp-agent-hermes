@@ -7,7 +7,15 @@
  * the gateway's REST API. Replace the "REASONING LOGIC" section with your real Hermes agent.
  */
 
+import crypto from 'crypto';
 import express, { Request, Response } from 'express';
+
+const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest();
+
+function tokensMatch(expected: string, actual: string | string[] | undefined): boolean {
+  const candidate = Array.isArray(actual) ? actual[0] ?? '' : actual ?? '';
+  return Boolean(candidate) && crypto.timingSafeEqual(sha256(candidate), sha256(expected));
+}
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '5000', 10);
@@ -51,7 +59,7 @@ interface WebhookPayload {
 // Inbound webhook from WhatsApp Agent Hermes
 app.post('/api/webhook', async (req: Request, res: Response) => {
   const token = req.headers['x-hermes-token'];
-  if (SECRET_TOKEN && token !== SECRET_TOKEN) {
+  if (SECRET_TOKEN && !tokensMatch(SECRET_TOKEN, token)) {
     console.warn('⚠️  Unauthorized webhook call. Bad x-hermes-token.');
     res.status(401).json({ error: 'Unauthorized' });
     return;

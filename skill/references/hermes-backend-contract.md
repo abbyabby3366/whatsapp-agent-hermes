@@ -204,8 +204,9 @@ A contact can reach you as a phone number, a WhatsApp `@username`, or an opaque 
 | HTTP | Meaning | What to do |
 | --- | --- | --- |
 | `400` | Bad recipient or PIN format (PIN must be exactly 4 digits; JSON numbers like `412` are read as `"0412"`) | Fix the input; do not retry as-is |
-| `403` | `@username` needs a 4-digit PIN, or the PIN was wrong | Ask the owner for the PIN, retry once |
+| `403` | `@username` needs a 4-digit PIN, the PIN was wrong, or a local media path is outside `ALLOWED_MEDIA_DIR` | Ask owner for PIN or use a URL / data URI / file inside `ALLOWED_MEDIA_DIR` (`./data/media`) |
 | `404` | `@username` not found, or phone number not on WhatsApp | Report it; do not retry |
+| `413` | Media exceeds `MAX_MEDIA_BYTES` (25 MiB) or request body limit | Compress/resize or stay within limit; do not retry as-is |
 | `429` | WhatsApp rate-limited username lookups | Back off before retrying |
 | `502` | WhatsApp rejected the message (Error `463` cold-outreach restriction, Error `479` stanza rejected) | Ledger as failed, alert the owner, never auto-retry |
 | `503` | Gateway not connected, or WhatsApp timed out | Retry later |

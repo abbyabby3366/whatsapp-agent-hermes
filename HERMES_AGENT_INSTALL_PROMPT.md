@@ -34,8 +34,8 @@ fi
 
 ### Step 3: Install & build the gateway
 ```bash
-npm install
-npx tsc --noEmit        # must exit 0
+npm ci
+npm run typecheck       # must exit 0
 npm run build           # compiles dist/ for production systemd execution
 ```
 
@@ -138,10 +138,11 @@ Implement the receiver modules in `~/whatsapp-hermes-receiver/` (`receiver.py`, 
      "messageType": "text" | "image" | "video" | "voice" | "audio" | "document" | "sticker" | "location" | "contact" | "other",
      "hasMedia": false,
      "mimetype": null,
+     "fileName": null,
      "mentionsMe": false,
      "isReplyToMe": false,
      "quoted": null | { "messageId": "...", "message": "..." },
-     "timestamp": "08-10-2026 20:15:30",
+     "timestamp": "08-10-26 20:15:30",
      "timezone": "Asia/Kuala_Lumpur",
      "isoTimestamp": "2026-10-08T12:15:30.000Z",
      "rawTimestamp": 1791461730

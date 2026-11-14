@@ -13,15 +13,30 @@
     tabText: $('tabText'), tabImage: $('tabImage'), tabDoc: $('tabDoc'), tabSticker: $('tabSticker'),
     panelText: $('panelText'), panelImage: $('panelImage'), panelDoc: $('panelDoc'), panelSticker: $('panelSticker'),
     messageInput: $('messageInput'), messageError: $('messageError'), charCount: $('charCount'),
-    imageUrlInput: $('imageUrlInput'), imageUrlError: $('imageUrlError'), imageFileInput: $('imageFileInput'), imagePickBtn: $('imagePickBtn'), imageCaptionInput: $('imageCaptionInput'),
-    docUrlInput: $('docUrlInput'), docUrlError: $('docUrlError'), docFileInput: $('docFileInput'), docPickBtn: $('docPickBtn'), docFileNameInput: $('docFileNameInput'), docCaptionInput: $('docCaptionInput'),
-    stickerUrlInput: $('stickerUrlInput'), stickerUrlError: $('stickerUrlError'), stickerFileInput: $('stickerFileInput'), stickerPickBtn: $('stickerPickBtn'), stickerPackInput: $('stickerPackInput'), stickerAuthorInput: $('stickerAuthorInput'),
+    imageUrlInput: $('imageUrlInput'), imageUrlError: $('imageUrlError'), imageFileInput: $('imageFileInput'), imagePickBtn: $('imagePickBtn'), imageFileBadge: $('imageFileBadge'), imageCaptionInput: $('imageCaptionInput'),
+    docUrlInput: $('docUrlInput'), docUrlError: $('docUrlError'), docFileInput: $('docFileInput'), docPickBtn: $('docPickBtn'), docFileBadge: $('docFileBadge'), docFileNameInput: $('docFileNameInput'), docCaptionInput: $('docCaptionInput'),
+    stickerUrlInput: $('stickerUrlInput'), stickerUrlError: $('stickerUrlError'), stickerFileInput: $('stickerFileInput'), stickerPickBtn: $('stickerPickBtn'), stickerFileBadge: $('stickerFileBadge'), stickerPackInput: $('stickerPackInput'), stickerAuthorInput: $('stickerAuthorInput'),
+    activityNote: $('activityNote'), activitySearchInput: $('activitySearchInput'), activityFilterSelect: $('activityFilterSelect'),
     activityList: $('activityList'), toasts: $('toasts'),
     logoutDialog: $('logoutDialog'), logoutForm: $('logoutForm'), logoutConfirm: $('logoutConfirm'),
     authDialog: $('authDialog'), authForm: $('authForm'), authInput: $('authInput'), authError: $('authError')
   };
 
-  const POLL_MS = 3000;
+  const MAX_CLIENT_MEDIA_BYTES = 25 * 1024 * 1024;
+  const TIME_FMT = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kuala_Lumpur',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23'
+  });
+  const DATE_FMT = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kuala_Lumpur',
+    day: '2-digit',
+    month: '2-digit',
+    year: '2-digit'
+  });
+
   let apiKey = '';
   try { apiKey = sessionStorage.getItem('gatewayApiKey') || ''; } catch (_) { /* storage unavailable */ }
   let lastState = null;
@@ -31,6 +46,12 @@
   let authPending = false;
   let switchBusy = false;
   let currentSendMode = 'text';
+  const selectedFiles = { image: null, doc: null, sticker: null };
+  let replyContext = null;
+  let streamAbort = null;
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let streamActive = false;
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -94,6 +115,158 @@
     el.authInput.focus();
   }
 
+  function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function formatWhenHtml(m) {
+    if (m.isoTimestamp) {
+      const d = new Date(m.isoTimestamp);
+      if (!Number.isNaN(d.getTime())) {
+        const timeStr = TIME_FMT.format(d);
+        const dateStr = DATE_FMT.format(d).replace(/\//g, '-');
+        return '<span class="when-time">' + escapeHtml(timeStr) + '</span><span class="when-date">' + escapeHtml(dateStr) + '</span>';
+      }
+    }
+    const raw = String(m.timestamp || '');
+    const parts = raw.split(' ');
+    if (parts.length >= 2) {
+      return '<span class="when-time">' + escapeHtml(parts.slice(1).join(' ')) + '</span><span class="when-date">' + escapeHtml(parts[0]) + '</span>';
+    }
+    return '<span class="when-time">' + escapeHtml(raw) + '</span>';
+  }
+
+  function disconnectEventStream() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (streamAbort) {
+      streamAbort.abort();
+      streamAbort = null;
+    }
+    streamActive = false;
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer || authPending || document.hidden) return;
+    const delay = Math.min(15000, 1000 * Math.pow(2, reconnectAttempt)) + Math.floor(Math.random() * 400);
+    reconnectAttempt = Math.min(reconnectAttempt + 1, 6);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void connectEventStream(false);
+    }, delay);
+  }
+
+  function parseSseFrame(frameText) {
+    const lines = frameText.split('\n');
+    let eventName = 'message';
+    const dataLines = [];
+    for (const line of lines) {
+      if (!line || line.startsWith(':')) continue;
+      if (line.startsWith('event:')) {
+        eventName = line.slice(6).trim();
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    if (eventName === 'status' && dataLines.length > 0) {
+      try {
+        const parsed = JSON.parse(dataLines.join('\n'));
+        lastState = parsed;
+        render(parsed);
+      } catch (_) {
+        // Ignore malformed SSE payload frame.
+      }
+    }
+  }
+
+  async function connectEventStream(resetBackoff) {
+    disconnectEventStream();
+    if (resetBackoff) reconnectAttempt = 0;
+
+    const controller = new AbortController();
+    streamAbort = controller;
+
+    try {
+      const headers = { Accept: 'text/event-stream' };
+      if (apiKey) headers['x-api-key'] = apiKey;
+
+      const res = await fetch('/api/events', {
+        method: 'GET',
+        headers: headers,
+        signal: controller.signal,
+        cache: 'no-store'
+      });
+
+      if (res.status === 401) {
+        let data = null;
+        try { data = await res.json(); } catch (_) { data = null; }
+        if (offline) { offline = false; el.offlineBanner.hidden = true; }
+        el.activityNote.textContent = 'Access key required';
+        if (data && data.authRequired) {
+          requestApiKey();
+        } else {
+          requestApiKey();
+        }
+        return;
+      }
+
+      if (res.status === 429) {
+        streamActive = false;
+        if (offline) { offline = false; el.offlineBanner.hidden = true; }
+        el.activityNote.textContent = 'Rate limited — retrying…';
+        toast('Too many authentication attempts. Retrying shortly…', true);
+        scheduleReconnect();
+        return;
+      }
+
+      if (!res.ok || !res.body) {
+        throw new Error('HTTP ' + res.status);
+      }
+
+      streamActive = true;
+      reconnectAttempt = 0;
+      if (offline) { offline = false; el.offlineBanner.hidden = true; }
+      el.activityNote.textContent = 'Live updates';
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, '\n');
+        let sepIndex = buffer.indexOf('\n\n');
+        while (sepIndex !== -1) {
+          const frame = buffer.slice(0, sepIndex);
+          buffer = buffer.slice(sepIndex + 2);
+          parseSseFrame(frame);
+          sepIndex = buffer.indexOf('\n\n');
+        }
+      }
+
+      streamActive = false;
+      if (!controller.signal.aborted) {
+        el.activityNote.textContent = 'Reconnecting…';
+        scheduleReconnect();
+      }
+    } catch (err) {
+      streamActive = false;
+      if (controller.signal.aborted) return;
+      if (!offline) {
+        offline = true;
+        el.offlineBanner.hidden = false;
+        setPill('pill-error', 'Server unreachable');
+      }
+      el.activityNote.textContent = 'Reconnecting…';
+      scheduleReconnect();
+    }
+  }
+
   el.authForm.addEventListener('submit', (e) => {
     e.preventDefault();
     const key = el.authInput.value.trim();
@@ -103,12 +276,12 @@
     el.authInput.value = '';
     el.authDialog.close();
     authPending = false;
-    fetchStatus();
+    void connectEventStream(true);
   });
   el.authDialog.addEventListener('cancel', (e) => e.preventDefault()); // key is required to proceed
 
   // ---------------------------------------------------------------------------
-  // Status polling
+  // Status updates (SSE + on-demand fallback after explicit actions)
   // ---------------------------------------------------------------------------
 
   async function fetchStatus() {
@@ -157,7 +330,7 @@
     el.sendDisabledNote.hidden = connected;
 
     // Avoid re-rendering identical content so the QR image and focus do not flicker.
-    const key = [state.status, state.qrCodeDataUrl ? state.qrCodeDataUrl.length : 0, state.lastError, state.user && state.user.id, state.lastConnectedAt].join('|');
+    const key = [state.status, state.qrCodeDataUrl ? state.qrCodeDataUrl.length : 0, state.lastError, state.user && state.user.id, state.lastConnectedIso || state.lastConnectedAt].join('|');
     if (key === lastRenderedKey) return;
     lastRenderedKey = key;
 
@@ -168,11 +341,20 @@
       setPill('pill-ok', 'Connected');
       const id = (state.user && state.user.id) || '';
       const phone = id.split('@')[0].split(':')[0];
+      let connectedSinceHtml = '';
+      const iso = state.lastConnectedIso ? new Date(state.lastConnectedIso) : null;
+      if (iso && !Number.isNaN(iso.getTime())) {
+        const cTime = TIME_FMT.format(iso);
+        const cDate = DATE_FMT.format(iso).replace(/\//g, '-');
+        connectedSinceHtml = '<div class="small">Connected since ' + escapeHtml(cTime) + ' <span class="when-date">' + escapeHtml(cDate) + '</span></div>';
+      } else if (state.lastConnectedAt) {
+        connectedSinceHtml = '<div class="muted small">Connected since ' + escapeHtml(state.lastConnectedAt) + '</div>';
+      }
       el.connBody.innerHTML =
         '<div class="conn-icon ok" aria-hidden="true">&#10003;</div>' +
         '<div class="conn-ok"><div class="conn-account">' + escapeHtml((state.user && state.user.name) || 'WhatsApp linked') + '</div>' +
         '<div class="muted">+' + escapeHtml(phone) + '</div>' +
-        (state.lastConnectedAt ? '<div class="muted small">Connected since ' + escapeHtml(state.lastConnectedAt) + '</div>' : '') +
+        connectedSinceHtml +
         '</div>';
       el.logoutBtn.hidden = false;
     } else if (state.status === 'qr_ready' && state.qrCodeDataUrl) {
@@ -232,13 +414,45 @@
     filtered: ['tag', 'Filtered', 'Blocked by ALLOWED_NUMBERS / FORWARD_GROUPS']
   };
 
+  function matchesActivityFilter(m, query, statusFilter) {
+    if (statusFilter === 'inbound' && m.fromMe) return false;
+    if (statusFilter === 'outbound' && !m.fromMe) return false;
+    if (statusFilter === 'replied' && (m.fromMe || m.webhookStatus !== 'replied')) return false;
+    if (statusFilter === 'processing' && (m.fromMe || m.webhookStatus !== 'processing')) return false;
+    if (statusFilter === 'failed') {
+      const isFailed = m.fromMe ? Boolean(m.deliveryError) : m.webhookStatus === 'failed';
+      if (!isFailed) return false;
+    }
+    if (statusFilter === 'filtered' && (m.fromMe || (m.webhookStatus !== 'filtered' && m.webhookStatus !== 'paused'))) {
+      return false;
+    }
+
+    if (!query) return true;
+    const haystack = [
+      m.sender, m.senderName, m.senderUsername, m.recipient, m.chatJid,
+      m.content, m.hermesReply, m.webhookError, m.deliveryError, m.messageType
+    ]
+      .filter(Boolean)
+      .join('\n')
+      .toLowerCase();
+    return haystack.includes(query);
+  }
+
   function renderActivity(messages) {
     if (!messages.length) {
       const empty = '<li class="empty">No messages yet. New WhatsApp messages and your replies will show up here.</li>';
       if (lastActivityHtml !== empty) { el.activityList.innerHTML = empty; lastActivityHtml = empty; }
       return;
     }
-    const html = messages.map((m) => {
+    const query = el.activitySearchInput.value.trim().toLowerCase();
+    const statusFilter = el.activityFilterSelect.value;
+    const visible = messages.filter((m) => matchesActivityFilter(m, query, statusFilter));
+    if (!visible.length) {
+      const noMatch = '<li class="empty">No messages match the current search or filter.</li>';
+      if (lastActivityHtml !== noMatch) { el.activityList.innerHTML = noMatch; lastActivityHtml = noMatch; }
+      return;
+    }
+    const html = visible.map((m) => {
       let who, tag;
       if (m.fromMe) {
         who = '<span>To ' + escapeHtml(m.recipient) + '</span><span class="sub">from ' + escapeHtml(m.sender) + '</span>';
@@ -262,16 +476,99 @@
         : (m.webhookError || m.deliveryError
           ? '<span class="tag-error">' + escapeHtml(m.webhookError || m.deliveryError) + '</span>'
           : '');
+      let actions = '';
+      if (!m.fromMe) {
+        const replyTarget = m.chatJid || (m.senderUsername ? '@' + m.senderUsername : m.sender);
+        const replyLabel = m.senderName || (m.senderUsername ? '@' + m.senderUsername : m.sender);
+        actions = '<span class="activity-actions">' +
+          '<button type="button" class="btn-inline" data-action="reply" data-id="' + escapeHtml(m.id) + '" data-target="' + escapeHtml(replyTarget) + '" data-label="' + escapeHtml(replyLabel) + '">Reply</button>' +
+          (m.hasMedia ? '<button type="button" class="btn-inline" data-action="download" data-id="' + escapeHtml(m.id) + '">Download</button>' : '') +
+          '</span>';
+      }
       return '<li>' +
         '<div class="who">' + who + '</div>' +
-        '<div class="when">' + escapeHtml(m.timestamp) + '</div>' +
+        '<div class="when">' + formatWhenHtml(m) + '</div>' +
         '<div class="body">' + escapeHtml(m.content) + '</div>' +
-        '<div class="meta">' + tag + extra + '</div>' +
+        '<div class="meta">' + tag + extra + actions + '</div>' +
         '</li>';
     }).join('');
-    // Only touch the DOM when something changed, so text selection survives the 3 s poll.
+    // Only touch the DOM when visible items actually changed, preserving text selection.
     if (html !== lastActivityHtml) { el.activityList.innerHTML = html; lastActivityHtml = html; }
   }
+
+  el.activitySearchInput.addEventListener('input', () => {
+    renderActivity((lastState && lastState.recentMessages) || []);
+  });
+  el.activityFilterSelect.addEventListener('change', () => {
+    renderActivity((lastState && lastState.recentMessages) || []);
+  });
+
+  async function downloadMediaFile(messageId, btn) {
+    btn.disabled = true;
+    const origLabel = btn.textContent;
+    btn.textContent = 'Downloading…';
+    try {
+      const headers = {};
+      if (apiKey) headers['x-api-key'] = apiKey;
+      const res = await fetch('/api/media/' + encodeURIComponent(messageId), { headers: headers });
+      if (res.status === 401) {
+        requestApiKey();
+        return;
+      }
+      if (!res.ok) {
+        let msg = 'HTTP ' + res.status;
+        try {
+          const errData = await res.json();
+          if (errData && errData.error) msg = errData.error;
+        } catch (_) { /* ignore non-json error */ }
+        toast('Download failed: ' + msg, true);
+        return;
+      }
+      const blob = await res.blob();
+      const disp = res.headers.get('Content-Disposition') || '';
+      const utf8Match = disp.match(/filename\*=UTF-8''([^;]+)/i);
+      const asciiMatch = disp.match(/filename="([^"]+)"/i);
+      const filename = utf8Match
+        ? decodeURIComponent(utf8Match[1])
+        : (asciiMatch ? asciiMatch[1] : ('media-' + messageId));
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (err) {
+      toast('Download failed: ' + err.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origLabel;
+    }
+  }
+
+  el.activityList.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'reply') {
+      const target = btn.dataset.target || '';
+      const label = btn.dataset.label || target;
+      el.recipientInput.value = target;
+      replyContext = { recipient: target, messageId: btn.dataset.id || undefined };
+      setFieldError(el.recipientInput, el.recipientError, '');
+      el.sendForm.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      if (currentSendMode === 'text' && !el.messageInput.disabled) {
+        el.messageInput.focus();
+      } else if (!el.recipientInput.disabled) {
+        el.recipientInput.focus();
+      }
+      toast('Replying to ' + label);
+    } else if (action === 'download') {
+      const id = btn.dataset.id;
+      if (id) void downloadMediaFile(id, btn);
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Actions
@@ -372,26 +669,66 @@
   }
   for (const [key, item] of Object.entries(MODES)) item.tab.addEventListener('click', () => setSendMode(key));
 
-  function bindFilePicker(btn, fileInput, textInput, errNode, onSelected) {
+  function renderFileBadge(mode, badgeNode, fileInput, urlInput) {
+    const file = selectedFiles[mode];
+    if (!file) {
+      badgeNode.hidden = true;
+      badgeNode.innerHTML = '';
+      return;
+    }
+    badgeNode.innerHTML =
+      '<span class="file-badge-info">' + escapeHtml(file.name) + ' (' + escapeHtml(formatBytes(file.size)) + ')</span>' +
+      '<button type="button" class="file-badge-remove">Remove</button>';
+    badgeNode.hidden = false;
+    badgeNode.querySelector('.file-badge-remove').addEventListener('click', () => {
+      selectedFiles[mode] = null;
+      fileInput.value = '';
+      renderFileBadge(mode, badgeNode, fileInput, urlInput);
+    });
+  }
+
+  function bindFilePicker(mode, btn, fileInput, textInput, badgeNode, errNode, onSelected) {
     btn.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', () => {
       const file = fileInput.files && fileInput.files[0];
       if (!file) return;
+      if (file.size === 0) {
+        selectedFiles[mode] = null;
+        fileInput.value = '';
+        renderFileBadge(mode, badgeNode, fileInput, textInput);
+        setFieldError(textInput, errNode, 'Selected file is empty.');
+        return;
+      }
+      if (file.size > MAX_CLIENT_MEDIA_BYTES) {
+        selectedFiles[mode] = null;
+        fileInput.value = '';
+        renderFileBadge(mode, badgeNode, fileInput, textInput);
+        setFieldError(textInput, errNode, 'File (' + formatBytes(file.size) + ') exceeds the 25 MB limit.');
+        return;
+      }
       if (onSelected) onSelected(file);
       const reader = new FileReader();
       reader.onload = () => {
-        textInput.value = reader.result;
+        selectedFiles[mode] = { name: file.name, size: file.size, dataUrl: reader.result };
+        textInput.value = '';
         setFieldError(textInput, errNode, '');
+        renderFileBadge(mode, badgeNode, fileInput, textInput);
+      };
+      reader.onerror = () => {
+        selectedFiles[mode] = null;
+        fileInput.value = '';
+        renderFileBadge(mode, badgeNode, fileInput, textInput);
+        setFieldError(textInput, errNode, 'Could not read the selected file.');
       };
       reader.readAsDataURL(file);
     });
   }
 
-  bindFilePicker(el.imagePickBtn, el.imageFileInput, el.imageUrlInput, el.imageUrlError);
-  bindFilePicker(el.docPickBtn, el.docFileInput, el.docUrlInput, el.docUrlError, (file) => {
+  bindFilePicker('image', el.imagePickBtn, el.imageFileInput, el.imageUrlInput, el.imageFileBadge, el.imageUrlError);
+  bindFilePicker('doc', el.docPickBtn, el.docFileInput, el.docUrlInput, el.docFileBadge, el.docUrlError, (file) => {
     if (!el.docFileNameInput.value.trim()) el.docFileNameInput.value = file.name;
   });
-  bindFilePicker(el.stickerPickBtn, el.stickerFileInput, el.stickerUrlInput, el.stickerUrlError);
+  bindFilePicker('sticker', el.stickerPickBtn, el.stickerFileInput, el.stickerUrlInput, el.stickerFileBadge, el.stickerUrlError);
 
   function isValidRecipientInput(recipient) {
     if (/^[^@\s]+@(s\.whatsapp\.net|g\.us|lid)$/i.test(recipient)) return '';
@@ -438,6 +775,9 @@
       }
     }
 
+    const replyToId =
+      replyContext && replyContext.recipient === recipient ? replyContext.messageId : undefined;
+
     if (currentSendMode === 'text') {
       const message = el.messageInput.value.trim();
       if (!message) {
@@ -446,11 +786,13 @@
       } else {
         setFieldError(el.messageInput, el.messageError, '');
       }
-      return valid ? { endpoint: '/api/send', body: { to: recipient, message: message } } : null;
+      return valid
+        ? { endpoint: '/api/send', body: { to: recipient, message: message, ...(replyToId ? { replyToMessageId: replyToId } : {}) } }
+        : null;
     }
 
     if (currentSendMode === 'image') {
-      const url = el.imageUrlInput.value.trim();
+      const url = (selectedFiles.image && selectedFiles.image.dataUrl) || el.imageUrlInput.value.trim();
       if (!url) {
         setFieldError(el.imageUrlInput, el.imageUrlError, 'Enter an image URL or choose a file.');
         valid = false;
@@ -461,13 +803,13 @@
       return valid
         ? {
             endpoint: '/api/send-image',
-            body: { to: recipient, url: url, ...(caption ? { caption: caption } : {}) }
+            body: { to: recipient, url: url, ...(caption ? { caption: caption } : {}), ...(replyToId ? { replyToMessageId: replyToId } : {}) }
           }
         : null;
     }
 
     if (currentSendMode === 'doc') {
-      const url = el.docUrlInput.value.trim();
+      const url = (selectedFiles.doc && selectedFiles.doc.dataUrl) || el.docUrlInput.value.trim();
       if (!url) {
         setFieldError(el.docUrlInput, el.docUrlError, 'Enter a document URL or choose a file.');
         valid = false;
@@ -483,14 +825,15 @@
               to: recipient,
               url: url,
               ...(fileName ? { fileName: fileName } : {}),
-              ...(caption ? { caption: caption } : {})
+              ...(caption ? { caption: caption } : {}),
+              ...(replyToId ? { replyToMessageId: replyToId } : {})
             }
           }
         : null;
     }
 
     if (currentSendMode === 'sticker') {
-      const url = el.stickerUrlInput.value.trim();
+      const url = (selectedFiles.sticker && selectedFiles.sticker.dataUrl) || el.stickerUrlInput.value.trim();
       if (!url) {
         setFieldError(el.stickerUrlInput, el.stickerUrlError, 'Enter a sticker image URL or choose a file.');
         valid = false;
@@ -506,7 +849,8 @@
               to: recipient,
               url: url,
               ...(pack ? { pack: pack } : {}),
-              ...(author ? { author: author } : {})
+              ...(author ? { author: author } : {}),
+              ...(replyToId ? { replyToMessageId: replyToId } : {})
             }
           }
         : null;
@@ -521,17 +865,43 @@
     input.setAttribute('aria-invalid', text ? 'true' : 'false');
   }
 
-  el.recipientInput.addEventListener('input', () => setFieldError(el.recipientInput, el.recipientError, ''));
+  el.recipientInput.addEventListener('input', () => {
+    setFieldError(el.recipientInput, el.recipientError, '');
+    if (replyContext && el.recipientInput.value.trim() !== replyContext.recipient) {
+      replyContext = null;
+    }
+  });
   el.messageInput.addEventListener('input', () => {
     setFieldError(el.messageInput, el.messageError, '');
     el.charCount.textContent = String(el.messageInput.value.length);
   });
-  el.imageUrlInput.addEventListener('input', () => setFieldError(el.imageUrlInput, el.imageUrlError, ''));
-  el.docUrlInput.addEventListener('input', () => setFieldError(el.docUrlInput, el.docUrlError, ''));
-  el.stickerUrlInput.addEventListener('input', () => setFieldError(el.stickerUrlInput, el.stickerUrlError, ''));
+  el.imageUrlInput.addEventListener('input', () => {
+    setFieldError(el.imageUrlInput, el.imageUrlError, '');
+    if (selectedFiles.image) {
+      selectedFiles.image = null;
+      el.imageFileInput.value = '';
+      renderFileBadge('image', el.imageFileBadge, el.imageFileInput, el.imageUrlInput);
+    }
+  });
+  el.docUrlInput.addEventListener('input', () => {
+    setFieldError(el.docUrlInput, el.docUrlError, '');
+    if (selectedFiles.doc) {
+      selectedFiles.doc = null;
+      el.docFileInput.value = '';
+      renderFileBadge('doc', el.docFileBadge, el.docFileInput, el.docUrlInput);
+    }
+  });
+  el.stickerUrlInput.addEventListener('input', () => {
+    setFieldError(el.stickerUrlInput, el.stickerUrlError, '');
+    if (selectedFiles.sticker) {
+      selectedFiles.sticker = null;
+      el.stickerFileInput.value = '';
+      renderFileBadge('sticker', el.stickerFileBadge, el.stickerFileInput, el.stickerUrlInput);
+    }
+  });
 
   const onCtrlEnter = (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !el.sendBtn.disabled) {
+    if (!e.isComposing && (e.ctrlKey || e.metaKey) && e.key === 'Enter' && !el.sendBtn.disabled) {
       e.preventDefault();
       el.sendForm.requestSubmit();
     }
@@ -566,18 +936,25 @@
     try {
       const { data } = await api(payload.endpoint, { method: 'POST', body: payload.body });
       if (data.success) {
+        replyContext = null;
         showResult(el.sendResult, (currentSendMode === 'text' ? 'Message' : (currentSendMode === 'image' ? 'Image' : (currentSendMode === 'doc' ? 'Document' : 'Sticker'))) + ' sent.', true);
         if (currentSendMode === 'text') {
           el.messageInput.value = '';
           el.charCount.textContent = '0';
         } else if (currentSendMode === 'image') {
           el.imageUrlInput.value = el.imageCaptionInput.value = el.imageFileInput.value = '';
+          selectedFiles.image = null;
+          renderFileBadge('image', el.imageFileBadge, el.imageFileInput, el.imageUrlInput);
         } else if (currentSendMode === 'doc') {
           el.docUrlInput.value = el.docFileNameInput.value = el.docCaptionInput.value = el.docFileInput.value = '';
+          selectedFiles.doc = null;
+          renderFileBadge('doc', el.docFileBadge, el.docFileInput, el.docUrlInput);
         } else if (currentSendMode === 'sticker') {
           el.stickerUrlInput.value = el.stickerPackInput.value = el.stickerAuthorInput.value = el.stickerFileInput.value = '';
+          selectedFiles.sticker = null;
+          renderFileBadge('sticker', el.stickerFileBadge, el.stickerFileInput, el.stickerUrlInput);
         }
-        fetchStatus();
+        if (!streamActive) void fetchStatus();
       } else {
         showResult(el.sendResult, data.error || ('The ' + actionName + ' could not be sent.'), false);
       }
@@ -593,7 +970,11 @@
   // Boot
   // ---------------------------------------------------------------------------
 
-  fetchStatus();
-  setInterval(() => { if (!document.hidden) fetchStatus(); }, POLL_MS);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchStatus(); });
+  void connectEventStream(true);
+  window.addEventListener('pagehide', disconnectEventStream);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && !streamActive && !authPending) {
+      void connectEventStream(true);
+    }
+  });
 })();

@@ -1,6 +1,9 @@
-import fs from 'fs';
 import crypto from 'crypto';
 import sharp from 'sharp';
+import { resolveMediaInput } from './media.js';
+
+const MAX_STATIC_STICKER_BYTES = 100 * 1024;
+const MAX_ANIMATED_STICKER_BYTES = 500 * 1024;
 
 export interface StickerOptions {
   pack?: string;
@@ -46,7 +49,7 @@ export function buildStickerExif(options: {
  */
 export function injectWebpExif(webpBuf: Buffer, exifBody: Buffer): Buffer {
   if (
-    webpBuf.length < 12 ||
+    webpBuf.length < 20 ||
     webpBuf.subarray(0, 4).toString('ascii') !== 'RIFF' ||
     webpBuf.subarray(8, 12).toString('ascii') !== 'WEBP'
   ) {
@@ -57,6 +60,9 @@ export function injectWebpExif(webpBuf: Buffer, exifBody: Buffer): Buffer {
   let result: Buffer;
 
   if (fourCC === 'VP8X') {
+    if (webpBuf.length < 30) {
+      throw new Error('Malformed WebP buffer: truncated VP8X header');
+    }
     const modified = Buffer.from(webpBuf);
     // Set bit 3 (0x08) on flags byte to indicate EXIF is present
     modified[20] |= 0x08;
@@ -65,8 +71,14 @@ export function injectWebpExif(webpBuf: Buffer, exifBody: Buffer): Buffer {
     let offset = 30; // 12 (RIFF+WEBP) + 8 (VP8X chunk header) + 10 (VP8X payload)
     const chunks: Buffer[] = [modified.subarray(0, 30)];
     while (offset < modified.length) {
+      if (offset + 8 > modified.length) {
+        throw new Error(`Malformed WebP buffer: truncated chunk header at offset ${offset}`);
+      }
       const tag = modified.subarray(offset, offset + 4).toString('ascii');
       const size = modified.readUInt32LE(offset + 4);
+      if (offset + 8 + size > modified.length) {
+        throw new Error(`Malformed WebP buffer: chunk "${tag}" exceeds buffer length`);
+      }
       const totalChunkLen = 8 + size + (size % 2);
       if (tag !== 'EXIF') {
         chunks.push(modified.subarray(offset, Math.min(offset + totalChunkLen, modified.length)));
@@ -82,15 +94,43 @@ export function injectWebpExif(webpBuf: Buffer, exifBody: Buffer): Buffer {
     chunks.push(exifChunkHeader, exifBody, pad);
     result = Buffer.concat(chunks);
   } else {
-    // WebP without VP8X (simple VP8 or VP8L). Wrap it with an extended VP8X header.
+    // WebP without VP8X (simple VP8 or VP8L). Inspect frame dimensions and alpha, then wrap with VP8X.
+    const chunkSize = webpBuf.readUInt32LE(16);
+    if (20 + chunkSize > webpBuf.length) {
+      throw new Error(`Malformed WebP buffer: chunk "${fourCC}" exceeds buffer length`);
+    }
+
+    let widthMinus1 = 511;
+    let heightMinus1 = 511;
+    let hasAlpha = false;
+
+    if (fourCC === 'VP8L') {
+      if (webpBuf.length < 25 || webpBuf[20] !== 0x2f) {
+        throw new Error('Malformed WebP buffer: invalid VP8L bitstream header');
+      }
+      const bits = webpBuf.readUInt32LE(21);
+      widthMinus1 = bits & 0x3fff;
+      heightMinus1 = (bits >>> 14) & 0x3fff;
+      hasAlpha = Boolean((bits >>> 28) & 0x01);
+    } else if (fourCC === 'VP8 ') {
+      if (webpBuf.length < 30 || webpBuf[23] !== 0x9d || webpBuf[24] !== 0x01 || webpBuf[25] !== 0x2a) {
+        throw new Error('Malformed WebP buffer: invalid VP8 bitstream header');
+      }
+      widthMinus1 = Math.max(0, (webpBuf.readUInt16LE(26) & 0x3fff) - 1);
+      heightMinus1 = Math.max(0, (webpBuf.readUInt16LE(28) & 0x3fff) - 1);
+    } else {
+      throw new Error(`Unsupported WebP chunk format "${fourCC}"`);
+    }
+
     const vp8xHeader = Buffer.alloc(18);
     vp8xHeader.write('VP8X', 0, 4, 'ascii');
     vp8xHeader.writeUInt32LE(10, 4);
-    vp8xHeader[8] = 0x08; // Set EXIF flag
-    // Width - 1 (511 for 512x512)
-    vp8xHeader.writeUIntLE(511, 12, 3);
-    // Height - 1 (511 for 512x512)
-    vp8xHeader.writeUIntLE(511, 15, 3);
+    vp8xHeader[8] = 0x08 | (hasAlpha ? 0x10 : 0x00); // Preserve Alpha (0x10) alongside EXIF (0x08)
+    vp8xHeader.writeUIntLE(widthMinus1, 12, 3);
+    vp8xHeader.writeUIntLE(heightMinus1, 15, 3);
+
+    const payloadTail = webpBuf.subarray(12);
+    const payloadPad = payloadTail.length % 2 === 1 ? Buffer.from([0x00]) : Buffer.alloc(0);
 
     const exifChunkHeader = Buffer.alloc(8);
     exifChunkHeader.write('EXIF', 0, 4, 'ascii');
@@ -100,7 +140,8 @@ export function injectWebpExif(webpBuf: Buffer, exifBody: Buffer): Buffer {
     result = Buffer.concat([
       webpBuf.subarray(0, 12),
       vp8xHeader,
-      webpBuf.subarray(12),
+      payloadTail,
+      payloadPad,
       exifChunkHeader,
       exifBody,
       pad
@@ -113,58 +154,16 @@ export function injectWebpExif(webpBuf: Buffer, exifBody: Buffer): Buffer {
 }
 
 /**
- * Resolves any input (URL, data URI, base64, local file path, or Buffer) into raw image bytes.
+ * Resolves any input (URL, data URI, base64, allowlisted local file path, or Buffer) into raw image bytes.
  */
 export async function resolveImageBuffer(input: string | Buffer): Promise<Buffer> {
-  if (Buffer.isBuffer(input)) {
-    if (input.length === 0) {
-      throw new Error('Provided image Buffer is empty');
-    }
-    return input;
-  }
-
-  const str = input.trim();
-  if (!str) {
-    throw new Error('Image input string is empty');
-  }
-
-  // Remote HTTP / HTTPS URL
-  if (str.startsWith('http://') || str.startsWith('https://')) {
-    const res = await fetch(str);
-    if (!res.ok) {
-      throw new Error(`Failed to download sticker image from ${str} (HTTP ${res.status})`);
-    }
-    const arrayBuffer = await res.arrayBuffer();
-    return Buffer.from(arrayBuffer);
-  }
-
-  // Data URI (e.g. data:image/png;base64,...)
-  if (str.startsWith('data:')) {
-    const commaIndex = str.indexOf(',');
-    if (commaIndex === -1) {
-      throw new Error('Invalid data URI format: missing comma separator');
-    }
-    const base64Data = str.slice(commaIndex + 1);
-    return Buffer.from(base64Data, 'base64');
-  }
-
-  // Local file path
-  if (fs.existsSync(str)) {
-    return await fs.promises.readFile(str);
-  }
-
-  // Raw base64 string
-  if (/^[A-Za-z0-9+/=]+$/.test(str) && str.length > 30) {
-    return Buffer.from(str, 'base64');
-  }
-
-  throw new Error(
-    `Cannot resolve sticker image: "${str.slice(0, 60)}" is neither a reachable URL, existing file, data URI, nor valid base64`
-  );
+  const resolved = await resolveMediaInput(input, { allowRawBase64: true });
+  return resolved.buffer;
 }
 
 /**
- * Formats an image (PNG, JPG, WebP, GIF, etc.) into a 512x512 WebP WhatsApp sticker with Exif metadata.
+ * Formats an image (PNG, JPG, WebP, GIF, etc.) into a 512x512 WebP WhatsApp sticker with Exif metadata,
+ * stepping down quality if needed to stay within WhatsApp's sticker payload ceilings.
  */
 export async function prepareSticker(
   input: string | Buffer,
@@ -172,33 +171,54 @@ export async function prepareSticker(
 ): Promise<Buffer> {
   const rawBuffer = await resolveImageBuffer(input);
 
-  // Probe format and animation
-  let sharpInstance = sharp(rawBuffer, { animated: options.isAnimated ?? true });
-  const meta = await sharpInstance.metadata();
+  // Probe format and animation once, then clone for encoding passes
+  const baseSharp = sharp(rawBuffer, {
+    animated: options.isAnimated ?? true,
+    limitInputPixels: 64_000_000
+  });
+  const meta = await baseSharp.metadata();
 
   const isAnimated = Boolean(options.isAnimated || (meta.pages && meta.pages > 1));
-  const quality = options.quality ?? 80;
+  const initialQuality = options.quality ?? 80;
+  const maxBytes = isAnimated ? MAX_ANIMATED_STICKER_BYTES : MAX_STATIC_STICKER_BYTES;
 
-  // Resize to fit within 512x512 with transparent background
-  sharpInstance = sharp(rawBuffer, { animated: isAnimated })
-    .resize(512, 512, {
-      fit: 'contain',
-      background: { r: 0, g: 0, b: 0, alpha: 0 }
-    })
-    .webp({ quality, effort: 4 });
+  const exifBody =
+    options.pack || options.author || options.categories || options.id
+      ? buildStickerExif({
+          pack: options.pack,
+          author: options.author,
+          categories: options.categories,
+          id: options.id
+        })
+      : null;
 
-  let webpBuffer = await sharpInstance.toBuffer();
+  const qualities = [initialQuality, ...[60, 40, 25, 15].filter((q) => q < initialQuality)];
+  let lastSize = 0;
 
-  // Attach WhatsApp sticker metadata if specified
-  if (options.pack || options.author || options.categories || options.id) {
-    const exifBody = buildStickerExif({
-      pack: options.pack,
-      author: options.author,
-      categories: options.categories,
-      id: options.id
-    });
-    webpBuffer = Buffer.from(injectWebpExif(webpBuffer, exifBody));
+  for (let i = 0; i < qualities.length; i++) {
+    const quality = qualities[i];
+    const effort = i === 0 ? 4 : 6;
+
+    let webpBuffer = await baseSharp
+      .clone()
+      .resize(512, 512, {
+        fit: 'contain',
+        background: { r: 0, g: 0, b: 0, alpha: 0 }
+      })
+      .webp({ quality, effort })
+      .toBuffer();
+
+    if (exifBody) {
+      webpBuffer = Buffer.from(injectWebpExif(webpBuffer, exifBody));
+    }
+
+    lastSize = webpBuffer.length;
+    if (webpBuffer.length <= maxBytes) {
+      return webpBuffer;
+    }
   }
 
-  return webpBuffer;
+  throw new Error(
+    `Prepared ${isAnimated ? 'animated ' : ''}sticker (${lastSize} bytes) exceeds WhatsApp's ${Math.round(maxBytes / 1024)} KB limit even at minimum quality`
+  );
 }
