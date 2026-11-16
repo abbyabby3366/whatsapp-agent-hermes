@@ -1,7 +1,46 @@
 import { formatDateTimeParts } from '../formatting.js';
-import type { ReceiverConfig } from './config.js';
+import { normalizeDigits, type ReceiverConfig } from './config.js';
 import type { GatewayClient } from './gateway-client.js';
-import type { ChatMapStore, RuntimeStateStore, SessionStore } from './stores.js';
+import type { ChatMapStore, ContactLookupKeys, RuntimeStateStore, SessionStore } from './stores.js';
+
+function resolveAdminTarget(
+  rawTarget: string,
+  chatMap: ChatMapStore,
+  defaultCountryCode: string
+): { key: string; lookup: ContactLookupKeys } {
+  const resolved = chatMap.resolveKey(rawTarget);
+  if (resolved.chatKey) {
+    return {
+      key: resolved.chatKey,
+      lookup: {
+        chatKey: resolved.chatKey,
+        phone: resolved.record?.phone,
+        username: resolved.record?.username,
+        lid: resolved.record?.lid,
+        chatJids: resolved.record?.chatJids
+      }
+    };
+  }
+
+  const clean = rawTarget.trim();
+  const bare = clean.includes('@') && !clean.startsWith('@') ? clean.toLowerCase() : clean;
+  let key: string;
+  if (bare.endsWith('@g.us')) {
+    key = bare;
+  } else if (bare.endsWith('@s.whatsapp.net')) {
+    const userPart = bare.slice(0, bare.indexOf('@')).split(':')[0];
+    key = normalizeDigits(userPart, defaultCountryCode) || clean;
+  } else if (bare.endsWith('@lid')) {
+    key = bare.slice(0, bare.indexOf('@')).split(':')[0].replace(/[^0-9]/g, '') || bare;
+  } else if (clean.startsWith('@') || /[a-z]/i.test(clean)) {
+    const handle = clean.replace(/^@+/, '').split('#')[0].trim().toLowerCase();
+    key = handle ? `@${handle}` : clean;
+  } else {
+    key = normalizeDigits(clean, defaultCountryCode) || clean;
+  }
+
+  return { key, lookup: { chatKey: key } };
+}
 
 export function parseDurationMs(token: string | undefined): number | undefined {
   if (!token) return undefined;
@@ -77,8 +116,7 @@ export async function handleMasterAdminCommand(
   if (pauseMatch) {
     const rawTarget = pauseMatch[1];
     const durationToken = pauseMatch[2];
-    const resolved = deps.chatMap.resolveKey(rawTarget);
-    const key = resolved.chatKey ?? (rawTarget.startsWith('@') ? rawTarget.toLowerCase() : rawTarget.replace(/[^0-9]/g, '') || rawTarget);
+    const { key } = resolveAdminTarget(rawTarget, deps.chatMap, deps.cfg.defaultCountryCode);
     const durationMs = parseDurationMs(durationToken);
     if (durationToken && !durationMs) {
       return `Invalid duration "${durationToken}". Try e.g. \`pause ${rawTarget} 4h\`, \`30m\`, or \`1d\`.`;
@@ -94,9 +132,8 @@ export async function handleMasterAdminCommand(
   const resumeMatch = /^resume\s+(\S+)$/i.exec(trimmed);
   if (resumeMatch) {
     const rawTarget = resumeMatch[1];
-    const resolved = deps.chatMap.resolveKey(rawTarget);
-    const key = resolved.chatKey ?? (rawTarget.startsWith('@') ? rawTarget.toLowerCase() : rawTarget.replace(/[^0-9]/g, '') || rawTarget);
-    const removed = deps.runtimeState.resumeContact(key);
+    const { key, lookup } = resolveAdminTarget(rawTarget, deps.chatMap, deps.cfg.defaultCountryCode);
+    const removed = deps.runtimeState.resumeContact(lookup);
     return removed
       ? `Resumed auto-reply for *${key}*.`
       : `Contact *${key}* was not paused.`;

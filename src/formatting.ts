@@ -1,4 +1,20 @@
+import os from 'os';
+import path from 'path';
+
 export const isPlaceholderSecret = (value: string): boolean => /^change-me(-|$)/i.test(value.trim());
+
+/**
+ * Expands a leading `~` or `~/` (or `~\`) to `homeDir`. Leaves all other paths unchanged.
+ */
+export function expandHomePath(rawPath: string, homeDir: string = os.homedir()): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) return '';
+  if (trimmed === '~') return homeDir;
+  if (trimmed.startsWith('~/') || trimmed.startsWith('~\\')) {
+    return path.join(homeDir, trimmed.slice(2));
+  }
+  return trimmed;
+}
 
 const dateTimeFormatters = new Map<string, Intl.DateTimeFormat>();
 

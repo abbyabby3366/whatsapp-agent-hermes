@@ -5,7 +5,7 @@ import path from 'path';
  * Atomically writes JSON to `filePath` by writing a unique sibling temp file first
  * and renaming it into place so partial writes never corrupt existing state files.
  */
-export async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
+export async function writeJsonAtomic(filePath: string, data: unknown, mode = 0o600): Promise<void> {
   const dir = path.dirname(filePath);
   await fs.promises.mkdir(dir, { recursive: true });
   const uniqueSuffix = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
@@ -13,7 +13,7 @@ export async function writeJsonAtomic(filePath: string, data: unknown): Promise<
   const serialized = JSON.stringify(data, null, 2);
 
   try {
-    await fs.promises.writeFile(tmpPath, serialized, 'utf8');
+    await fs.promises.writeFile(tmpPath, serialized, { encoding: 'utf8', mode });
     await fs.promises.rename(tmpPath, filePath);
   } catch (err) {
     try {

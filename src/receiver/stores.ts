@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { formatDateTimeParts } from '../formatting.js';
+import { DebouncedJsonWriter } from '../persistence.js';
 import { normalizeDigits } from './config.js';
 
 function writeJsonAtomicSync(filePath: string, data: unknown): void {
@@ -386,6 +387,7 @@ export interface HandledEntry {
 export class HandledLedger {
   private readonly filePath: string;
   private entries: Record<string, HandledEntry>;
+  private readonly writer: DebouncedJsonWriter<Record<string, HandledEntry>>;
 
   constructor(dataDir: string, private readonly maxEntries = 10_000) {
     this.filePath = path.join(dataDir, 'handled.json');
@@ -394,6 +396,9 @@ export class HandledLedger {
       () => ({}),
       (v): v is Record<string, HandledEntry> => isPlainObject(v)
     );
+    this.writer = new DebouncedJsonWriter<Record<string, HandledEntry>>(this.filePath, 250, (err) => {
+      console.error('[HandledLedger] Could not persist handled ledger:', err instanceof Error ? err.message : err);
+    });
   }
 
   public has(messageId: string): boolean {
@@ -408,7 +413,11 @@ export class HandledLedger {
         delete this.entries[oldKey];
       }
     }
-    writeJsonAtomicSync(this.filePath, this.entries);
+    this.writer.schedule(() => ({ ...this.entries }));
+  }
+
+  public async flush(): Promise<void> {
+    await this.writer.flush();
   }
 }
 
@@ -490,10 +499,45 @@ export class SessionStore {
 // 4. Runtime Toggle & Quota State Store (state.json)
 // ---------------------------------------------------------------------------
 
+export interface ContactLookupKeys {
+  chatKey: string;
+  phone?: string;
+  username?: string;
+  lid?: string;
+  chatJids?: string[];
+}
+
+function expandPauseCandidates(target: string | ContactLookupKeys): { primaryKey: string; candidates: string[] } {
+  if (typeof target === 'string') {
+    const clean = target.trim();
+    const list = clean ? [clean] : [];
+    if (clean.startsWith('@')) list.push(clean.toLowerCase());
+    return { primaryKey: clean, candidates: Array.from(new Set(list)) };
+  }
+  const primaryKey = target.chatKey;
+  const rawCandidates: string[] = [target.chatKey];
+  if (target.phone) rawCandidates.push(target.phone);
+  if (target.username) {
+    const handle = target.username.replace(/^@+/, '').toLowerCase();
+    if (handle) {
+      rawCandidates.push(`@${handle}`, handle);
+    }
+  }
+  if (target.lid) rawCandidates.push(target.lid);
+  for (const jid of target.chatJids ?? []) {
+    if (jid) rawCandidates.push(jid);
+  }
+  return {
+    primaryKey,
+    candidates: Array.from(new Set(rawCandidates.filter(Boolean)))
+  };
+}
+
 export interface PausedContactEntry {
   pausedAt: string;
   untilIso?: string;
   reason?: string;
+  aliases?: string[];
 }
 
 interface StateFileData {
@@ -567,19 +611,53 @@ export class RuntimeStateStore {
     }
   }
 
-  public isContactPaused(chatKey: string, nowMs = Date.now()): { paused: boolean; entry?: PausedContactEntry } {
+  public isContactPaused(
+    target: string | ContactLookupKeys,
+    nowMs = Date.now()
+  ): { paused: boolean; entry?: PausedContactEntry } {
     this.syncFromDisk();
-    const entry = this.state.pausedContacts[chatKey];
-    if (!entry) return { paused: false };
-    if (entry.untilIso) {
-      const untilMs = Date.parse(entry.untilIso);
-      if (Number.isFinite(untilMs) && untilMs <= nowMs) {
-        delete this.state.pausedContacts[chatKey];
+    const { primaryKey, candidates } = expandPauseCandidates(target);
+    const candidateSet = new Set(candidates);
+    let mutated = false;
+
+    const handleMatch = (matchedKey: string, entry: PausedContactEntry): { paused: boolean; entry?: PausedContactEntry } | null => {
+      if (entry.untilIso) {
+        const untilMs = Date.parse(entry.untilIso);
+        if (Number.isFinite(untilMs) && untilMs <= nowMs) {
+          delete this.state.pausedContacts[matchedKey];
+          mutated = true;
+          return null;
+        }
+      }
+      if (matchedKey !== primaryKey && primaryKey) {
+        const mergedAliases = Array.from(new Set([...(entry.aliases ?? []), matchedKey]));
+        const promoted: PausedContactEntry = { ...entry, aliases: mergedAliases };
+        this.state.pausedContacts[primaryKey] = promoted;
+        delete this.state.pausedContacts[matchedKey];
+        mutated = true;
         this.persist();
-        return { paused: false };
+        return { paused: true, entry: promoted };
+      }
+      if (mutated) this.persist();
+      return { paused: true, entry };
+    };
+
+    for (const candidate of candidates) {
+      const entry = this.state.pausedContacts[candidate];
+      if (!entry) continue;
+      const res = handleMatch(candidate, entry);
+      if (res) return res;
+    }
+
+    for (const [key, entry] of Object.entries(this.state.pausedContacts)) {
+      if (entry.aliases?.some((alias) => candidateSet.has(alias))) {
+        const res = handleMatch(key, entry);
+        if (res) return res;
       }
     }
-    return { paused: true, entry };
+
+    if (mutated) this.persist();
+    return { paused: false };
   }
 
   public pauseContact(chatKey: string, durationMs?: number, reason?: string): PausedContactEntry {
@@ -595,14 +673,27 @@ export class RuntimeStateStore {
     return entry;
   }
 
-  public resumeContact(chatKey: string): boolean {
+  public resumeContact(target: string | ContactLookupKeys): boolean {
     this.syncFromDisk();
-    if (!Object.prototype.hasOwnProperty.call(this.state.pausedContacts, chatKey)) {
-      return false;
+    const { candidates } = expandPauseCandidates(target);
+    const candidateSet = new Set(candidates);
+    let removed = false;
+    for (const candidate of candidates) {
+      if (Object.prototype.hasOwnProperty.call(this.state.pausedContacts, candidate)) {
+        delete this.state.pausedContacts[candidate];
+        removed = true;
+      }
     }
-    delete this.state.pausedContacts[chatKey];
-    this.persist();
-    return true;
+    for (const [key, entry] of Object.entries(this.state.pausedContacts)) {
+      if (entry.aliases?.some((alias) => candidateSet.has(alias))) {
+        delete this.state.pausedContacts[key];
+        removed = true;
+      }
+    }
+    if (removed) {
+      this.persist();
+    }
+    return removed;
   }
 
   public listPausedContacts(nowMs = Date.now()): Array<{ chatKey: string; entry: PausedContactEntry }> {
@@ -706,8 +797,12 @@ export class RuntimeStateStore {
     if (!oldKey || !newKey || oldKey === newKey) return;
     let changed = false;
     if (this.state.pausedContacts[oldKey]) {
+      const prev = this.state.pausedContacts[oldKey];
       if (!this.state.pausedContacts[newKey]) {
-        this.state.pausedContacts[newKey] = this.state.pausedContacts[oldKey];
+        this.state.pausedContacts[newKey] = {
+          ...prev,
+          aliases: Array.from(new Set([...(prev.aliases ?? []), oldKey]))
+        };
       }
       delete this.state.pausedContacts[oldKey];
       changed = true;
@@ -947,18 +1042,37 @@ export interface OutboxFlagRecord {
 
 export class OutboxStore {
   private readonly filePath: string;
-  private entries: Record<string, OutboxFlagRecord>;
+  private entries: Record<string, OutboxFlagRecord> = {};
+  private lastFingerprint: string | null = null;
 
   constructor(dataDir: string, private readonly maxEntries = 1000) {
     this.filePath = path.join(dataDir, 'outbox.json');
+    this.loadFromDisk();
+  }
+
+  private loadFromDisk(): void {
     this.entries = readJsonStrict<Record<string, OutboxFlagRecord>>(
       this.filePath,
       () => ({}),
       (v): v is Record<string, OutboxFlagRecord> => isPlainObject(v)
     );
+    this.lastFingerprint = getFileFingerprint(this.filePath);
+  }
+
+  private syncFromDisk(): void {
+    const current = getFileFingerprint(this.filePath);
+    if (current !== this.lastFingerprint) {
+      this.loadFromDisk();
+    }
+  }
+
+  private persist(): void {
+    writeJsonAtomicSync(this.filePath, this.entries);
+    this.lastFingerprint = getFileFingerprint(this.filePath);
   }
 
   public record(entry: OutboxFlagRecord): void {
+    this.syncFromDisk();
     this.entries[entry.messageId] = entry;
     const keys = Object.keys(this.entries);
     if (keys.length > this.maxEntries) {
@@ -966,10 +1080,26 @@ export class OutboxStore {
         delete this.entries[oldKey];
       }
     }
-    writeJsonAtomicSync(this.filePath, this.entries);
+    this.persist();
   }
 
   public get(messageId: string): OutboxFlagRecord | undefined {
+    this.syncFromDisk();
     return this.entries[messageId];
+  }
+
+  public migrateKey(oldKey: string, newKey: string): void {
+    this.syncFromDisk();
+    if (!oldKey || !newKey || oldKey === newKey) return;
+    let changed = false;
+    for (const entry of Object.values(this.entries)) {
+      if (entry.targetChatKey === oldKey) {
+        entry.targetChatKey = newKey;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.persist();
+    }
   }
 }

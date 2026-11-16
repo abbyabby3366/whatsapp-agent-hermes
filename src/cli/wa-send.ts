@@ -7,7 +7,7 @@ import { inferDocumentMimetype } from '../mime.js';
 import { buildReceiverConfig, loadReceiverEnv, type ReceiverConfig } from '../receiver/config.js';
 import { GatewayClient } from '../receiver/gateway-client.js';
 import { HistoryStore } from '../receiver/history.js';
-import { ChatMapStore, ContactsStore, FlowStore, RuntimeStateStore, SessionStore } from '../receiver/stores.js';
+import { ChatMapStore, ContactsStore, FlowStore, OutboxStore, RuntimeStateStore, SessionStore } from '../receiver/stores.js';
 
 interface ParsedFlags {
   positional: string[];
@@ -69,12 +69,14 @@ function persistOutboundDelivery(
       const flows = new FlowStore(cfg.dataDir, cfg.timezone);
       const contacts = new ContactsStore(cfg.dataDir);
       const runtimeState = new RuntimeStateStore(cfg.dataDir);
+      const outbox = new OutboxStore(cfg.dataDir);
       for (const oldKey of identity.previousKeys) {
         history.migrateChatKey(oldKey, identity.chatKey);
         sessions.migrateKey(oldKey, identity.chatKey);
         flows.migrateKey(oldKey, identity.chatKey);
         contacts.migrateKey(oldKey, identity.chatKey);
         runtimeState.migrateKey(oldKey, identity.chatKey);
+        outbox.migrateKey(oldKey, identity.chatKey);
       }
     }
 

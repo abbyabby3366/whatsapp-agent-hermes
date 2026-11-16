@@ -93,6 +93,18 @@ export class HistoryStore {
       );
       CREATE INDEX IF NOT EXISTS idx_messages_chat_key_id ON messages (chat_key, id);
       CREATE INDEX IF NOT EXISTS idx_messages_direction_raw_ts ON messages (direction, raw_timestamp);
+      CREATE TABLE IF NOT EXISTS pending_outbound (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_key TEXT NOT NULL,
+        chat_jid TEXT NOT NULL,
+        inbound_message_id TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        is_group INTEGER NOT NULL DEFAULT 0,
+        raw_timestamp INTEGER NOT NULL,
+        UNIQUE(inbound_message_id, chunk_index)
+      );
+      CREATE INDEX IF NOT EXISTS idx_pending_outbound_raw_ts ON pending_outbound (raw_timestamp, id);
     `);
   }
 
@@ -192,9 +204,80 @@ export class HistoryStore {
     return rows.filter((r) => !isHandled(r.messageId));
   }
 
+  public queuePendingOutbound(
+    items: Array<{
+      chatKey: string;
+      chatJid: string;
+      inboundMessageId: string;
+      chunkIndex: number;
+      body: string;
+      isGroup: boolean;
+      rawTimestamp: number;
+    }>
+  ): void {
+    if (items.length === 0) return;
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO pending_outbound (
+        chat_key, chat_jid, inbound_message_id, chunk_index, body, is_group, raw_timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.db.exec('BEGIN');
+    try {
+      for (const item of items) {
+        stmt.run(
+          item.chatKey,
+          item.chatJid,
+          item.inboundMessageId,
+          item.chunkIndex,
+          item.body,
+          item.isGroup ? 1 : 0,
+          Math.trunc(item.rawTimestamp)
+        );
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  public listPendingOutbound(cutoffRawTimestamp: number): Array<{
+    id: number;
+    chatKey: string;
+    chatJid: string;
+    inboundMessageId: string;
+    chunkIndex: number;
+    body: string;
+    isGroup: boolean;
+  }> {
+    const rows = this.db
+      .prepare(`
+        SELECT id, chat_key, chat_jid, inbound_message_id, chunk_index, body, is_group
+        FROM pending_outbound
+        WHERE raw_timestamp >= ?
+        ORDER BY id ASC
+      `)
+      .all(Math.floor(cutoffRawTimestamp));
+
+    return rows.map((row) => ({
+      id: Number(row.id),
+      chatKey: asString(row.chat_key),
+      chatJid: asString(row.chat_jid),
+      inboundMessageId: asString(row.inbound_message_id),
+      chunkIndex: Number(row.chunk_index),
+      body: asString(row.body),
+      isGroup: Number(row.is_group) === 1
+    }));
+  }
+
+  public deletePendingOutbound(id: number): void {
+    this.db.prepare(`DELETE FROM pending_outbound WHERE id = ?`).run(id);
+  }
+
   public migrateChatKey(oldKey: string, newKey: string): number {
     if (!oldKey || !newKey || oldKey === newKey) return 0;
     const res = this.db.prepare(`UPDATE messages SET chat_key = ? WHERE chat_key = ?`).run(newKey, oldKey);
+    this.db.prepare(`UPDATE pending_outbound SET chat_key = ? WHERE chat_key = ?`).run(newKey, oldKey);
     return Number(res.changes);
   }
 

@@ -308,12 +308,15 @@ export class WhatsAppClient {
   private sessionDir: string;
   private dataDir: string;
   private usernamesFile: string;
+  private lidPhonesFile: string;
   private activityFile: string;
   private usernamesWriter: DebouncedJsonWriter<Record<string, UsernameDirectoryEntry>>;
+  private lidPhonesWriter: DebouncedJsonWriter<Record<string, string>>;
   private activityWriter: DebouncedJsonWriter<PersistedActivity>;
   private usernameDirectory = new Map<string, UsernameDirectoryEntry>();
   private jidToUsername = new Map<string, string>();
   private phoneToUsername = new Map<string, string>();
+  private lidToPhone = new Map<string, string>();
   /** Cached verified phone JIDs (`...@s.whatsapp.net`) -> expiry epoch ms. */
   private verifiedPhoneJids = new Map<string, { jid: string; expiresAt: number }>();
   /** LID JIDs whose reverse @username lookup returned nothing recently (jid -> epoch ms). */
@@ -342,6 +345,8 @@ export class WhatsAppClient {
   private notifyQueued = false;
   private recentMessages: RecentMessage[] = [];
   private processedMessageIds = new Set<string>();
+  /** Outbound message IDs dispatched by this gateway so Baileys echo events are ignored. */
+  private gatewayOutboundIds = new Set<string>();
   /** Raw messages kept so replies can quote them and media can be downloaded on request. */
   private rawMessages = new Map<string, WAMessage>();
   private settings: RuntimeSettings = loadSettings();
@@ -368,14 +373,19 @@ export class WhatsAppClient {
       fs.mkdirSync(this.sessionDir, { recursive: true });
     }
     this.usernamesFile = path.resolve(this.dataDir, 'usernames.json');
+    this.lidPhonesFile = path.resolve(this.dataDir, 'lid_phones.json');
     this.activityFile = path.resolve(this.dataDir, 'activity.json');
     this.usernamesWriter = new DebouncedJsonWriter(this.usernamesFile, 400, (err) => {
       console.error('[WhatsApp] Could not persist usernames directory:', err instanceof Error ? err.message : err);
+    });
+    this.lidPhonesWriter = new DebouncedJsonWriter(this.lidPhonesFile, 400, (err) => {
+      console.error('[WhatsApp] Could not persist LID-phone directory:', err instanceof Error ? err.message : err);
     });
     this.activityWriter = new DebouncedJsonWriter(this.activityFile, 500, (err) => {
       console.error('[WhatsApp] Could not persist activity state:', err instanceof Error ? err.message : err);
     });
     this.loadUsernameDirectory();
+    this.loadLidPhoneDirectory();
     this.loadActivityState();
   }
 
@@ -470,10 +480,97 @@ export class WhatsAppClient {
     this.jidToUsername.set(entry.jid, entry.username);
     if (entry.phoneNumber) {
       this.phoneToUsername.set(entry.phoneNumber, entry.username);
+      if (isLidUser(entry.jid)) {
+        this.recordLidPhoneMapping(entry.jid, entry.phoneNumber, false);
+      }
     } else if (isPnUser(entry.jid)) {
       const digits = digitsOfJid(entry.jid);
       if (digits) this.phoneToUsername.set(digits, entry.username);
     }
+  }
+
+  private loadLidPhoneDirectory(): void {
+    if (!fs.existsSync(this.lidPhonesFile)) return;
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.lidPhonesFile, 'utf8')) as Record<string, string>;
+      if (!raw || typeof raw !== 'object') return;
+      for (const [lid, phone] of Object.entries(raw)) {
+        if (typeof lid === 'string' && typeof phone === 'string') {
+          this.recordLidPhoneMapping(lid, phone, false);
+        }
+      }
+    } catch (err: unknown) {
+      console.warn('[WhatsApp] Could not read LID-phone directory:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private saveLidPhoneDirectory(): void {
+    this.lidPhonesWriter.schedule(() => {
+      const serialized: Record<string, string> = {};
+      for (const [lid, phone] of this.lidToPhone.entries()) {
+        serialized[lid] = phone;
+      }
+      return serialized;
+    });
+  }
+
+  private recordLidPhoneMapping(
+    rawLidJid: string | null | undefined,
+    rawPhone: string | null | undefined,
+    persist = true
+  ): boolean {
+    if (!rawLidJid || !rawPhone) return false;
+    const lidJid = jidNormalizedUser(rawLidJid);
+    if (!lidJid || !isLidUser(lidJid)) return false;
+    const digits = digitsOfJid(rawPhone);
+    if (digits.length < 7 || digits.length > 15 || digits === digitsOfJid(lidJid)) {
+      return false;
+    }
+    if (this.lidToPhone.get(lidJid) === digits) return false;
+    this.lidToPhone.set(lidJid, digits);
+    if (persist) {
+      this.saveLidPhoneDirectory();
+    }
+    return true;
+  }
+
+  private async resolvePhoneForLid(lidJid: string, knownUsername?: string): Promise<string | null> {
+    const normLid = jidNormalizedUser(lidJid);
+    if (!normLid || !isLidUser(normLid)) return null;
+
+    const cached = this.lidToPhone.get(normLid);
+    if (cached) return cached;
+
+    if (knownUsername) {
+      const fromUser = this.usernameDirectory.get(knownUsername)?.phoneNumber;
+      if (fromUser) {
+        this.recordLidPhoneMapping(normLid, fromUser);
+        return fromUser;
+      }
+    }
+
+    const mappedUser = this.jidToUsername.get(normLid);
+    if (mappedUser) {
+      const fromUser = this.usernameDirectory.get(mappedUser)?.phoneNumber;
+      if (fromUser) {
+        this.recordLidPhoneMapping(normLid, fromUser);
+        return fromUser;
+      }
+    }
+
+    try {
+      const mappedPn = await this.sock?.signalRepository?.lidMapping?.getPNForLID(normLid);
+      if (mappedPn) {
+        const digits = digitsOfJid(mappedPn);
+        if (digits.length >= 7 && digits.length <= 15 && digits !== digitsOfJid(normLid)) {
+          this.recordLidPhoneMapping(normLid, digits);
+          return digits;
+        }
+      }
+    } catch {
+      // Best-effort lookup from Baileys local signal LID store
+    }
+    return null;
   }
 
   private unindexUsernameEntry(username: string, entry: UsernameDirectoryEntry): void {
@@ -622,6 +719,7 @@ export class WhatsAppClient {
    */
   private ingestMessageUsernames(messages: WAMessage[], opts: { historical?: boolean } = {}): void {
     let changed = false;
+    let lidPhoneChanged = false;
     const learn = (username: string, jid: string, pn: string | undefined, name: string | undefined): void => {
       if (opts.historical) {
         const normalized = jidNormalizedUser(jid);
@@ -640,6 +738,9 @@ export class WhatsAppClient {
       if (isJidGroup(chatJid)) {
         if (key.participant && isPnUser(key.participant)) this.recordVerifiedPhoneJid(key.participant);
         if (key.participantAlt && isPnUser(key.participantAlt)) this.recordVerifiedPhoneJid(key.participantAlt);
+        if (key.participant && isLidUser(key.participant) && key.participantAlt && isPnUser(key.participantAlt)) {
+          if (this.recordLidPhoneMapping(key.participant, key.participantAlt, false)) lidPhoneChanged = true;
+        }
         if (key.participantUsername && key.participant) {
           const pn = key.participantAlt && isPnUser(key.participantAlt) ? key.participantAlt : isPnUser(key.participant) ? key.participant : undefined;
           learn(key.participantUsername, key.participant, digitsOfJid(pn) || undefined, peerName);
@@ -647,6 +748,9 @@ export class WhatsAppClient {
       } else {
         if (isPnUser(chatJid)) this.recordVerifiedPhoneJid(chatJid);
         if (key.remoteJidAlt && isPnUser(key.remoteJidAlt)) this.recordVerifiedPhoneJid(key.remoteJidAlt);
+        if (isLidUser(chatJid) && key.remoteJidAlt && isPnUser(key.remoteJidAlt)) {
+          if (this.recordLidPhoneMapping(chatJid, key.remoteJidAlt, false)) lidPhoneChanged = true;
+        }
         if (key.remoteJidUsername) {
           const pn = key.remoteJidAlt && isPnUser(key.remoteJidAlt) ? key.remoteJidAlt : isPnUser(chatJid) ? chatJid : undefined;
           learn(key.remoteJidUsername, chatJid, digitsOfJid(pn) || undefined, peerName);
@@ -654,28 +758,35 @@ export class WhatsAppClient {
       }
     }
     if (changed) this.saveUsernameDirectory();
+    if (lidPhoneChanged) this.saveLidPhoneDirectory();
   }
 
   /** Learns @username mappings from group metadata (owner, subject/description owners, participants). */
-  private ingestGroupParticipants(participants: Array<Partial<GroupParticipant>>): boolean {
-    let changed = false;
+  private ingestGroupParticipants(participants: Array<Partial<GroupParticipant>>): { usernamesChanged: boolean; lidPhoneChanged: boolean } {
+    let usernamesChanged = false;
+    let lidPhoneChanged = false;
     for (const p of participants) {
       if (!p) continue;
       if (p.id && isPnUser(p.id)) this.recordVerifiedPhoneJid(p.id);
       if (p.phoneNumber && isPnUser(p.phoneNumber)) this.recordVerifiedPhoneJid(p.phoneNumber);
+      const pnSource = p.phoneNumber || (p.id && isPnUser(p.id) ? p.id : undefined);
+      const lidSource = p.lid || (p.id && isLidUser(p.id) ? p.id : undefined);
+      if (lidSource && pnSource && this.recordLidPhoneMapping(lidSource, pnSource, false)) {
+        lidPhoneChanged = true;
+      }
       if (!p.username) continue;
       const targetJid = p.lid || p.id || p.phoneNumber;
       if (!targetJid) continue;
-      const pnSource = p.phoneNumber || (p.id && isPnUser(p.id) ? p.id : undefined);
       if (this.upsertUsernameMapping(p.username, targetJid, digitsOfJid(pnSource) || undefined, p.name || p.notify || undefined, false)) {
-        changed = true;
+        usernamesChanged = true;
       }
     }
-    return changed;
+    return { usernamesChanged, lidPhoneChanged };
   }
 
   private ingestGroupMetadata(groups: Array<Partial<GroupMetadata>>): void {
     let changed = false;
+    let lidPhoneChanged = false;
     for (const g of groups) {
       if (!g) continue;
       const owners: Array<[string | undefined, string | undefined, string | undefined]> = [
@@ -687,15 +798,21 @@ export class WhatsAppClient {
       for (const [username, jid, pn] of owners) {
         if (jid && isPnUser(jid)) this.recordVerifiedPhoneJid(jid);
         if (pn && isPnUser(pn)) this.recordVerifiedPhoneJid(pn);
+        if (jid && isLidUser(jid) && pn && isPnUser(pn)) {
+          if (this.recordLidPhoneMapping(jid, pn, false)) lidPhoneChanged = true;
+        }
         if (username && jid && this.upsertUsernameMapping(username, jid, digitsOfJid(pn) || undefined, undefined, false)) {
           changed = true;
         }
       }
-      if (Array.isArray(g.participants) && this.ingestGroupParticipants(g.participants)) {
-        changed = true;
+      if (Array.isArray(g.participants)) {
+        const res = this.ingestGroupParticipants(g.participants);
+        if (res.usernamesChanged) changed = true;
+        if (res.lidPhoneChanged) lidPhoneChanged = true;
       }
     }
     if (changed) this.saveUsernameDirectory();
+    if (lidPhoneChanged) this.saveLidPhoneDirectory();
   }
 
   /**
@@ -776,14 +893,19 @@ export class WhatsAppClient {
 
   private ingestContacts(contacts: Array<Partial<Contact>>): void {
     let changed = false;
+    let lidPhoneChanged = false;
     for (const contact of contacts) {
       if (!contact) continue;
       if (contact.id && isPnUser(contact.id)) this.recordVerifiedPhoneJid(contact.id);
       if (contact.phoneNumber && isPnUser(contact.phoneNumber)) this.recordVerifiedPhoneJid(contact.phoneNumber);
+      const pnSource = contact.phoneNumber || (contact.id && isPnUser(contact.id) ? contact.id : undefined);
+      const lidSource = contact.lid || (contact.id && isLidUser(contact.id) ? contact.id : undefined);
+      if (lidSource && pnSource && this.recordLidPhoneMapping(lidSource, pnSource, false)) {
+        lidPhoneChanged = true;
+      }
       if (!contact.username) continue;
       const targetJid = contact.lid || contact.id || contact.phoneNumber;
       if (!targetJid) continue;
-      const pnSource = contact.phoneNumber || (contact.id && isPnUser(contact.id) ? contact.id : undefined);
       const digits = pnSource ? pnSource.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') : undefined;
       const displayName = contact.name || contact.notify || undefined;
       if (this.upsertUsernameMapping(contact.username, targetJid, digits, displayName, false)) {
@@ -792,6 +914,9 @@ export class WhatsAppClient {
     }
     if (changed) {
       this.saveUsernameDirectory();
+    }
+    if (lidPhoneChanged) {
+      this.saveLidPhoneDirectory();
     }
   }
 
@@ -886,6 +1011,9 @@ export class WhatsAppClient {
             id: sock.user?.id || 'Connected Account',
             name: sock.user?.name || undefined
           };
+          if (sock.user?.lid && sock.user?.id && isPnUser(sock.user.id)) {
+            this.recordLidPhoneMapping(sock.user.lid, sock.user.id);
+          }
           this.notifyStateChange();
           console.log(`[WhatsApp] Connected successfully as ${this.user.id}`);
         } else if (connection === 'close') {
@@ -1053,7 +1181,7 @@ export class WhatsAppClient {
       this.reconnectTimeout = null;
     }
     this.cleanupSocket();
-    await Promise.all([this.usernamesWriter.flush(), this.activityWriter.flush()]);
+    await Promise.all([this.usernamesWriter.flush(), this.lidPhonesWriter.flush(), this.activityWriter.flush()]);
   }
 
   public async logout(): Promise<{ success: boolean; message: string }> {
@@ -1085,7 +1213,7 @@ export class WhatsAppClient {
       this.lastConnectedIso = null;
       this.lastError = null;
       this.reconnectAttempts = 0;
-      await Promise.all([this.usernamesWriter.flush(), this.activityWriter.flush()]);
+      await Promise.all([this.usernamesWriter.flush(), this.lidPhonesWriter.flush(), this.activityWriter.flush()]);
       this.notifyStateChange();
       return { success: true, message: 'Logged out and session cleared successfully' };
     } catch (err: unknown) {
@@ -1277,11 +1405,25 @@ export class WhatsAppClient {
     }
   }
 
+  private recordGatewayOutboundId(id: string | undefined): void {
+    if (!id) return;
+    this.gatewayOutboundIds.add(id);
+    if (this.gatewayOutboundIds.size > MAX_PROCESSED_MESSAGE_IDS) {
+      const oldest = this.gatewayOutboundIds.values().next().value;
+      if (oldest) this.gatewayOutboundIds.delete(oldest);
+    }
+    this.processedMessageIds.add(id);
+    if (this.processedMessageIds.size > MAX_PROCESSED_MESSAGE_IDS) {
+      const oldest = this.processedMessageIds.values().next().value;
+      if (oldest) this.processedMessageIds.delete(oldest);
+    }
+  }
+
   private async handleIncomingMessage(msg: WAMessage): Promise<void> {
     if (!msg.message) return;
 
     const msgId = msg.key.id;
-    if (msgId && this.processedMessageIds.has(msgId)) {
+    if (msgId && (this.processedMessageIds.has(msgId) || this.gatewayOutboundIds.has(msgId))) {
       return;
     }
     if (msgId) {
@@ -1295,8 +1437,8 @@ export class WhatsAppClient {
     const fromMe = Boolean(msg.key.fromMe);
     const chatJid = msg.key.remoteJid || '';
 
-    // Ignore status broadcasts, newsletters/channels and our own messages.
-    if (!chatJid || chatJid.includes('@broadcast') || chatJid.endsWith('@newsletter') || fromMe) {
+    // Ignore status broadcasts and newsletters/channels.
+    if (!chatJid || chatJid.includes('@broadcast') || chatJid.endsWith('@newsletter')) {
       return;
     }
 
@@ -1311,17 +1453,29 @@ export class WhatsAppClient {
       ? rawUsername.trim().replace(/^@+/, '').toLowerCase() || undefined
       : undefined;
 
+    const me = new Set(
+      [this.sock?.user?.id, this.sock?.user?.lid].filter((v): v is string => Boolean(v)).map(jidNormalizedUser)
+    );
+    const myPhone = this.sock?.user?.id && isPnUser(this.sock.user.id) ? digitsOfJid(this.sock.user.id) || null : null;
+
     // WhatsApp now addresses many people by an opaque "LID" instead of their phone number.
     // Only report a phone number when we actually know it; replies always go to chatJid.
     const phoneJid = isLidUser(senderJid) ? senderAlt : senderJid;
     if (phoneJid && isPnUser(phoneJid)) {
       this.recordVerifiedPhoneJid(phoneJid);
+      if (isLidUser(senderJid)) {
+        this.recordLidPhoneMapping(senderJid, phoneJid);
+      }
     }
-    const phone = phoneJid ? phoneJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') || null : null;
+    let phone =
+      phoneJid && !isLidUser(phoneJid) && !isJidGroup(phoneJid)
+        ? phoneJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') || null
+        : null;
     const senderId = senderJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+    const peerName = fromMe ? undefined : msg.pushName ?? undefined;
 
     if (senderUsername) {
-      this.upsertUsernameMapping(senderUsername, senderJid, phone ?? undefined, msg.pushName ?? undefined);
+      this.upsertUsernameMapping(senderUsername, senderJid, phone ?? undefined, peerName);
     } else {
       // Inbound 1:1 stanzas do not carry the sender's username, so use what we learned earlier,
       // and for an unknown LID ask WhatsApp once (bounded, cached).
@@ -1331,22 +1485,98 @@ export class WhatsAppClient {
       }
     }
 
-    const me = new Set(
-      [this.sock?.user?.id, this.sock?.user?.lid].filter((v): v is string => Boolean(v)).map(jidNormalizedUser)
-    );
-    const ctx = parsed.contextInfo;
-    const mentionsMe = (ctx?.mentionedJid ?? []).some((j) => me.has(jidNormalizedUser(j)));
-    const isReplyToMe = Boolean(ctx?.participant && me.has(jidNormalizedUser(ctx.participant)));
-    const quotedContent = this.parseContent(ctx?.quotedMessage);
+    if (!phone && isLidUser(senderJid)) {
+      phone = await this.resolvePhoneForLid(senderJid, senderUsername);
+      if (phone && senderUsername) {
+        this.upsertUsernameMapping(senderUsername, senderJid, phone, peerName);
+      }
+    }
+
+    const normalizedChatJid = jidNormalizedUser(chatJid);
+    const isSelfChat = !isGroup && (me.has(normalizedChatJid) || Boolean(myPhone && phone === myPhone));
+    if (isSelfChat && !phone && myPhone) {
+      phone = myPhone;
+    }
 
     const tsSeconds = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000);
     const eventDate = new Date(tsSeconds * 1000);
     const id = msgId || `msg-${Date.now()}`;
 
+    // Manual outbound messages sent from the primary phone (not this gateway)
+    if (fromMe && !isSelfChat) {
+      const echoDisplay = isGroup
+        ? `${chatJid.split('@')[0]} (Group)`
+        : senderUsername
+          ? `@${senderUsername}`
+          : phone || senderId;
+
+      this.cacheRawMessage(id, msg);
+      const echoRecord: RecentMessage = {
+        id,
+        sender: 'Owner (Phone)',
+        recipient: echoDisplay,
+        content: parsed.text,
+        timestamp: this.formatDateTime(eventDate),
+        isoTimestamp: eventDate.toISOString(),
+        fromMe: true,
+        isGroup,
+        chatJid,
+        messageType: parsed.type,
+        hasMedia: parsed.hasMedia
+      };
+      this.addRecentMessage(echoRecord);
+
+      if (!config.webhookUrl || !this.settings.forwardingEnabled || (isGroup && !config.forwardGroups)) {
+        return;
+      }
+
+      const echoPayload = {
+        event: 'message.echo',
+        messageId: id,
+        sender: phone,
+        senderName: null,
+        senderUsername: senderUsername ?? null,
+        senderJid: chatJid,
+        chatJid,
+        remoteJid: chatJid,
+        isGroup,
+        groupJid: isGroup ? chatJid : null,
+        fromMe: true,
+        isSelfChat: false,
+        message: parsed.text,
+        messageType: parsed.type,
+        hasMedia: parsed.hasMedia,
+        mimetype: parsed.mimetype ?? null,
+        fileName: parsed.fileName ?? null,
+        timestamp: echoRecord.timestamp,
+        timezone: config.timezone,
+        isoTimestamp: echoRecord.isoTimestamp,
+        rawTimestamp: tsSeconds
+      };
+
+      try {
+        const echoRes = await this.withWebhookSlot(() => postToHermes(echoPayload));
+        if (!echoRes.ok) {
+          console.warn(`[Webhook] Hermes returned HTTP ${echoRes.status} for manual echo ${id}`);
+        }
+      } catch (err: unknown) {
+        console.warn(
+          `[Webhook] Could not forward manual echo ${id} to Hermes: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      return;
+    }
+
+    const ctx = parsed.contextInfo;
+    const mentionsMe = (ctx?.mentionedJid ?? []).some((j) => me.has(jidNormalizedUser(j)));
+    const isReplyToMe = Boolean(ctx?.participant && me.has(jidNormalizedUser(ctx.participant)));
+    const quotedContent = this.parseContent(ctx?.quotedMessage);
+    const displaySenderName = isSelfChat ? msg.pushName || this.sock?.user?.name || undefined : msg.pushName || undefined;
+
     const record: RecentMessage = {
       id,
       sender: phone || senderId,
-      senderName: msg.pushName || undefined,
+      senderName: displaySenderName,
       senderUsername,
       recipient: 'Hermes Agent',
       content: parsed.text,
@@ -1371,11 +1601,12 @@ export class WhatsAppClient {
       return;
     }
     if (
-      (isGroup && !config.forwardGroups) ||
-      (config.allowedNumbers.length > 0 &&
-        !config.allowedNumbers.some(
-          (n) => n === phone || n === senderId || (senderUsername !== undefined && n === `@${senderUsername}`)
-        ))
+      !isSelfChat &&
+      ((isGroup && !config.forwardGroups) ||
+        (config.allowedNumbers.length > 0 &&
+          !config.allowedNumbers.some(
+            (n) => n === phone || n === senderId || (senderUsername !== undefined && n === `@${senderUsername}`)
+          )))
     ) {
       record.webhookStatus = 'filtered';
       this.scheduleActivitySave();
@@ -1399,6 +1630,8 @@ export class WhatsAppClient {
       remoteJid: chatJid,
       isGroup,
       groupJid: isGroup ? chatJid : null,
+      fromMe,
+      isSelfChat,
       message: parsed.text,
       messageType: parsed.type,
       hasMedia: parsed.hasMedia,
@@ -1721,6 +1954,7 @@ export class WhatsAppClient {
         const normalizedPn = attrJid && isPnUser(attrJid) ? jidNormalizedUser(attrJid) : undefined;
 
         if (normalizedLid && normalizedPn) {
+          this.recordLidPhoneMapping(normalizedLid, normalizedPn);
           try {
             await this.sock.signalRepository.lidMapping.storeLIDPNMappings([{ lid: normalizedLid, pn: normalizedPn }]);
           } catch {
@@ -1890,8 +2124,9 @@ export class WhatsAppClient {
 
     const { jid, isGroup, displayRecipient } = params.resolved;
     const quoted = params.quotedMessageId ? this.rawMessages.get(params.quotedMessageId) : undefined;
-    // Pre-generate the id so the ack listener is attached before the stanza goes out
+    // Pre-generate the id so the ack listener is attached and outbound echo filtering is armed before sending
     const outboundId = generateMessageIDV2(sock.user?.id);
+    this.recordGatewayOutboundId(outboundId);
     const ackTimeoutMs = params.ackTimeoutMs ?? OUTBOUND_ACK_TIMEOUT_MS;
 
     let ackListener: ((node: BinaryNode) => void) | undefined;
@@ -1910,6 +2145,7 @@ export class WhatsAppClient {
         ...(quoted ? { quoted } : {})
       });
       const messageId = result?.key?.id ?? outboundId;
+      this.recordGatewayOutboundId(messageId);
 
       // Ack window starts after the upload/relay finished, so large media is not cut short
       const ack = await Promise.race([

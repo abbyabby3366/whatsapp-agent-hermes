@@ -92,12 +92,15 @@ export class GatewayClient {
     return { ok: false, status: 503, error: 'Gateway request exhausted retries' };
   }
 
-  public sendText(params: {
-    to: string;
-    message: string;
-    pin?: string;
-    replyToMessageId?: string;
-  }): Promise<GatewayCallResult<{ success: boolean; messageId?: string; jid?: string }>> {
+  public sendText(
+    params: {
+      to: string;
+      message: string;
+      pin?: string;
+      replyToMessageId?: string;
+    },
+    opts: { retryOn503?: boolean; timeoutMs?: number } = {}
+  ): Promise<GatewayCallResult<{ success: boolean; messageId?: string; jid?: string }>> {
     return this.requestJson(
       'POST',
       '/api/send',
@@ -107,7 +110,7 @@ export class GatewayClient {
         ...(params.pin ? { pin: params.pin } : {}),
         ...(params.replyToMessageId ? { replyToMessageId: params.replyToMessageId } : {})
       },
-      { retryOn503: true, timeoutMs: 25_000 }
+      { retryOn503: opts.retryOn503 ?? true, timeoutMs: opts.timeoutMs ?? 25_000 }
     );
   }
 

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import type http from 'node:http';
 import sharp from 'sharp';
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-gateway-test-'));
@@ -24,15 +25,17 @@ process.env.GATEWAY_API_KEY = TEST_API_KEY;
 process.env.TIMEZONE = 'Asia/Kuala_Lumpur';
 process.env.DEFAULT_COUNTRY_CODE = '60';
 
-const { formatDateTimeParts, flushSettings, isPlaceholderSecret } = await import('../src/config.js');
+const { config, formatDateTimeParts, flushSettings, isPlaceholderSecret } = await import('../src/config.js');
+const { expandHomePath } = await import('../src/formatting.js');
 const { DebouncedJsonWriter } = await import('../src/persistence.js');
-const { MediaResolutionError, resolveMediaInput } = await import('../src/media.js');
+const { isPrivateOrReservedIp, MediaResolutionError, resolveMediaInput } = await import('../src/media.js');
 const { buildStickerExif, injectWebpExif, prepareSticker } = await import('../src/sticker.js');
 const {
   formatWhatsAppText,
   inferDocumentMimetype,
   isValidWhatsAppUsername,
   parseRecipientInput,
+  WhatsAppClient,
   waClient
 } = await import('../src/whatsapp.js');
 const { app, resetAuthRateLimits } = await import('../src/index.js');
@@ -318,6 +321,202 @@ describe('HTTP Gateway (Express 5, CSP, Auth Rate Limit, SSE)', () => {
       assert.equal(connectedRes.status, 409);
     } finally {
       waClient.getState = originalGetState;
+    }
+  });
+});
+
+describe('Security, tilde paths, self-chat, manual echoes & LID phone resolution', () => {
+  it('expands leading tilde paths cleanly without altering regular paths', () => {
+    assert.equal(expandHomePath('~', '/home/tester'), '/home/tester');
+    assert.equal(expandHomePath('~/sub/file.env', '/home/tester'), path.join('/home/tester', 'sub/file.env'));
+    assert.equal(expandHomePath('./relative', '/home/tester'), './relative');
+    assert.equal(expandHomePath('/abs/path', '/home/tester'), '/abs/path');
+  });
+
+  it('blocks private, loopback, link-local metadata URLs and redirects to private IPs (SSRF)', async () => {
+    assert.equal(isPrivateOrReservedIp('127.0.0.1'), true);
+    assert.equal(isPrivateOrReservedIp('169.254.169.254'), true);
+    assert.equal(isPrivateOrReservedIp('10.1.2.3'), true);
+    assert.equal(isPrivateOrReservedIp('172.16.0.1'), true);
+    assert.equal(isPrivateOrReservedIp('192.168.1.10'), true);
+    assert.equal(isPrivateOrReservedIp('::1'), true);
+    assert.equal(isPrivateOrReservedIp('::ffff:127.0.0.1'), true);
+    assert.equal(isPrivateOrReservedIp('0:0:0:0:0:ffff:127.0.0.1'), true);
+    assert.equal(isPrivateOrReservedIp('0:0:0:0:0:ffff:8.8.8.8'), false);
+    assert.equal(isPrivateOrReservedIp('fe80::1'), true);
+    assert.equal(isPrivateOrReservedIp('fc00::1'), true);
+    assert.equal(isPrivateOrReservedIp('8.8.8.8'), false);
+
+    const mediaSrv = http.createServer((req, res) => {
+      if (req.url === '/redirect-local') {
+        res.writeHead(302, { Location: `http://127.0.0.1:${(mediaSrv.address() as { port: number }).port}/ok.txt` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok-bytes');
+    });
+    await new Promise<void>((resolve) => mediaSrv.listen(0, '127.0.0.1', () => resolve()));
+    const addr = mediaSrv.address() as { port: number };
+
+    try {
+      for (const blockedUrl of [
+        `http://127.0.0.1:${addr.port}/ok.txt`,
+        `http://[::1]:${addr.port}/ok.txt`,
+        `http://localhost:${addr.port}/ok.txt`,
+        'http://169.254.169.254/latest/meta-data/'
+      ]) {
+        await assert.rejects(
+          () => resolveMediaInput(blockedUrl),
+          (err: unknown) => err instanceof MediaResolutionError && err.statusCode === 403
+        );
+      }
+
+      const allowed = await resolveMediaInput(`http://127.0.0.1:${addr.port}/redirect-local`, {
+        allowPrivateNetwork: true
+      });
+      assert.equal(allowed.buffer.toString('utf8'), 'ok-bytes');
+
+      // Simulate a public URL redirecting to internal loopback -> must reject hop 1 with 403
+      const origFetch = globalThis.fetch;
+      let fetchCalls = 0;
+      globalThis.fetch = (async () => {
+        fetchCalls += 1;
+        return new Response(null, { status: 302, headers: { location: `http://127.0.0.1:${addr.port}/ok.txt` } });
+      }) as typeof fetch;
+      try {
+        await assert.rejects(
+          () => resolveMediaInput('https://8.8.8.8/image.png'),
+          (err: unknown) => err instanceof MediaResolutionError && err.statusCode === 403
+        );
+        assert.equal(fetchCalls, 1);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    } finally {
+      await new Promise<void>((resolve) => mediaSrv.close(() => resolve()));
+    }
+  });
+
+  it('forwards self-chat DMs and manual phone echoes, filters gateway echoes, and resolves LID phones locally', async () => {
+    const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-client-iso-'));
+    const isoSessions = path.join(isoRoot, 'sessions');
+    const isoData = path.join(isoRoot, 'data');
+
+    const receivedHooks: Array<Record<string, unknown>> = [];
+    const hookSrv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        receivedHooks.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'processing', reply: null }));
+      });
+    });
+    await new Promise<void>((resolve) => hookSrv.listen(0, '127.0.0.1', () => resolve()));
+    const hookAddr = hookSrv.address() as { port: number };
+
+    const prevWebhookUrl = config.webhookUrl;
+    const prevWebhookToken = config.webhookToken;
+    const prevRetries = config.webhookRetries;
+    const prevAllowed = [...config.allowedNumbers];
+    const prevDataDir = config.dataDir;
+
+    config.dataDir = isoData;
+    config.webhookUrl = `http://127.0.0.1:${hookAddr.port}/api/webhook`;
+    config.webhookToken = '';
+    config.webhookRetries = 0;
+    config.allowedNumbers = [];
+
+    const client = new WhatsAppClient(isoSessions, isoData);
+    const fakeWs = new EventEmitter();
+    const fakeSock = {
+      user: { id: '60123456789:0@s.whatsapp.net', lid: '111222333444555:0@lid', name: 'Desmond' },
+      ws: fakeWs,
+      ev: { removeAllListeners: () => undefined },
+      end: () => undefined,
+      onWhatsApp: async (jid: string) => [{ exists: true, jid }],
+      generateMessageTag: () => 'tag_1',
+      query: async () => ({ tag: 'iq', attrs: {}, content: [] }),
+      sendMessage: async (_jid: string, _content: unknown, opts?: { messageId?: string }) => {
+        const id = opts?.messageId || 'gw_out_fallback';
+        queueMicrotask(() => fakeWs.emit(`TAG:${id}`, { tag: 'ack', attrs: { class: 'message' } }));
+        return { key: { id } };
+      },
+      signalRepository: {
+        lidMapping: {
+          getPNForLID: async (lid: string) => {
+            if (lid === '111222333444555@lid') return '60123456789@s.whatsapp.net';
+            if (lid === '222333444555666@lid') return '60187654321@s.whatsapp.net';
+            return null;
+          },
+          storeLIDPNMappings: async () => undefined
+        }
+      }
+    };
+
+    const internal = client as unknown as {
+      sock: unknown;
+      status: string;
+      handleIncomingMessage: (msg: unknown) => Promise<void>;
+    };
+    internal.sock = fakeSock;
+    internal.status = 'connected';
+
+    try {
+      // 1. Gateway's own outbound message echoed back -> ignored
+      const sent = await client.sendMessage('60187654321', 'Hello from gateway');
+      assert.equal(sent.success, true);
+      assert.ok(sent.messageId);
+      await internal.handleIncomingMessage({
+        key: { id: sent.messageId, remoteJid: '60187654321@s.whatsapp.net', fromMe: true },
+        message: { conversation: 'Hello from gateway' }
+      });
+      assert.equal(receivedHooks.length, 0);
+
+      // 2. Owner's non-gateway self-chat message over @lid -> forwarded with fromMe + isSelfChat + phone
+      await internal.handleIncomingMessage({
+        key: { id: 'self_msg_1', remoteJid: '111222333444555@lid', fromMe: true },
+        message: { conversation: 'status' }
+      });
+      assert.equal(receivedHooks.length, 1);
+      assert.equal(receivedHooks[0].event, 'message.received');
+      assert.equal(receivedHooks[0].fromMe, true);
+      assert.equal(receivedHooks[0].isSelfChat, true);
+      assert.equal(receivedHooks[0].sender, '60123456789');
+
+      // 3. Owner's manual reply from phone to contact -> message.echo without incrementing receivedCount
+      const beforeCount = client.getState().stats.receivedCount;
+      await internal.handleIncomingMessage({
+        key: { id: 'manual_phone_1', remoteJid: '60187654321@s.whatsapp.net', fromMe: true },
+        message: { conversation: 'Manual phone reply' }
+      });
+      assert.equal(client.getState().stats.receivedCount, beforeCount);
+      assert.equal(receivedHooks.length, 2);
+      assert.equal(receivedHooks[1].event, 'message.echo');
+      assert.equal(receivedHooks[1].fromMe, true);
+      assert.equal(receivedHooks[1].isSelfChat, false);
+      assert.equal(receivedHooks[1].message, 'Manual phone reply');
+
+      // 4. Inbound @lid without remoteJidAlt resolves phone from signalRepository.lidMapping and passes ALLOWED_NUMBERS
+      config.allowedNumbers = ['60187654321'];
+      await internal.handleIncomingMessage({
+        key: { id: 'lid_only_1', remoteJid: '222333444555666@lid', fromMe: false },
+        pushName: 'Lid Contact',
+        message: { conversation: 'Hi via LID' }
+      });
+      assert.equal(receivedHooks.length, 3);
+      assert.equal(receivedHooks[2].event, 'message.received');
+      assert.equal(receivedHooks[2].sender, '60187654321');
+    } finally {
+      config.webhookUrl = prevWebhookUrl;
+      config.webhookToken = prevWebhookToken;
+      config.webhookRetries = prevRetries;
+      config.allowedNumbers = prevAllowed;
+      config.dataDir = prevDataDir;
+      await client.shutdown();
+      await new Promise<void>((resolve) => hookSrv.close(() => resolve()));
+      fs.rmSync(isoRoot, { recursive: true, force: true });
     }
   });
 });

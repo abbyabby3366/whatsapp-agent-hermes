@@ -32,6 +32,8 @@ export interface WebhookPayload {
   remoteJid?: string | null;
   isGroup?: boolean;
   groupJid?: string | null;
+  fromMe?: boolean;
+  isSelfChat?: boolean;
   message?: string | null;
   messageType?: string | null;
   hasMedia?: boolean;
@@ -59,11 +61,15 @@ interface QueuedInboundTurnItem {
 }
 
 interface ChatQueueState {
+  chatKey: string;
   generation: number;
+  manualTakeoverGen: number;
+  waitingDrainers: number;
   pending: QueuedInboundTurnItem[];
   timer: NodeJS.Timeout | null;
   abortController: AbortController | null;
   activeRun: Promise<void> | null;
+  mergedInto?: ChatQueueState;
 }
 
 class ConcurrencySemaphore {
@@ -155,9 +161,11 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
   const semaphore = new ConcurrencySemaphore(cfg.maxConcurrentRuns);
   const chatQueues = new Map<string, ChatQueueState>();
   const inflightIngests = new Set<Promise<void>>();
+  let turnSeq = 0;
   let activeTurns = 0;
   let shuttingDown = false;
   let lastProxyAlertMs = 0;
+  let mediaPruneTimer: NodeJS.Timeout | null = null;
 
   const app = express();
   app.disable('x-powered-by');
@@ -204,13 +212,26 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
       return;
     }
 
-    if (payload.isGroup && !payload.mentionsMe && !payload.isReplyToMe) {
+    if (payload.isGroup && payload.event !== 'message.echo' && !payload.fromMe && !payload.mentionsMe && !payload.isReplyToMe) {
       res.json({ reply: null, ignored: true });
       return;
     }
 
     if (handled.has(payload.messageId)) {
       res.json({ reply: null, duplicate: true });
+      return;
+    }
+
+    if (payload.event === 'message.echo' || (payload.fromMe && !payload.isSelfChat)) {
+      res.json({ reply: null, recorded: true });
+      const p = ingestManualOutbound(payload as WebhookPayload).catch((err: unknown) => {
+        console.error(
+          `[Receiver] Failed to record manual echo ${payload.messageId}:`,
+          err instanceof Error ? err.message : err
+        );
+      });
+      inflightIngests.add(p);
+      void p.finally(() => inflightIngests.delete(p));
       return;
     }
 
@@ -256,12 +277,109 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
     return Boolean(senderLid && knownMasterLid && senderLid === knownMasterLid);
   }
 
+  function resolveTargetQueue(q: ChatQueueState): ChatQueueState {
+    let cur = q;
+    while (cur.mergedInto) {
+      cur = cur.mergedInto;
+    }
+    return cur;
+  }
+
+  function getOrCreateQueue(chatKey: string): ChatQueueState {
+    let q = chatQueues.get(chatKey);
+    if (!q) {
+      q = {
+        chatKey,
+        generation: 0,
+        manualTakeoverGen: -1,
+        waitingDrainers: 0,
+        pending: [],
+        timer: null,
+        abortController: null,
+        activeRun: null
+      };
+      chatQueues.set(chatKey, q);
+    }
+    return q;
+  }
+
+  function cleanupIdleQueue(q: ChatQueueState): void {
+    const target = resolveTargetQueue(q);
+    if (
+      !target.timer &&
+      !target.activeRun &&
+      target.waitingDrainers === 0 &&
+      target.pending.length === 0 &&
+      target.abortController === null &&
+      chatQueues.get(target.chatKey) === target
+    ) {
+      chatQueues.delete(target.chatKey);
+    }
+  }
+
+  function armQueueTimer(q: ChatQueueState): void {
+    if (q.timer) {
+      clearTimeout(q.timer);
+    }
+    const delayMs = Math.max(0, Math.round(cfg.coalesceWindowSeconds * 1000));
+    q.timer = setTimeout(() => {
+      q.timer = null;
+      void scheduleDrain(q);
+    }, delayMs);
+    q.timer.unref?.();
+  }
+
+  function migrateChatQueue(oldKey: string, newKey: string): void {
+    if (!oldKey || !newKey || oldKey === newKey) return;
+    const rawOld = chatQueues.get(oldKey);
+    if (!rawOld) return;
+    const oldQ = resolveTargetQueue(rawOld);
+    chatQueues.delete(oldKey);
+
+    const existingRaw = chatQueues.get(newKey);
+    if (!existingRaw) {
+      oldQ.chatKey = newKey;
+      for (const item of oldQ.pending) {
+        item.chatKey = newKey;
+      }
+      chatQueues.set(newKey, oldQ);
+      return;
+    }
+
+    const targetQ = resolveTargetQueue(existingRaw);
+    if (targetQ === oldQ) return;
+
+    if (oldQ.timer) {
+      clearTimeout(oldQ.timer);
+      oldQ.timer = null;
+    }
+    oldQ.generation = ++turnSeq;
+    oldQ.abortController?.abort();
+
+    const moved = oldQ.pending.splice(0, oldQ.pending.length);
+    for (const item of moved) {
+      item.chatKey = newKey;
+    }
+    if (moved.length > 0) {
+      targetQ.pending.unshift(...moved);
+    }
+    oldQ.mergedInto = targetQ;
+
+    targetQ.generation = ++turnSeq;
+    targetQ.abortController?.abort();
+    if (targetQ.pending.length > 0 && !shuttingDown) {
+      armQueueTimer(targetQ);
+    }
+  }
+
   function migrateAllStores(oldKey: string, newKey: string): void {
     history.migrateChatKey(oldKey, newKey);
     sessions.migrateKey(oldKey, newKey);
     flows.migrateKey(oldKey, newKey);
     contacts.migrateKey(oldKey, newKey);
     runtimeState.migrateKey(oldKey, newKey);
+    outbox.migrateKey(oldKey, newKey);
+    migrateChatQueue(oldKey, newKey);
   }
 
   async function saveInboundMedia(payload: WebhookPayload): Promise<{
@@ -292,7 +410,7 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
       'bin';
     const fileName = `${safeId}.${ext}`;
     const localPath = path.join(cfg.mediaDir, fileName);
-    fs.writeFileSync(localPath, dl.buffer);
+    await fs.promises.writeFile(localPath, dl.buffer, { mode: 0o600 });
 
     const msgType = (payload.messageType || '').toLowerCase();
     const isImage = msgType === 'image' || mimetype.startsWith('image/');
@@ -305,6 +423,52 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
     return { localPath, isImage, isAudio, descriptor };
   }
 
+  async function ingestManualOutbound(payload: WebhookPayload): Promise<void> {
+    if (handled.has(payload.messageId)) return;
+
+    const isGroup = Boolean(payload.isGroup || payload.chatJid.endsWith('@g.us'));
+    const identity = chatMap.upsertInbound({
+      chatJid: payload.chatJid,
+      sender: payload.sender,
+      senderUsername: payload.senderUsername,
+      isGroup
+    });
+    for (const oldKey of identity.previousKeys) {
+      migrateAllStores(oldKey, identity.chatKey);
+    }
+
+    // Cancel any queued or in-flight AI draft because the owner replied manually from their phone
+    const existing = chatQueues.get(identity.chatKey);
+    if (existing) {
+      const q = resolveTargetQueue(existing);
+      q.generation = ++turnSeq;
+      q.manualTakeoverGen = q.generation;
+      if (q.timer) {
+        clearTimeout(q.timer);
+        q.timer = null;
+      }
+      const cancelled = q.pending.splice(0, q.pending.length);
+      for (const item of cancelled) {
+        handled.mark(item.payload.messageId, 'silent', identity.chatKey);
+      }
+      q.abortController?.abort();
+    }
+
+    const body = (payload.message ?? '').trim();
+    const isoTimestamp = payload.isoTimestamp || new Date().toISOString();
+    if (body) {
+      history.recordOutbound({
+        chatKey: identity.chatKey,
+        chatJid: payload.chatJid,
+        inboundMessageId: `manual:${payload.messageId}`,
+        chunkIndex: 0,
+        body,
+        isoTimestamp
+      });
+    }
+    handled.mark(payload.messageId, 'sent', identity.chatKey);
+  }
+
   async function ingestInbound(payload: WebhookPayload, options: { fromReplay?: boolean } = {}): Promise<void> {
     if (handled.has(payload.messageId)) return;
 
@@ -314,7 +478,7 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
       senderJid: payload.senderJid,
       sender: payload.sender,
       senderUsername: payload.senderUsername,
-      senderName: payload.senderName,
+      senderName: payload.fromMe ? undefined : payload.senderName,
       isGroup
     });
     for (const oldKey of identity.previousKeys) {
@@ -322,6 +486,10 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
     }
 
     const isMasterDm = isMasterPrincipal(payload, identity.record);
+    if (payload.fromMe && !isMasterDm) {
+      handled.mark(payload.messageId, 'silent', identity.chatKey);
+      return;
+    }
     const imagePaths: string[] = [];
     const bodyParts: string[] = [];
     const rawCaptionOrText = (payload.message ?? '').trim();
@@ -341,6 +509,8 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
           } catch (err: unknown) {
             console.error(`[Receiver] Transcription failed for ${payload.messageId}:`, err);
             bodyParts.push('[voice note | engine: whisper-onnx | quality: unclear | transcript: "(transcription error)"]');
+          } finally {
+            await fs.promises.unlink(media.localPath).catch(() => undefined);
           }
         } else if (media.descriptor) {
           bodyParts.push(media.descriptor);
@@ -348,11 +518,14 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
       }
     } else if (payload.hasMedia && (payload.messageType === 'image' || payload.mimetype?.startsWith('image/'))) {
       const safeId = payload.messageId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 48);
-      if (fs.existsSync(cfg.mediaDir)) {
-        const cachedImage = fs.readdirSync(cfg.mediaDir).find((f) => f.startsWith(`${safeId}.`));
+      try {
+        const files = await fs.promises.readdir(cfg.mediaDir);
+        const cachedImage = files.find((f) => f.startsWith(`${safeId}.`));
         if (cachedImage) {
           imagePaths.push(path.join(cfg.mediaDir, cachedImage));
         }
+      } catch {
+        // Ignore when media directory does not exist
       }
     }
 
@@ -386,7 +559,13 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
         phone: identity.record.phone,
         lid: identity.record.lid
       });
-      const pauseState = runtimeState.isContactPaused(identity.chatKey);
+      const pauseState = runtimeState.isContactPaused({
+        chatKey: identity.chatKey,
+        phone: identity.record.phone,
+        username: identity.record.username,
+        lid: identity.record.lid,
+        chatJids: identity.record.chatJids
+      });
       if (!runtimeState.isAutoReplyEnabled() || pauseState.paused || profile?.auto_reply === false) {
         handled.mark(payload.messageId, 'silent', identity.chatKey);
         return;
@@ -407,50 +586,47 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
   }
 
   function enqueueTurnItem(item: QueuedInboundTurnItem): void {
-    let q = chatQueues.get(item.chatKey);
-    if (!q) {
-      q = {
-        generation: 0,
-        pending: [],
-        timer: null,
-        abortController: null,
-        activeRun: null
-      };
-      chatQueues.set(item.chatKey, q);
-    }
-
+    const q = resolveTargetQueue(getOrCreateQueue(item.chatKey));
+    item.chatKey = q.chatKey;
     q.pending.push(item);
-    q.generation += 1;
+    q.generation = ++turnSeq;
 
     // Supersede any active in-flight turn for this chat immediately
     if (q.abortController) {
       q.abortController.abort();
     }
 
-    if (q.timer) {
-      clearTimeout(q.timer);
-    }
-
-    const delayMs = Math.max(0, Math.round(cfg.coalesceWindowSeconds * 1000));
-    q.timer = setTimeout(() => {
-      q!.timer = null;
-      void scheduleDrain(item.chatKey);
-    }, delayMs);
-    q.timer.unref?.();
+    armQueueTimer(q);
   }
 
-  async function scheduleDrain(chatKey: string): Promise<void> {
-    const q = chatQueues.get(chatKey);
-    if (!q || shuttingDown) return;
-    if (q.activeRun) {
-      await q.activeRun;
-    }
-    if (!q.pending.length || q.timer || shuttingDown) return;
+  async function scheduleDrain(initialQ: ChatQueueState): Promise<void> {
+    let q = resolveTargetQueue(initialQ);
+    if (shuttingDown) return;
 
-    const run = processChatBurst(chatKey, q).finally(() => {
+    if (q.activeRun) {
+      q.waitingDrainers += 1;
+      try {
+        while (q.activeRun) {
+          await q.activeRun;
+          q = resolveTargetQueue(q);
+          if (shuttingDown) return;
+        }
+      } finally {
+        q.waitingDrainers = Math.max(0, q.waitingDrainers - 1);
+      }
+    }
+
+    q = resolveTargetQueue(q);
+    if (!q.pending.length || q.timer || shuttingDown) {
+      cleanupIdleQueue(q);
+      return;
+    }
+
+    const run = processChatBurst(q).finally(() => {
       if (q.activeRun === run) {
         q.activeRun = null;
       }
+      cleanupIdleQueue(q);
     });
     q.activeRun = run;
     await run;
@@ -582,20 +758,22 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
     return sections.join('\n\n');
   }
 
-  async function sendMasterAlert(message: string): Promise<void> {
+  async function sendMasterAlert(message: string, opts: { retryOn503?: boolean } = {}): Promise<void> {
     if (!cfg.masterPhone) return;
-    await gateway.sendText({ to: cfg.masterPhone, message });
+    await gateway.sendText({ to: cfg.masterPhone, message }, opts);
   }
 
-  async function processChatBurst(chatKey: string, q: ChatQueueState): Promise<void> {
+  async function processChatBurst(q: ChatQueueState): Promise<void> {
     const release = await semaphore.acquire();
     activeTurns += 1;
 
     try {
-      if (q.pending.length === 0 || shuttingDown) return;
+      const queueBeforeRun = resolveTargetQueue(q);
+      let chatKey = queueBeforeRun.chatKey;
+      if (queueBeforeRun.pending.length === 0 || shuttingDown) return;
 
-      const items = q.pending.splice(0, q.pending.length);
-      const capturedGeneration = q.generation;
+      const items = queueBeforeRun.pending.splice(0, queueBeforeRun.pending.length);
+      const capturedGeneration = queueBeforeRun.generation;
       const latest = items[items.length - 1];
       const chatJid = latest.chatJid;
 
@@ -650,13 +828,22 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
       }
 
       // If superseded while waiting in the semaphore queue, put items back cleanly
-      if (capturedGeneration !== q.generation || shuttingDown) {
-        q.pending.unshift(...items);
+      const preTargetQ = resolveTargetQueue(queueBeforeRun);
+      if (capturedGeneration !== preTargetQ.generation || preTargetQ !== queueBeforeRun || shuttingDown) {
+        if (preTargetQ.manualTakeoverGen > capturedGeneration) {
+          for (const item of items) handled.mark(item.payload.messageId, 'silent', preTargetQ.chatKey);
+        } else {
+          for (const item of items) item.chatKey = preTargetQ.chatKey;
+          preTargetQ.pending.unshift(...items);
+          if (!preTargetQ.timer && preTargetQ.waitingDrainers === 0 && !shuttingDown) {
+            armQueueTimer(preTargetQ);
+          }
+        }
         return;
       }
 
       const abortController = new AbortController();
-      q.abortController = abortController;
+      queueBeforeRun.abortController = abortController;
 
       const prompt = buildPrompt(chatKey, items);
       const toolsets = latest.isMasterDm ? cfg.toolsetsOwner : cfg.toolsetsContact;
@@ -669,16 +856,27 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
         sessionId: existingSessionId,
         imagePaths,
         signal: abortController.signal,
-        onStaleSession: () => sessions.clear(chatKey)
+        onStaleSession: () => sessions.clear(resolveTargetQueue(queueBeforeRun).chatKey)
       });
 
-      if (q.abortController === abortController) {
-        q.abortController = null;
+      if (queueBeforeRun.abortController === abortController) {
+        queueBeforeRun.abortController = null;
       }
 
-      // Superseded mid-turn by a newer message: merge these items back before the new items
-      if (result.superseded || capturedGeneration !== q.generation) {
-        q.pending.unshift(...items);
+      const targetQ = resolveTargetQueue(queueBeforeRun);
+      chatKey = targetQ.chatKey;
+
+      // Superseded mid-turn by a newer message or manual takeover
+      if (result.superseded || targetQ !== queueBeforeRun || capturedGeneration !== targetQ.generation) {
+        if (targetQ.manualTakeoverGen > capturedGeneration) {
+          for (const item of items) handled.mark(item.payload.messageId, 'silent', chatKey);
+        } else {
+          for (const item of items) item.chatKey = chatKey;
+          targetQ.pending.unshift(...items);
+          if (!targetQ.timer && targetQ.waitingDrainers === 0 && !shuttingDown) {
+            armQueueTimer(targetQ);
+          }
+        }
         return;
       }
 
@@ -734,10 +932,20 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
         return;
       }
 
+      if (resolveTargetQueue(q).manualTakeoverGen > capturedGeneration) {
+        for (const item of items) handled.mark(item.payload.messageId, 'silent', chatKey);
+        return;
+      }
+
       // 4. Mark read right before dispatching chunk 1 (never prematurely!)
       await gateway.markRead(latest.payload.messageId);
 
       for (let i = 0; i < parsed.chunks.length; i++) {
+        if (resolveTargetQueue(q).manualTakeoverGen > capturedGeneration) {
+          const outcome = i > 0 ? 'sent' : 'silent';
+          for (const item of items) handled.mark(item.payload.messageId, outcome, chatKey);
+          return;
+        }
         const chunk = parsed.chunks[i];
         if (i > 0 && cfg.splitMessageDelaySeconds > 0) {
           await gateway.setPresence(chatJid, 'composing');
@@ -761,8 +969,33 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
             await sendMasterAlert(`[FLAG] Failed sending reply to ${chatKey} (HTTP 502): ${sendRes.error || 'Rejected'}`);
             return;
           }
-          // Transient outage after retries -> leave unledgered for replayOrphans()
-          await sendMasterAlert(`[Alert] Failed sending reply to ${chatKey} (HTTP ${sendRes.status}): ${sendRes.error || 'Error'}`);
+          if (i > 0) {
+            // Chunk 0 was already delivered; queue unsent tail chunks instead of replaying the whole burst
+            const rawTs =
+              typeof latest.payload.rawTimestamp === 'number' && Number.isFinite(latest.payload.rawTimestamp)
+                ? latest.payload.rawTimestamp
+                : Math.floor(Date.now() / 1000);
+            history.queuePendingOutbound(
+              parsed.chunks.slice(i).map((remainingBody, offset) => ({
+                chatKey,
+                chatJid,
+                inboundMessageId: latest.payload.messageId,
+                chunkIndex: i + offset,
+                body: remainingBody,
+                isGroup: latest.isGroup,
+                rawTimestamp: rawTs
+              }))
+            );
+            if (!latest.isMasterDm) {
+              runtimeState.recordReplySent(chatKey);
+            }
+            for (const item of items) handled.mark(item.payload.messageId, 'sent', chatKey);
+          }
+          // Transient outage after retries -> don't stall another 25s retrying the alert
+          await sendMasterAlert(
+            `[Alert] Failed sending reply to ${chatKey} (HTTP ${sendRes.status}): ${sendRes.error || 'Error'}`,
+            { retryOn503: false }
+          );
           return;
         }
 
@@ -787,11 +1020,62 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
     }
   }
 
+  async function pruneExpiredMedia(): Promise<number> {
+    if (cfg.mediaRetentionHours <= 0) return 0;
+    const cutoffMs = Date.now() - cfg.mediaRetentionHours * 3_600_000;
+    let removed = 0;
+    try {
+      const entries = await fs.promises.readdir(cfg.mediaDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const fullPath = path.join(cfg.mediaDir, entry.name);
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          if (stat.mtimeMs < cutoffMs) {
+            await fs.promises.unlink(fullPath);
+            removed += 1;
+          }
+        } catch {
+          // Ignore file removed concurrently
+        }
+      }
+    } catch {
+      // Ignore missing mediaDir
+    }
+    return removed;
+  }
+
   async function replayOrphans(): Promise<number> {
     if (!cfg.startupReplay) return 0;
     const cutoffEpoch = Math.floor(Date.now() / 1000) - cfg.replayMaxAgeMin * 60;
-    const orphans = history.findOrphans(cutoffEpoch, (msgId) => handled.has(msgId));
     let count = 0;
+
+    const pendingChunks = history.listPendingOutbound(cutoffEpoch);
+    for (const pending of pendingChunks) {
+      if (shuttingDown) break;
+      const sendRes = await gateway.sendText({
+        to: pending.chatJid,
+        message: pending.body
+      });
+      if (sendRes.ok) {
+        history.recordOutbound({
+          chatKey: pending.chatKey,
+          chatJid: pending.chatJid,
+          inboundMessageId: pending.inboundMessageId,
+          chunkIndex: pending.chunkIndex,
+          body: pending.body
+        });
+        history.deletePendingOutbound(pending.id);
+        count += 1;
+      } else if (sendRes.status === 502) {
+        history.deletePendingOutbound(pending.id);
+        await sendMasterAlert(
+          `[FLAG] Failed sending queued chunk ${pending.chunkIndex} to ${pending.chatKey} (HTTP 502): ${sendRes.error || 'Rejected'}`
+        );
+      }
+    }
+
+    const orphans = history.findOrphans(cutoffEpoch, (msgId) => handled.has(msgId));
 
     for (const row of orphans) {
       let payload: WebhookPayload;
@@ -853,6 +1137,13 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
   let httpServer: http.Server | null = null;
 
   async function start(): Promise<http.Server> {
+    void pruneExpiredMedia();
+    if (cfg.mediaRetentionHours > 0 && !mediaPruneTimer) {
+      mediaPruneTimer = setInterval(() => {
+        void pruneExpiredMedia();
+      }, 6 * 3_600_000);
+      mediaPruneTimer.unref();
+    }
     return new Promise((resolve, reject) => {
       const srv = app.listen(cfg.port, cfg.host, () => {
         httpServer = srv;
@@ -864,6 +1155,20 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
 
   async function shutdown(): Promise<void> {
     shuttingDown = true;
+    if (mediaPruneTimer) {
+      clearInterval(mediaPruneTimer);
+      mediaPruneTimer = null;
+    }
+
+    if (httpServer) {
+      await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
+      httpServer = null;
+    }
+
+    if (inflightIngests.size > 0) {
+      await Promise.race([Promise.allSettled(Array.from(inflightIngests)), sleep(5_000)]);
+    }
+
     for (const q of chatQueues.values()) {
       if (q.timer) {
         clearTimeout(q.timer);
@@ -877,16 +1182,14 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
 
     if (activeRuns.length > 0) {
       await Promise.race([Promise.allSettled(activeRuns), sleep(cfg.drainSeconds * 1000)]);
-      // Abort anything still running past DRAIN_SECONDS
+      // Abort anything still running past DRAIN_SECONDS and wait briefly for cleanup
       for (const q of chatQueues.values()) {
         q.abortController?.abort();
       }
+      await Promise.race([Promise.allSettled(activeRuns), sleep(3_500)]);
     }
 
-    if (httpServer) {
-      await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
-      httpServer = null;
-    }
+    await handled.flush();
     history.close();
   }
 

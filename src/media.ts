@@ -1,4 +1,6 @@
+import dns from 'dns';
 import fs from 'fs';
+import net from 'net';
 import path from 'path';
 import { config } from './config.js';
 
@@ -14,6 +16,7 @@ export class MediaResolutionError extends Error {
 
 export interface ResolveMediaOptions {
   allowRawBase64?: boolean;
+  allowPrivateNetwork?: boolean;
   maxBytes?: number;
   timeoutMs?: number;
   allowedDir?: string;
@@ -23,6 +26,134 @@ export interface ResolvedMedia {
   buffer: Buffer;
   mimetype?: string;
   fileName?: string;
+}
+
+const MAX_REMOTE_REDIRECTS = 5;
+
+function parseIpv6Words(ip: string): number[] | null {
+  let working = ip;
+  const lastColon = working.lastIndexOf(':');
+  if (lastColon !== -1 && working.slice(lastColon + 1).includes('.')) {
+    const ipv4Part = working.slice(lastColon + 1);
+    if (!net.isIPv4(ipv4Part)) return null;
+    const octets = ipv4Part.split('.').map((n) => Number.parseInt(n, 10));
+    const w0 = ((octets[0] << 8) | octets[1]).toString(16);
+    const w1 = ((octets[2] << 8) | octets[3]).toString(16);
+    working = `${working.slice(0, lastColon)}:${w0}:${w1}`;
+  }
+
+  const halves = working.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves[1] ? halves[1].split(':') : [];
+  const isHexGroup = (g: string) => /^[0-9a-f]{1,4}$/.test(g);
+  if (!left.every(isHexGroup) || !right.every(isHexGroup)) return null;
+  if (halves.length === 1) {
+    if (left.length !== 8) return null;
+    return left.map((h) => Number.parseInt(h, 16));
+  }
+  const missing = 8 - (left.length + right.length);
+  if (missing < 0) return null;
+  return [
+    ...left.map((h) => Number.parseInt(h, 16)),
+    ...new Array<number>(missing).fill(0),
+    ...right.map((h) => Number.parseInt(h, 16))
+  ];
+}
+
+/**
+ * Returns true when `rawIp` falls inside loopback, private, link-local, CGNAT, multicast, or reserved ranges.
+ */
+export function isPrivateOrReservedIp(rawIp: string): boolean {
+  const cleaned = rawIp.trim().replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+  if (!cleaned) return true;
+
+  if (net.isIPv4(cleaned)) {
+    const octets = cleaned.split('.').map((part) => Number.parseInt(part, 10));
+    if (octets.length !== 4 || octets.some((o) => !Number.isFinite(o) || o < 0 || o > 255)) {
+      return true;
+    }
+    const [a, b] = octets;
+    if (a === 0) return true; // 0.0.0.0/8 ("this network")
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 (CGNAT)
+    if (a === 127) return true; // 127.0.0.0/8 (loopback)
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16 (link-local & cloud metadata)
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 (benchmarking)
+    if (a >= 224) return true; // multicast / reserved / broadcast
+    return false;
+  }
+
+  if (net.isIPv6(cleaned)) {
+    const words = parseIpv6Words(cleaned);
+    if (!words || words.some((w) => !Number.isFinite(w))) {
+      return true;
+    }
+    const prefixZero6 = words.slice(0, 6).every((w) => w === 0);
+    if (prefixZero6 && words[6] === 0 && (words[7] === 0 || words[7] === 1)) {
+      return true; // :: and ::1
+    }
+    const isV4Mapped = words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff;
+    const isV4Compat = prefixZero6 && (words[6] !== 0 || words[7] > 1);
+    if (isV4Mapped || isV4Compat) {
+      const v4 = `${words[6] >>> 8}.${words[6] & 0xff}.${words[7] >>> 8}.${words[7] & 0xff}`;
+      return isPrivateOrReservedIp(v4);
+    }
+    if ((words[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 (unique local)
+    if ((words[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 (link-local)
+    if ((words[0] & 0xff00) === 0xff00) return true; // ff00::/8 (multicast)
+    return false;
+  }
+
+  return true;
+}
+
+async function assertSafeRemoteUrl(targetUrl: URL): Promise<void> {
+  if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
+    throw new MediaResolutionError(400, `Unsupported media URL protocol: ${targetUrl.protocol}`);
+  }
+  if (targetUrl.username || targetUrl.password) {
+    throw new MediaResolutionError(400, 'Media URL must not include embedded credentials');
+  }
+
+  const host = targetUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host) {
+    throw new MediaResolutionError(400, 'Media URL hostname is empty');
+  }
+  if (host === 'localhost' || host.endsWith('.localhost') || host === 'metadata.google.internal') {
+    throw new MediaResolutionError(403, 'Access denied: remote media URL points to a restricted internal host');
+  }
+
+  if (net.isIP(host)) {
+    if (isPrivateOrReservedIp(host)) {
+      throw new MediaResolutionError(
+        403,
+        'Access denied: remote media URL resolves to a private, loopback, or link-local address'
+      );
+    }
+    return;
+  }
+
+  let records: dns.LookupAddress[];
+  try {
+    records = await dns.promises.lookup(host, { all: true, verbatim: true });
+  } catch (err: unknown) {
+    throw new MediaResolutionError(
+      502,
+      `Could not resolve remote media host "${host}": ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (!records.length) {
+    throw new MediaResolutionError(502, `Could not resolve remote media host "${host}"`);
+  }
+  if (records.some((record) => isPrivateOrReservedIp(record.address))) {
+    throw new MediaResolutionError(
+      403,
+      'Access denied: remote media URL resolves to a private, loopback, or link-local address'
+    );
+  }
 }
 
 function isInsideDirectory(rootDir: string, candidatePath: string): boolean {
@@ -113,6 +244,7 @@ export async function resolveMediaInput(
 ): Promise<ResolvedMedia> {
   const maxBytes = opts.maxBytes ?? config.maxMediaBytes;
   const timeoutMs = opts.timeoutMs ?? config.mediaFetchTimeoutMs;
+  const allowPrivateNetwork = opts.allowPrivateNetwork ?? config.allowPrivateMediaUrls;
   const allowedDir = path.resolve(opts.allowedDir ?? config.allowedMediaDir);
 
   if (Buffer.isBuffer(input)) {
@@ -130,30 +262,66 @@ export async function resolveMediaInput(
     throw new MediaResolutionError(400, 'Media input string is empty');
   }
 
-  // 1. Remote HTTP / HTTPS URL (bounded timeout & byte ceiling)
+  // 1. Remote HTTP / HTTPS URL (SSRF-checked per hop, bounded timeout & byte ceiling)
   if (/^https?:\/\//i.test(str)) {
-    let parsedUrl: URL;
+    let currentUrl: URL;
     try {
-      parsedUrl = new URL(str);
+      currentUrl = new URL(str);
     } catch {
       throw new MediaResolutionError(400, `Invalid media URL: "${str.slice(0, 80)}"`);
     }
 
+    const deadline = Date.now() + timeoutMs;
     try {
-      const res = await fetch(parsedUrl, { signal: AbortSignal.timeout(timeoutMs) });
-      if (!res.ok) {
-        throw new MediaResolutionError(502, `Failed to download media from ${parsedUrl.toString()} (HTTP ${res.status})`);
+      let res: Response | null = null;
+      for (let hop = 0; hop <= MAX_REMOTE_REDIRECTS; hop++) {
+        if (!allowPrivateNetwork) {
+          await assertSafeRemoteUrl(currentUrl);
+        }
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new MediaResolutionError(502, `Timed out downloading media from ${currentUrl.toString()} after ${timeoutMs}ms`);
+        }
+        res = await fetch(currentUrl, {
+          redirect: 'manual',
+          signal: AbortSignal.timeout(remainingMs)
+        });
+
+        if (res.status >= 300 && res.status < 400) {
+          const location = res.headers.get('location');
+          await res.body?.cancel();
+          if (!location) {
+            throw new MediaResolutionError(502, `Redirect from ${currentUrl.toString()} (HTTP ${res.status}) missing Location header`);
+          }
+          if (hop === MAX_REMOTE_REDIRECTS) {
+            throw new MediaResolutionError(502, 'Too many redirects while downloading media');
+          }
+          try {
+            currentUrl = new URL(location, currentUrl);
+          } catch {
+            throw new MediaResolutionError(400, `Invalid redirect URL while downloading media`);
+          }
+          continue;
+        }
+        break;
       }
 
-      const buffer = await readStreamWithLimit(res, maxBytes, parsedUrl.toString());
+      if (!res) {
+        throw new MediaResolutionError(502, `Failed to download media from ${currentUrl.toString()}`);
+      }
+      if (!res.ok) {
+        throw new MediaResolutionError(502, `Failed to download media from ${currentUrl.toString()} (HTTP ${res.status})`);
+      }
+
+      const buffer = await readStreamWithLimit(res, maxBytes, currentUrl.toString());
       if (buffer.length === 0) {
-        throw new MediaResolutionError(502, `Remote media from ${parsedUrl.toString()} was empty`);
+        throw new MediaResolutionError(502, `Remote media from ${currentUrl.toString()} was empty`);
       }
 
       const rawContentType = res.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
       const mimetype = rawContentType && rawContentType.includes('/') ? rawContentType : undefined;
 
-      const rawBase = path.posix.basename(parsedUrl.pathname);
+      const rawBase = path.posix.basename(currentUrl.pathname);
       let fileName: string | undefined;
       if (rawBase && rawBase !== '/') {
         try {
@@ -169,11 +337,11 @@ export async function resolveMediaInput(
         throw err;
       }
       if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
-        throw new MediaResolutionError(502, `Timed out downloading media from ${parsedUrl.toString()} after ${timeoutMs}ms`);
+        throw new MediaResolutionError(502, `Timed out downloading media from ${currentUrl.toString()} after ${timeoutMs}ms`);
       }
       throw new MediaResolutionError(
         502,
-        `Failed to download media from ${parsedUrl.toString()}: ${err instanceof Error ? err.message : String(err)}`
+        `Failed to download media from ${currentUrl.toString()}: ${err instanceof Error ? err.message : String(err)}`
       );
     }
   }

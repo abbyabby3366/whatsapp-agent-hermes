@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { isPlaceholderSecret } from '../formatting.js';
+import { expandHomePath, isPlaceholderSecret } from '../formatting.js';
 
 export interface ReceiverConfig {
   host: string;
@@ -38,6 +38,7 @@ export interface ReceiverConfig {
   splitMessageDelaySeconds: number;
   maxMessagesPerTurn: number;
   maxMediaBytes: number;
+  mediaRetentionHours: number;
   dryRun: boolean;
 }
 
@@ -48,11 +49,11 @@ export function defaultReceiverDir(): string {
 export function resolveEnvFileCandidates(explicitPath?: string): string[] {
   const candidates: string[] = [];
   if (explicitPath?.trim()) {
-    candidates.push(path.resolve(explicitPath.trim()));
+    candidates.push(path.resolve(expandHomePath(explicitPath)));
   }
   const fromEnv = process.env.RECEIVER_ENV_FILE?.trim();
   if (fromEnv) {
-    candidates.push(path.resolve(fromEnv));
+    candidates.push(path.resolve(expandHomePath(fromEnv)));
   }
   candidates.push(path.resolve(process.cwd(), 'receiver.env'));
   candidates.push(path.join(defaultReceiverDir(), 'receiver.env'));
@@ -111,7 +112,9 @@ function parseDtype(raw: string | undefined): ReceiverConfig['whisperDtype'] {
 }
 
 export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): ReceiverConfig {
-  const dataDir = path.resolve(overrides.dataDir ?? (process.env.RECEIVER_DATA_DIR?.trim() || defaultReceiverDir()));
+  const dataDir = path.resolve(
+    expandHomePath(overrides.dataDir ?? (process.env.RECEIVER_DATA_DIR?.trim() || defaultReceiverDir()))
+  );
   const timezone = (overrides.timezone ?? process.env.TIMEZONE?.trim()) || 'Asia/Kuala_Lumpur';
   try {
     new Intl.DateTimeFormat('en-GB', { timeZone: timezone });
@@ -123,12 +126,19 @@ export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): Re
   const masterPhoneRaw = overrides.masterPhone ?? (process.env.MASTER_PHONE?.trim() || process.env.OWNER_WHATSAPP?.trim() || '');
   const masterLidRaw = overrides.masterLid ?? (process.env.MASTER_LID?.trim() || '');
   const repoAssetsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'skill', 'assets');
+  const rawHermesBin = overrides.hermesBin ?? (process.env.HERMES_BIN?.trim() || 'hermes');
+  const hermesBin =
+    rawHermesBin === '~' || rawHermesBin.startsWith('~/') || rawHermesBin.startsWith('~\\')
+      ? path.resolve(expandHomePath(rawHermesBin))
+      : rawHermesBin;
 
   return {
     host: overrides.host ?? (process.env.RECEIVER_HOST?.trim() || '127.0.0.1'),
     port: overrides.port ?? parseNumberEnv('RECEIVER_PORT', 5000, true),
     dataDir,
-    mediaDir: overrides.mediaDir ?? (process.env.RECEIVER_MEDIA_DIR?.trim() || path.join(dataDir, 'media')),
+    mediaDir: path.resolve(
+      expandHomePath(overrides.mediaDir ?? (process.env.RECEIVER_MEDIA_DIR?.trim() || path.join(dataDir, 'media')))
+    ),
     gatewayUrl: (overrides.gatewayUrl ?? (process.env.WHATSAPP_GATEWAY_URL?.trim() || 'http://127.0.0.1:3100')).replace(/\/+$/, ''),
     gatewayApiKey: overrides.gatewayApiKey ?? (process.env.GATEWAY_API_KEY?.trim() || ''),
     hermesSecretToken: overrides.hermesSecretToken ?? (process.env.HERMES_SECRET_TOKEN?.trim() || ''),
@@ -139,9 +149,16 @@ export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): Re
     timezone,
     whisperModel: overrides.whisperModel ?? resolveWhisperModelId(process.env.WHISPER_MODEL),
     whisperDtype: overrides.whisperDtype ?? parseDtype(process.env.WHISPER_DTYPE),
-    whisperCacheDir: overrides.whisperCacheDir ?? (process.env.WHISPER_CACHE_DIR?.trim() || path.join(dataDir, 'models')),
-    hermesBin: overrides.hermesBin ?? (process.env.HERMES_BIN?.trim() || 'hermes'),
-    rulesPath: overrides.rulesPath ?? (process.env.HERMES_RULES_PATH?.trim() || path.join(os.homedir(), '.hermes', 'skills', 'whatsapp-agent-rules', 'SKILL.md')),
+    whisperCacheDir: path.resolve(
+      expandHomePath(overrides.whisperCacheDir ?? (process.env.WHISPER_CACHE_DIR?.trim() || path.join(dataDir, 'models')))
+    ),
+    hermesBin,
+    rulesPath: path.resolve(
+      expandHomePath(
+        overrides.rulesPath ??
+          (process.env.HERMES_RULES_PATH?.trim() || path.join(os.homedir(), '.hermes', 'skills', 'whatsapp-agent-rules', 'SKILL.md'))
+      )
+    ),
     repoAssetsDir: overrides.repoAssetsDir ?? repoAssetsDir,
     toolsetsContact: overrides.toolsetsContact ?? (process.env.AGENT_TOOLSETS?.trim() || 'web,vision'),
     toolsetsOwner: overrides.toolsetsOwner ?? (process.env.AGENT_TOOLSETS_OWNER?.trim() || 'terminal,file,web,vision'),
@@ -157,6 +174,7 @@ export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): Re
     splitMessageDelaySeconds: overrides.splitMessageDelaySeconds ?? parseNumberEnv('SPLIT_MESSAGE_DELAY_SECONDS', 2.0, true),
     maxMessagesPerTurn: Math.max(1, Math.floor(overrides.maxMessagesPerTurn ?? parseNumberEnv('MAX_MESSAGES_PER_TURN', 5))),
     maxMediaBytes: Math.floor(overrides.maxMediaBytes ?? parseNumberEnv('MAX_MEDIA_BYTES', 25 * 1024 * 1024)),
+    mediaRetentionHours: overrides.mediaRetentionHours ?? parseNumberEnv('MEDIA_RETENTION_HOURS', 48, true),
     dryRun: overrides.dryRun ?? parseBoolEnv('DRY_RUN', false)
   };
 }

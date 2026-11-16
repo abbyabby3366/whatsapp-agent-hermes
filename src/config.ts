@@ -2,6 +2,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import {
+  expandHomePath,
   formatDateTimeParts as formatDateTimePartsForZone,
   getDateTimeFormatter,
   isPlaceholderSecret
@@ -63,7 +64,7 @@ const allowedSendersFromEnv = (name: string, defaultCountryCode: string): string
 };
 
 const defaultCountryCode = (process.env.DEFAULT_COUNTRY_CODE ?? '60').replace(/[^0-9]/g, '');
-const dataDir = process.env.DATA_DIR || './data';
+const dataDir = expandHomePath(process.env.DATA_DIR?.trim() || './data');
 const timezone = process.env.TIMEZONE?.trim() || 'Asia/Kuala_Lumpur';
 
 try {
@@ -86,7 +87,7 @@ export const config = {
   port: intFromEnv('PORT', 3100),
   /** Loopback by default: Hermes runs on the same server, so nothing else needs to reach the gateway. */
   host: process.env.HOST?.trim() || '127.0.0.1',
-  sessionsDir: process.env.SESSIONS_DIR || './sessions',
+  sessionsDir: expandHomePath(process.env.SESSIONS_DIR?.trim() || './sessions'),
   dataDir,
   /** Optional key protecting /api/* (except /api/health). Send as "Authorization: Bearer <key>" or "x-api-key". */
   apiKey,
@@ -98,7 +99,8 @@ export const config = {
   webhookRetries: intFromEnv('HERMES_WEBHOOK_RETRIES', 2),
   webhookConcurrency: Math.max(1, intFromEnv('WEBHOOK_CONCURRENCY', 8)),
   /** Directory allowlisted for local file paths passed to outbound media APIs. */
-  allowedMediaDir: path.resolve(process.env.ALLOWED_MEDIA_DIR?.trim() || path.join(dataDir, 'media')),
+  allowedMediaDir: path.resolve(expandHomePath(process.env.ALLOWED_MEDIA_DIR?.trim() || path.join(dataDir, 'media'))),
+  allowPrivateMediaUrls: boolFromEnv('ALLOW_PRIVATE_MEDIA_URLS', false),
   maxMediaBytes: positiveIntFromEnv('MAX_MEDIA_BYTES', 25 * 1024 * 1024),
   mediaFetchTimeoutMs: positiveIntFromEnv('MEDIA_FETCH_TIMEOUT_MS', 15000),
   /** Digits only. A number starting with 0 gets this country code instead (e.g. 60 for Malaysia). Empty disables. */
