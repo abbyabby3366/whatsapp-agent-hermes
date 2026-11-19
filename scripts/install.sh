@@ -260,60 +260,31 @@ const writeEnvAtomic = (targetPath, pairs, preservedFromOld) => {
   fs.renameSync(tmpPath, targetPath);
 };
 
-writeEnvAtomic(
-  gwEnvPath,
-  [
-    ['PORT', gatewayPort],
-    ['HOST', pickNonEmpty(oldGw.get('HOST'), '127.0.0.1')],
-    ['GATEWAY_API_KEY', gatewayApiKey],
-    ['TIMEZONE', timezone],
-    ['AGENT_WEBHOOK_URL', pickNonEmpty(oldGw.get('AGENT_WEBHOOK_URL'), `http://127.0.0.1:${receiverPort}/api/webhook`)],
-    ['AGENT_SECRET_TOKEN', agentSecretToken],
-    ['DEFAULT_COUNTRY_CODE', countryCode],
-    ['MASTER_PHONE', masterPhone],
-    ['MASTER_LID', masterLid],
-    ['MASTER_NAME', masterName]
-  ],
-  oldGw
-);
+const gwPairs = [
+  ['GATEWAY_API_KEY', gatewayApiKey],
+  ['AGENT_WEBHOOK_URL', pickNonEmpty(oldGw.get('AGENT_WEBHOOK_URL'), `http://127.0.0.1:${receiverPort}/api/webhook`)],
+  ['AGENT_SECRET_TOKEN', agentSecretToken]
+];
+if (timezone !== 'Asia/Kuala_Lumpur') gwPairs.push(['TIMEZONE', timezone]);
+if (countryCode && countryCode !== '60') gwPairs.push(['DEFAULT_COUNTRY_CODE', countryCode]);
 
-writeEnvAtomic(
-  rxEnvPath,
-  [
-    ['RECEIVER_HOST', pickNonEmpty(oldRx.get('RECEIVER_HOST'), '127.0.0.1')],
-    ['RECEIVER_PORT', receiverPort],
-    ['RECEIVER_DATA_DIR', receiverDir],
-    ['WHATSAPP_GATEWAY_URL', pickNonEmpty(oldRx.get('WHATSAPP_GATEWAY_URL'), `http://127.0.0.1:${gatewayPort}`)],
-    ['GATEWAY_API_KEY', gatewayApiKey],
-    ['AGENT_SECRET_TOKEN', agentSecretToken],
-    ['MASTER_PHONE', masterPhone],
-    ['MASTER_LID', masterLid],
-    ['MASTER_NAME', masterName],
-    ['DEFAULT_COUNTRY_CODE', countryCode],
-    ['TIMEZONE', timezone],
-    ['WHISPER_MODEL', pickNonEmpty(oldRx.get('WHISPER_MODEL'), 'base')],
-    ['WHISPER_DTYPE', pickNonEmpty(oldRx.get('WHISPER_DTYPE'), 'q8')],
-    ['WHISPER_CACHE_DIR', pickNonEmpty(oldRx.get('WHISPER_CACHE_DIR'), path.join(receiverDir, 'models'))],
-    ['AGENT_BIN', pickNonEmpty(oldRx.get('AGENT_BIN'), agentBinPath)],
-    ['AGENT_RULES_PATH', pickNonEmpty(oldRx.get('AGENT_RULES_PATH'), path.join(process.env.HOME || '', '.whatsapp-ai-agent', 'skills', 'whatsapp-agent-rules', 'SKILL.md'))],
-    ['AGENT_TOOLSETS', pickNonEmpty(oldRx.get('AGENT_TOOLSETS'), 'web,vision')],
-    ['AGENT_TOOLSETS_OWNER', pickNonEmpty(oldRx.get('AGENT_TOOLSETS_OWNER'), 'terminal,file,web,vision')],
-    ['AGENT_TIMEOUT_SECONDS', pickNonEmpty(oldRx.get('AGENT_TIMEOUT_SECONDS'), '300')],
-    ['COALESCE_WINDOW_SECONDS', pickNonEmpty(oldRx.get('COALESCE_WINDOW_SECONDS'), '2.5')],
-    ['MAX_CONCURRENT_RUNS', pickNonEmpty(oldRx.get('MAX_CONCURRENT_RUNS'), '4')],
-    ['DRAIN_SECONDS', pickNonEmpty(oldRx.get('DRAIN_SECONDS'), '120')],
-    ['STARTUP_REPLAY', pickNonEmpty(oldRx.get('STARTUP_REPLAY'), 'true')],
-    ['REPLAY_MAX_AGE_MIN', pickNonEmpty(oldRx.get('REPLAY_MAX_AGE_MIN'), '60')],
-    ['HISTORY_LIMIT', pickNonEmpty(oldRx.get('HISTORY_LIMIT'), '30')],
-    ['DAILY_REPLY_LIMIT_PER_PERSON', pickNonEmpty(oldRx.get('DAILY_REPLY_LIMIT_PER_PERSON'), '25')],
-    ['HOURLY_GLOBAL_REPLY_LIMIT', pickNonEmpty(oldRx.get('HOURLY_GLOBAL_REPLY_LIMIT'), '60')],
-    ['SPLIT_MESSAGE_DELAY_SECONDS', pickNonEmpty(oldRx.get('SPLIT_MESSAGE_DELAY_SECONDS'), '2.0')],
-    ['MAX_MESSAGES_PER_TURN', pickNonEmpty(oldRx.get('MAX_MESSAGES_PER_TURN'), '5')],
-    ['MAX_MEDIA_BYTES', pickNonEmpty(oldRx.get('MAX_MEDIA_BYTES'), '26214400')],
-    ['DRY_RUN', pickNonEmpty(oldRx.get('DRY_RUN'), 'false')]
-  ],
-  oldRx
-);
+writeEnvAtomic(gwEnvPath, gwPairs, oldGw);
+
+const rxPairs = [
+  ['GATEWAY_API_KEY', gatewayApiKey],
+  ['AGENT_SECRET_TOKEN', agentSecretToken],
+  ['MASTER_PHONE', masterPhone],
+  ['MASTER_NAME', masterName],
+  ['AGENT_BIN', pickNonEmpty(oldRx.get('AGENT_BIN'), agentBinPath)]
+];
+if (masterLid) rxPairs.push(['MASTER_LID', masterLid]);
+if (receiverDir !== path.join(process.env.HOME || '', 'whatsapp-ai-agent-receiver')) {
+  rxPairs.push(['RECEIVER_DATA_DIR', receiverDir]);
+}
+if (timezone !== 'Asia/Kuala_Lumpur') rxPairs.push(['TIMEZONE', timezone]);
+if (countryCode && countryCode !== '60') rxPairs.push(['DEFAULT_COUNTRY_CODE', countryCode]);
+
+writeEnvAtomic(rxEnvPath, rxPairs, oldRx);
 
 console.log(`[install] Wrote chmod 600 configs: ${gwEnvPath} and ${rxEnvPath}`);
 NODE
@@ -337,10 +308,9 @@ mkdir -p \
   "${SKILLS_DIR}/whatsapp-agent-rules" \
   "${HOME}/.local/bin"
 
-cp "${REPO_DIR}/wa-agent-SKILL.md" "${SKILLS_DIR}/whatsapp-ai-agent-gateway/SKILL.md"
-cp -r "${REPO_DIR}/skill/." "${SKILLS_DIR}/whatsapp-ai-agent-gateway/"
+cp -r "${REPO_DIR}/skill/whatsapp-ai-agent-gateway/." "${SKILLS_DIR}/whatsapp-ai-agent-gateway/"
 chmod +x "${SKILLS_DIR}/whatsapp-ai-agent-gateway/scripts/fetch-pairing-qr.sh"
-cp "${REPO_DIR}/skill-crafter-SKILL.md" "${SKILLS_DIR}/skill-crafter/SKILL.md"
+cp "${REPO_DIR}/skill/skill-crafter/SKILL.md" "${SKILLS_DIR}/skill-crafter/SKILL.md"
 
 RULES_SKILL_FILE="${SKILLS_DIR}/whatsapp-agent-rules/SKILL.md"
 if [[ ! -f "${RULES_SKILL_FILE}" ]]; then
@@ -365,10 +335,10 @@ else
 fi
 
 if [[ ! -f "${RECEIVER_DIR}/prompt_template.txt" ]]; then
-  cp "${REPO_DIR}/skill/assets/prompt_template.txt" "${RECEIVER_DIR}/prompt_template.txt"
+  cp "${REPO_DIR}/skill/whatsapp-ai-agent-gateway/assets/prompt_template.txt" "${RECEIVER_DIR}/prompt_template.txt"
 fi
 if [[ ! -f "${RECEIVER_DIR}/prompt_template_owner.txt" ]]; then
-  cp "${REPO_DIR}/skill/assets/prompt_template_owner.txt" "${RECEIVER_DIR}/prompt_template_owner.txt"
+  cp "${REPO_DIR}/skill/whatsapp-ai-agent-gateway/assets/prompt_template_owner.txt" "${RECEIVER_DIR}/prompt_template_owner.txt"
 fi
 
 cp "${REPO_DIR}/scripts/fetch-pairing-qr.sh" "${RECEIVER_DIR}/get-qr.sh"
@@ -454,9 +424,9 @@ systemctl --user daemon-reload
 systemctl --user enable whatsapp-ai-agent.service wa-agent-receiver.service
 systemctl --user restart whatsapp-ai-agent.service wa-agent-receiver.service
 
-GATEWAY_PORT="$(grep -E '^PORT=' "${REPO_DIR}/.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r")"
-GATEWAY_API_KEY_VAL="$(grep -E '^GATEWAY_API_KEY=' "${REPO_DIR}/.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r")"
-RECEIVER_PORT_VAL="$(grep -E '^RECEIVER_PORT=' "${RECEIVER_DIR}/receiver.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r")"
+GATEWAY_PORT="$(grep -E '^PORT=' "${REPO_DIR}/.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r" || true)"
+GATEWAY_API_KEY_VAL="$(grep -E '^GATEWAY_API_KEY=' "${REPO_DIR}/.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r" || true)"
+RECEIVER_PORT_VAL="$(grep -E '^RECEIVER_PORT=' "${RECEIVER_DIR}/receiver.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r" || true)"
 GW_BASE="http://127.0.0.1:${GATEWAY_PORT:-3100}"
 RX_BASE="http://127.0.0.1:${RECEIVER_PORT_VAL:-5000}"
 

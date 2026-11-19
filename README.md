@@ -8,23 +8,54 @@ A Baileys WhatsApp gateway **and** built-in Node webhook receiver that connects 
 
 Built on Express + the Baileys fork [`github:JonathanChuahE-Jay/Baileys`](https://github.com/JonathanChuahE-Jay/Baileys).
 
-## One-Command Server Install (Production)
+---
 
+## Install with an AI Agent (Autonomous Server Setup)
+
+> If you are an AI agent asked to install this repository on a Linux server, follow Steps 0–3 below directly.
+
+### Step 0: Ask for Master Identity Only (No LLM or Transcription API Keys)
+**Immediately ask the user for:**
+1. **Master Phone Number** (`MASTER_PHONE`): Personal WhatsApp number with country code, digits only (e.g. `60123456789`). Used for `@@FLAG@@` escalations, 1:1 Master DM command authority, and urgent alerts.
+2. **Master Operator Name** (`MASTER_NAME`): Their real name (e.g. `Alex`, `Desmond`) so replies speak in the first person ("I", "my") without exposing bots.
+
+- **Zero external API keys**: Voice notes transcribe locally via built-in Node ONNX Whisper (`onnx-community/whisper-base`, CPU `q8` — zero Python, zero `.venv`, zero API keys). Replies run via this host's configured AI Agent runner (`AGENT_BIN` in `receiver.env`) ONLY. Never ask for Gemini, OpenAI, OpenRouter, Anthropic, or other provider keys unless the user explicitly configures an external LLM runner.
+- Wait for `MASTER_PHONE` and `MASTER_NAME` before running the installer.
+
+### Step 1: Clone/Update & Run the One-Command Installer
 Requires **Node.js `>= 22.5.0`** and `npm`:
 
 ```bash
-git clone https://github.com/abbyabby3366/whatsapp-agent-hermes.git ~/whatsapp-ai-agent
-cd ~/whatsapp-ai-agent
-bash scripts/install.sh --master-phone 60123456789 --master-name "Alex"
+cd ~
+if [ -d ~/whatsapp-ai-agent ]; then
+  cd ~/whatsapp-ai-agent && git pull
+else
+  git clone https://github.com/abbyabby3366/whatsapp-agent-hermes.git ~/whatsapp-ai-agent
+  cd ~/whatsapp-ai-agent
+fi
+
+bash scripts/install.sh --master-phone "<MASTER_PHONE>" --master-name "<MASTER_NAME>"
 ```
 
-This idempotently generates `chmod 600` `.env` & `~/whatsapp-ai-agent-receiver/receiver.env`, builds `dist/`, installs global skills (`~/.whatsapp-ai-agent/skills/`), creates `~/.local/bin/{wa-send,wa-history,wa-flow,wa-qr}`, pre-warms ONNX Whisper, configures & starts both `systemd --user` services (`whatsapp-ai-agent` + `wa-agent-receiver`), and verifies health, `401` auth lock, and webhook ping.
+`scripts/install.sh` automatically verifies `node >= 22.5.0` & `npm`, generates `chmod 600` `.env` and `~/whatsapp-ai-agent-receiver/receiver.env` (preserving any existing non-placeholder secrets & learned rules), runs `npm ci && npm run typecheck && npm run build`, installs `~/.whatsapp-ai-agent/skills/` and `~/.local/bin/{wa-send,wa-history,wa-flow,wa-qr}`, pre-warms ONNX Whisper, enables `systemd --user` lingering, starts `whatsapp-ai-agent.service` (`:3100`) and `wa-agent-receiver.service` (`:5000`), verifies `401` auth lock on `:3100/api/status`, and tests `POST /api/webhook/test`.
 
-Pair WhatsApp via PNG export or the dashboard:
+Read `~/.whatsapp-ai-agent/skills/whatsapp-ai-agent-gateway/SKILL.md` and `~/.whatsapp-ai-agent/skills/skill-crafter/SKILL.md` to confirm operational commands and rule persistence.
 
-```bash
-~/.local/bin/wa-qr /tmp/wa-qr.png
-```
+### Step 2: Pair WhatsApp
+Run either:
+- `~/.local/bin/wa-qr /tmp/wa-qr.png` (or `bash ~/whatsapp-ai-agent/scripts/fetch-pairing-qr.sh /tmp/wa-qr.png`) and send `/tmp/wa-qr.png` to the user to scan, **OR**
+- Instruct the user to open `http://localhost:3100` over SSH (`ssh -L 3100:127.0.0.1:3100 user@server`), paste `GATEWAY_API_KEY` from `~/whatsapp-ai-agent/.env`, and scan the QR code (**WhatsApp -> Linked devices -> Link a device**).
+
+### Step 3: Verify Connected & Notify `MASTER_PHONE` Live
+1. Confirm `"whatsapp":"connected"`: `curl -s http://127.0.0.1:3100/api/health`
+2. Leave automated replies **ON and live** immediately (never enable a `[DRAFT APPROVAL]` queue).
+3. Send live setup confirmation to `MASTER_PHONE`:
+   ```bash
+   ~/.local/bin/wa-send text "<MASTER_PHONE>" "WhatsApp AI Agent setup complete. Live auto-reply is active."
+   ```
+   *(If WhatsApp returns HTTP 502 / Error 463 because no prior thread exists with `MASTER_PHONE`, do NOT retry in a loop — just confirm completion to the user here.)*
+
+---
 
 ## Quick Local Dev Start
 
@@ -62,7 +93,7 @@ wa-flow contacts | show <key> | open <key> "<item>" | close <key> "<item>" | fac
 
 ## Configuration (`.env` & `receiver.env`)
 
-See [`.env.example`](.env.example) for gateway settings, [`receiver.env.example`](receiver.env.example) for built-in receiver settings, and [`skill/references/deployment-and-env.md`](skill/references/deployment-and-env.md) for the full tunables table:
+See [`.env.example`](.env.example) for gateway settings, [`receiver.env.example`](receiver.env.example) for built-in receiver settings, and [`skill/whatsapp-ai-agent-gateway/references/deployment-and-env.md`](skill/whatsapp-ai-agent-gateway/references/deployment-and-env.md) for the full tunables table:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -138,4 +169,8 @@ All endpoints are on `http://127.0.0.1:3100`. Add `x-api-key: <GATEWAY_API_KEY>`
 
 Errors always come back as JSON `{ "success": false, "error": "..." }` with a matching HTTP status (400 bad input, 404 not on WhatsApp, 503 not connected).
 
-See [AI_AGENT_INSTALL_PROMPT.md](AI_AGENT_INSTALL_PROMPT.md) for the streamlined installation prompt, [wa-agent-SKILL.md](wa-agent-SKILL.md) (plus companion templates/references in [`skill/`](skill/)) for the operational AI Agent skill, [skill-crafter-SKILL.md](skill-crafter-SKILL.md) for the single-file global skill-persistence meta-skill, and [examples/ai_agent_demo.ts](examples/ai_agent_demo.ts) for a working Node.js demo receiver.
+## Skills & Demo
+
+- Operational gateway skill: [`skill/whatsapp-ai-agent-gateway/SKILL.md`](skill/whatsapp-ai-agent-gateway/SKILL.md) (with prompt templates, contracts, and references in [`skill/whatsapp-ai-agent-gateway/`](skill/whatsapp-ai-agent-gateway/))
+- Single-file skill-persistence meta-skill: [`skill/skill-crafter/SKILL.md`](skill/skill-crafter/SKILL.md)
+- Minimal Node.js demo webhook receiver: [`examples/ai_agent_demo.ts`](examples/ai_agent_demo.ts)

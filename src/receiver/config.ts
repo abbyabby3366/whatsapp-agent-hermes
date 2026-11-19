@@ -125,7 +125,14 @@ export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): Re
   const defaultCountryCode = (overrides.defaultCountryCode ?? process.env.DEFAULT_COUNTRY_CODE ?? '60').replace(/[^0-9]/g, '');
   const masterPhoneRaw = overrides.masterPhone ?? (process.env.MASTER_PHONE?.trim() || process.env.OWNER_WHATSAPP?.trim() || '');
   const masterLidRaw = overrides.masterLid ?? (process.env.MASTER_LID?.trim() || '');
-  const repoAssetsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'skill', 'assets');
+  const repoAssetsDir = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '..',
+    '..',
+    'skill',
+    'whatsapp-ai-agent-gateway',
+    'assets'
+  );
   const rawAgentBin = overrides.agentBin ?? (process.env.AGENT_BIN?.trim() || 'agent');
   const agentBin =
     rawAgentBin === '~' || rawAgentBin.startsWith('~/') || rawAgentBin.startsWith('~\\')
