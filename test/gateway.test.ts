@@ -155,7 +155,7 @@ describe('Sticker WebP EXIF & size ceiling', () => {
       .png()
       .toBuffer();
 
-    const stickerBuf = await prepareSticker(png, { pack: 'Hermes Pack', author: 'Agent' });
+    const stickerBuf = await prepareSticker(png, { pack: 'AI Agent Pack', author: 'AI Agent' });
     assert.equal(stickerBuf.subarray(0, 4).toString('ascii'), 'RIFF');
     assert.equal(stickerBuf.subarray(8, 12).toString('ascii'), 'WEBP');
     assert.equal(stickerBuf.subarray(12, 16).toString('ascii'), 'VP8X');

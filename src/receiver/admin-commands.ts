@@ -56,7 +56,7 @@ export function parseDurationMs(token: string | undefined): number | undefined {
 
 /**
  * Evaluates verified 1:1 Master DM control commands (`status`, `on`, `off`, `pause`, `resume`).
- * Returns formatted WhatsApp response string if handled as a command, or `null` to pass to Hermes.
+ * Returns formatted WhatsApp response string if handled as a command, or `null` to pass to the AI Agent.
  */
 export async function handleMasterAdminCommand(
   rawText: string,

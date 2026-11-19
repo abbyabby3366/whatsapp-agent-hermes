@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import type { ReceiverConfig } from './config.js';
 
-export interface RunHermesOptions {
+export interface RunAgentOptions {
   prompt: string;
   toolsets: string;
   sessionId?: string;
@@ -10,7 +10,7 @@ export interface RunHermesOptions {
   spawnImpl?: typeof spawn;
 }
 
-export interface RunHermesResult {
+export interface RunAgentResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
@@ -23,11 +23,11 @@ export interface RunHermesResult {
 const SESSION_ID_RE = /session_id:\s*([A-Za-z0-9_.:-]+)/i;
 const PROXY_AUTH_ERROR_RE = /\b(401|402|403|429)\b|unauthoriz|insufficient|budget|quota/i;
 
-export function buildHermesChildEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function buildAgentChildEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   // Deny-list ONLY receiver-only secrets so host AI proxy auth/config variables pass through intact.
   const childEnv: NodeJS.ProcessEnv = { ...baseEnv };
   delete childEnv.GATEWAY_API_KEY;
-  delete childEnv.HERMES_SECRET_TOKEN;
+  delete childEnv.AGENT_SECRET_TOKEN;
   return childEnv;
 }
 
@@ -48,10 +48,10 @@ function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-export function spawnHermesOnce(
-  cfg: Pick<ReceiverConfig, 'hermesBin' | 'dataDir' | 'agentTimeoutSeconds'>,
-  opts: RunHermesOptions
-): Promise<RunHermesResult> {
+export function spawnAgentOnce(
+  cfg: Pick<ReceiverConfig, 'agentBin' | 'dataDir' | 'agentTimeoutSeconds'>,
+  opts: RunAgentOptions
+): Promise<RunAgentResult> {
   return new Promise((resolve) => {
     const args = ['chat', '-Q', '--toolsets', opts.toolsets];
     if (opts.sessionId) {
@@ -70,9 +70,9 @@ export function spawnHermesOnce(
     let hardKillTimer: NodeJS.Timeout | undefined;
 
     const spawner = opts.spawnImpl ?? spawn;
-    const child = spawner(cfg.hermesBin, args, {
+    const child = spawner(cfg.agentBin, args, {
       cwd: cfg.dataDir,
-      env: buildHermesChildEnv(),
+      env: buildAgentChildEnv(),
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -130,11 +130,11 @@ export function spawnHermesOnce(
   });
 }
 
-export async function runHermesWithSessionFallback(
-  cfg: Pick<ReceiverConfig, 'hermesBin' | 'dataDir' | 'agentTimeoutSeconds'>,
-  opts: RunHermesOptions & { onStaleSession?: () => void }
-): Promise<RunHermesResult> {
-  const first = await spawnHermesOnce(cfg, opts);
+export async function runAgentWithSessionFallback(
+  cfg: Pick<ReceiverConfig, 'agentBin' | 'dataDir' | 'agentTimeoutSeconds'>,
+  opts: RunAgentOptions & { onStaleSession?: () => void }
+): Promise<RunAgentResult> {
+  const first = await spawnAgentOnce(cfg, opts);
   if (
     opts.sessionId &&
     !first.superseded &&
@@ -144,7 +144,7 @@ export async function runHermesWithSessionFallback(
     !first.stdout.trim()
   ) {
     opts.onStaleSession?.();
-    return spawnHermesOnce(cfg, { ...opts, sessionId: undefined });
+    return spawnAgentOnce(cfg, { ...opts, sessionId: undefined });
   }
   return first;
 }

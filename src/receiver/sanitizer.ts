@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { formatWhatsAppText } from '../formatting.js';
 
-export type ParsedHermesOutput =
+export type ParsedAgentOutput =
   | { kind: 'no-answer'; flags: []; chunks: [] }
   | { kind: 'silent'; flags: string[]; chunks: [] }
   | { kind: 'reply'; flags: string[]; chunks: string[] };
@@ -170,13 +170,13 @@ export function sanitizeReply(text: string): string {
 }
 
 /**
- * Parses `hermes chat -Q` stdout in strict order:
+ * Parses AI Agent CLI stdout in strict order:
  * 1) Empty stdout -> `no-answer` (eligible for startup replay)
  * 2) Extract & strip `@@FLAG@@` lines first
  * 3) Evaluate `NO_REPLY` (or empty body when flags were extracted) -> `silent`
  * 4) Split on `===MSG===`, sanitize each chunk, drop empty chunks, cap at `maxMessagesPerTurn`
  */
-export function parseHermesOutput(rawStdout: string, maxMessagesPerTurn = 5): ParsedHermesOutput {
+export function parseAgentOutput(rawStdout: string, maxMessagesPerTurn = 5): ParsedAgentOutput {
   if (!rawStdout || !rawStdout.trim()) {
     return { kind: 'no-answer', flags: [], chunks: [] };
   }

@@ -422,7 +422,7 @@ export class HandledLedger {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Hermes Session Store (sessions.json)
+// 3. AI Agent Session Store (sessions.json)
 // ---------------------------------------------------------------------------
 
 export class SessionStore {

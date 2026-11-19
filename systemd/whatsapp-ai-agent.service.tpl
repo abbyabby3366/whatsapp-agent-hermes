@@ -1,5 +1,5 @@
 [Unit]
-Description=WhatsApp Agent Hermes Gateway (Baileys)
+Description=WhatsApp AI Agent Gateway (Baileys)
 After=network-online.target
 Wants=network-online.target
 

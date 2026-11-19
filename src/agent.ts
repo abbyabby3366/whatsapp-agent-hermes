@@ -1,16 +1,16 @@
 import { config } from './config.js';
 
-export interface HermesResult {
+export interface AgentWebhookResult {
   ok: boolean;
   status: number;
   latencyMs: number;
   attempts: number;
   bodyText: string;
-  /** Parsed JSON body, or null when Hermes answered with something that is not a JSON object. */
+  /** Parsed JSON body, or null when the AI Agent answered with something that is not a JSON object. */
   json: Record<string, unknown> | null;
 }
 
-const MAX_HERMES_RESPONSE_BYTES = 64 * 1024;
+const MAX_AGENT_RESPONSE_BYTES = 64 * 1024;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -70,23 +70,23 @@ async function readBoundedText(res: Response, maxBytes: number): Promise<string>
 }
 
 /**
- * POSTs a payload to the Hermes webhook. Network errors, timeouts, HTTP 429 and 5xx are retried
+ * POSTs a payload to the AI Agent webhook. Network errors, timeouts, HTTP 429 and 5xx are retried
  * with a short back-off; other 4xx responses are returned immediately. Throws if every attempt
  * failed at the network level.
  */
-export async function postToHermes(
+export async function postToAgent(
   payload: unknown,
   opts: { retries?: number; timeoutMs?: number } = {}
-): Promise<HermesResult> {
+): Promise<AgentWebhookResult> {
   if (!config.webhookUrl) {
-    throw new Error('HERMES_WEBHOOK_URL is not configured');
+    throw new Error('AGENT_WEBHOOK_URL is not configured');
   }
 
   const retries = opts.retries ?? config.webhookRetries;
   const timeoutMs = opts.timeoutMs ?? config.webhookTimeoutMs;
   const messageId = extractMessageId(payload);
   const baseHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (config.webhookToken) baseHeaders['x-hermes-token'] = config.webhookToken;
+  if (config.webhookToken) baseHeaders['x-agent-token'] = config.webhookToken;
   if (messageId) baseHeaders['Idempotency-Key'] = messageId;
   const body = JSON.stringify(payload);
 
@@ -97,10 +97,10 @@ export async function postToHermes(
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let retryDelayMs = 1000 * attempt + Math.floor(Math.random() * 250);
     try {
-      const headers = { ...baseHeaders, 'X-Hermes-Attempt': String(attempt) };
+      const headers = { ...baseHeaders, 'X-Agent-Attempt': String(attempt) };
       const res = await fetch(config.webhookUrl, { method: 'POST', headers, body, signal: controller.signal });
-      const bodyText = await readBoundedText(res, MAX_HERMES_RESPONSE_BYTES);
-      const result: HermesResult = {
+      const bodyText = await readBoundedText(res, MAX_AGENT_RESPONSE_BYTES);
+      const result: AgentWebhookResult = {
         ok: res.ok,
         status: res.status,
         latencyMs: Date.now() - started,

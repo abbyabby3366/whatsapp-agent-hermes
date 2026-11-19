@@ -20,13 +20,13 @@ import {
 } from '../src/receiver/config.js';
 import { GatewayClient } from '../src/receiver/gateway-client.js';
 import {
-  buildHermesChildEnv,
-  runHermesWithSessionFallback,
-  spawnHermesOnce,
-  type RunHermesOptions
-} from '../src/receiver/hermes-runner.js';
+  buildAgentChildEnv,
+  runAgentWithSessionFallback,
+  spawnAgentOnce,
+  type RunAgentOptions
+} from '../src/receiver/agent-runner.js';
 import { HistoryStore } from '../src/receiver/history.js';
-import { cleanUntrusted, loadContactRules, parseHermesOutput, sanitizeReply } from '../src/receiver/sanitizer.js';
+import { cleanUntrusted, loadContactRules, parseAgentOutput, sanitizeReply } from '../src/receiver/sanitizer.js';
 import { createReceiverServer } from '../src/receiver/server.js';
 import {
   ChatMapStore,
@@ -114,7 +114,7 @@ describe('Receiver sanitizer & per-contact rules extraction', () => {
       '@@FLAG@@ Client asked for custom discount'
     ].join('\n');
 
-    const parsed = parseHermesOutput(raw, 5);
+    const parsed = parseAgentOutput(raw, 5);
     assert.equal(parsed.kind, 'reply');
     assert.deepEqual(parsed.flags, ['Client asked for custom discount']);
     assert.equal(parsed.chunks.length, 5);
@@ -124,21 +124,21 @@ describe('Receiver sanitizer & per-contact rules extraction', () => {
     assert.equal(parsed.chunks[0].includes('To: @alex_tan'), false);
     assert.equal(parsed.chunks[4], 'part5\n\npart6 overflow');
 
-    const silentWithFlag = parseHermesOutput('NO_REPLY\n@@FLAG@@ Urgent legal dispute');
+    const silentWithFlag = parseAgentOutput('NO_REPLY\n@@FLAG@@ Urgent legal dispute');
     assert.deepEqual(silentWithFlag, {
       kind: 'silent',
       flags: ['Urgent legal dispute'],
       chunks: []
     });
 
-    const flagOnly = parseHermesOutput('@@FLAG@@ Manual callback needed');
+    const flagOnly = parseAgentOutput('@@FLAG@@ Manual callback needed');
     assert.deepEqual(flagOnly, {
       kind: 'silent',
       flags: ['Manual callback needed'],
       chunks: []
     });
 
-    assert.equal(parseHermesOutput('   \n  ').kind, 'no-answer');
+    assert.equal(parseAgentOutput('   \n  ').kind, 'no-answer');
     assert.equal(sanitizeReply('Assistant: **Done**'), '*Done*');
     assert.equal(sanitizeReply('@@TO@@ @alex_tan\nTo: @alex_tan\nReply: **Ready**'), '*Ready*');
   });
@@ -154,7 +154,7 @@ describe('Receiver config validation, stores, identity promotion & CLIs', () => 
     const badCfg = buildReceiverConfig({
       dataDir: dir,
       gatewayApiKey: 'change-me-to-a-long-random-api-key',
-      hermesSecretToken: 'valid-secret-token-12345',
+      agentSecretToken: 'valid-secret-token-12345',
       masterPhone: '60111222333',
       masterName: 'Alex'
     });
@@ -163,7 +163,7 @@ describe('Receiver config validation, stores, identity promotion & CLIs', () => 
     const okCfg = buildReceiverConfig({
       dataDir: dir,
       gatewayApiKey: 'real-gateway-key-98765',
-      hermesSecretToken: 'real-hermes-secret-98765',
+      agentSecretToken: 'real-agent-secret-98765',
       masterPhone: '60111222333',
       masterName: 'Alex'
     });
@@ -278,24 +278,24 @@ describe('Receiver config validation, stores, identity promotion & CLIs', () => 
   });
 });
 
-describe('Hermes subprocess runner & secret deny-list', () => {
-  it('strips GATEWAY_API_KEY and HERMES_SECRET_TOKEN while preserving AI proxy env and retrying stale sessions', async () => {
-    const cleanEnv = buildHermesChildEnv({
+describe('AI Agent subprocess runner & secret deny-list', () => {
+  it('strips GATEWAY_API_KEY and AGENT_SECRET_TOKEN while preserving AI proxy env and retrying stale sessions', async () => {
+    const cleanEnv = buildAgentChildEnv({
       PATH: '/usr/bin',
       AI_PROXY_TOKEN: 'keep-proxy-token',
       GATEWAY_API_KEY: 'must-strip-gw',
-      HERMES_SECRET_TOKEN: 'must-strip-hook'
+      AGENT_SECRET_TOKEN: 'must-strip-hook'
     });
     assert.equal(cleanEnv.GATEWAY_API_KEY, undefined);
-    assert.equal(cleanEnv.HERMES_SECRET_TOKEN, undefined);
+    assert.equal(cleanEnv.AGENT_SECRET_TOKEN, undefined);
     assert.equal(cleanEnv.AI_PROXY_TOKEN, 'keep-proxy-token');
     assert.equal(cleanEnv.PATH, '/usr/bin');
 
     const prevGw = process.env.GATEWAY_API_KEY;
-    const prevHook = process.env.HERMES_SECRET_TOKEN;
+    const prevHook = process.env.AGENT_SECRET_TOKEN;
     const prevProxy = process.env.AI_PROXY_TOKEN;
     process.env.GATEWAY_API_KEY = 'secret-gw';
-    process.env.HERMES_SECRET_TOKEN = 'secret-hook';
+    process.env.AGENT_SECRET_TOKEN = 'secret-hook';
     process.env.AI_PROXY_TOKEN = 'proxy-ok';
 
     const workDir = makeTempDir('wa-runner-');
@@ -331,8 +331,8 @@ describe('Hermes subprocess runner & secret deny-list', () => {
 
     try {
       let cleared = false;
-      const res = await runHermesWithSessionFallback(
-        { hermesBin: 'hermes', dataDir: workDir, agentTimeoutSeconds: 10 },
+      const res = await runAgentWithSessionFallback(
+        { agentBin: 'agent', dataDir: workDir, agentTimeoutSeconds: 10 },
         {
           prompt: 'Hi there',
           toolsets: 'web,vision',
@@ -360,7 +360,7 @@ describe('Hermes subprocess runner & secret deny-list', () => {
         'Hi there'
       ]);
       assert.equal(calls[0].env?.GATEWAY_API_KEY, undefined);
-      assert.equal(calls[0].env?.HERMES_SECRET_TOKEN, undefined);
+      assert.equal(calls[0].env?.AGENT_SECRET_TOKEN, undefined);
       assert.equal(calls[0].env?.AI_PROXY_TOKEN, 'proxy-ok');
       assert.equal(calls[1].args.includes('--resume'), false);
       assert.equal(res.sessionId, 'fresh_sess_42');
@@ -368,26 +368,26 @@ describe('Hermes subprocess runner & secret deny-list', () => {
     } finally {
       if (prevGw === undefined) delete process.env.GATEWAY_API_KEY;
       else process.env.GATEWAY_API_KEY = prevGw;
-      if (prevHook === undefined) delete process.env.HERMES_SECRET_TOKEN;
-      else process.env.HERMES_SECRET_TOKEN = prevHook;
+      if (prevHook === undefined) delete process.env.AGENT_SECRET_TOKEN;
+      else process.env.AGENT_SECRET_TOKEN = prevHook;
       if (prevProxy === undefined) delete process.env.AI_PROXY_TOKEN;
       else process.env.AI_PROXY_TOKEN = prevProxy;
     }
 
     if (process.platform !== 'win32') {
-      const binPath = path.join(workDir, 'fake-hermes');
+      const binPath = path.join(workDir, 'fake-agent');
       fs.writeFileSync(
         binPath,
         [
           `#!${process.execPath}`,
-          `if (process.env.GATEWAY_API_KEY || process.env.HERMES_SECRET_TOKEN) process.exit(2);`,
+          `if (process.env.GATEWAY_API_KEY || process.env.AGENT_SECRET_TOKEN) process.exit(2);`,
           `process.stderr.write('session_id: posix_sess_1\\n');`,
           `process.stdout.write('POSIX OK\\n');`
         ].join('\n'),
         { mode: 0o755 }
       );
-      const posixRes = await spawnHermesOnce(
-        { hermesBin: binPath, dataDir: workDir, agentTimeoutSeconds: 10 },
+      const posixRes = await spawnAgentOnce(
+        { agentBin: binPath, dataDir: workDir, agentTimeoutSeconds: 10 },
         { prompt: 'ping', toolsets: 'web,vision' }
       );
       assert.equal(posixRes.exitCode, 0);
@@ -465,18 +465,18 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
     assert.ok(gwAddr && typeof gwAddr === 'object');
     const gatewayUrl = `http://127.0.0.1:${gwAddr.port}`;
 
-    const hermesCalls: Array<{ toolsets: string; prompt: string; aborted: boolean }> = [];
+    const agentCalls: Array<{ toolsets: string; prompt: string; aborted: boolean }> = [];
     let firstTurnStartedResolve: (() => void) | null = null;
     const firstTurnStarted = new Promise<void>((resolve) => {
       firstTurnStartedResolve = resolve;
     });
 
-    const fakeRunHermes = async (
+    const fakeRunAgent = async (
       _cfg: unknown,
-      opts: RunHermesOptions & { onStaleSession?: () => void }
+      opts: RunAgentOptions & { onStaleSession?: () => void }
     ) => {
       const entry = { toolsets: opts.toolsets, prompt: opts.prompt, aborted: false };
-      hermesCalls.push(entry);
+      agentCalls.push(entry);
 
       const turnIdx = opts.prompt.lastIndexOf('[New Inbound Turn');
       const masterIdx = opts.prompt.lastIndexOf('[Master DM Turn');
@@ -552,7 +552,7 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       mediaDir: path.join(workDir, 'media'),
       gatewayUrl,
       gatewayApiKey: 'test-gw-key-12345',
-      hermesSecretToken: 'test-hook-secret-12345',
+      agentSecretToken: 'test-hook-secret-12345',
       masterPhone: '60190000001',
       masterName: 'Desmond',
       rulesPath: rulesFile,
@@ -562,7 +562,7 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
 
     const runtime = createReceiverServer(cfg, {
       transcribeAudio: async () => '[voice note | engine: whisper-onnx | lang: en | transcript: "Please send invoice"]',
-      runHermes: fakeRunHermes
+      runAgent: fakeRunAgent
     });
     const rxServer = await runtime.start();
     const rxAddr = rxServer.address();
@@ -572,7 +572,7 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
     const postWebhook = (body: Record<string, unknown>, token = 'test-hook-secret-12345') =>
       fetch(`${receiverUrl}/api/webhook`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-hermes-token': token },
+        headers: { 'Content-Type': 'application/json', 'x-agent-token': token },
         body: JSON.stringify(body)
       });
 
@@ -624,9 +624,9 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       });
       await runtime.waitForIdle();
 
-      assert.equal(hermesCalls[0].aborted, true);
-      assert.ok(hermesCalls[1].prompt.includes('first burst msg'));
-      assert.ok(hermesCalls[1].prompt.includes('second supersede msg'));
+      assert.equal(agentCalls[0].aborted, true);
+      assert.ok(agentCalls[1].prompt.includes('first burst msg'));
+      assert.ok(agentCalls[1].prompt.includes('second supersede msg'));
 
       const callSeq = gatewayCalls.map((c) => `${c.url}:${String(c.body?.to ?? c.body?.recipient ?? c.body?.presence ?? '')}`);
       const flagIdx = gatewayCalls.findIndex((c) => c.url === '/api/send' && String(c.body?.message).startsWith('[FLAG]'));
@@ -648,7 +648,7 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
 
       // 3. Voice note -> calls mock transcribeAudio (no real Whisper)
       gatewayCalls.length = 0;
-      hermesCalls.length = 0;
+      agentCalls.length = 0;
       await postWebhook({
         event: 'message.received',
         messageId: 'voice_m1',
@@ -663,11 +663,11 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       });
       await runtime.waitForIdle();
       assert.ok(gatewayCalls.some((c) => c.url === '/api/media/voice_m1'));
-      assert.ok(hermesCalls[0].prompt.includes('Please send invoice'));
+      assert.ok(agentCalls[0].prompt.includes('Please send invoice'));
 
       // 4. NO_REPLY -> zero /api/read, zero /api/send
       gatewayCalls.length = 0;
-      hermesCalls.length = 0;
+      agentCalls.length = 0;
       await postWebhook({
         event: 'message.received',
         messageId: 'silent_m1',
@@ -682,7 +682,7 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       assert.equal(runtime.stores.handled.has('silent_m1'), true);
 
       // 5. Master 1:1 DM quote-reply elevates toolsets & injects escalation context; group DM stays sandboxed
-      hermesCalls.length = 0;
+      agentCalls.length = 0;
       await postWebhook({
         event: 'message.received',
         messageId: 'master_dm_quote',
@@ -706,10 +706,10 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       });
       await runtime.waitForIdle();
 
-      assert.equal(hermesCalls[0].toolsets, cfg.toolsetsOwner);
-      assert.ok(hermesCalls[0].prompt.includes('[Quoted Escalation Context]'));
+      assert.equal(agentCalls[0].toolsets, cfg.toolsetsOwner);
+      assert.ok(agentCalls[0].prompt.includes('[Quoted Escalation Context]'));
       assert.equal(runtime.stores.runtimeState.getMasterLid(), '999888777666555');
-      assert.equal(hermesCalls[1].toolsets, cfg.toolsetsContact);
+      assert.equal(agentCalls[1].toolsets, cfg.toolsetsContact);
 
       // 6. Master DM admin commands: status, off, pause, on, resume
       gatewayCalls.length = 0;
@@ -730,7 +730,7 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       assert.equal(runtime.stores.runtimeState.isContactPaused('60123456789').paused, false);
 
       // 7. Orphan replay
-      hermesCalls.length = 0;
+      agentCalls.length = 0;
       gatewayCalls.length = 0;
       runtime.stores.history.recordInbound({
         chatKey: '60123456789',
@@ -745,12 +745,12 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       const replayed = await runtime.replayOrphans();
       await runtime.waitForIdle();
       assert.equal(replayed, 1);
-      assert.ok(hermesCalls[0].prompt.includes('Missed during crash'));
+      assert.ok(agentCalls[0].prompt.includes('Missed during crash'));
       assert.ok(gatewayCalls.some((c) => c.url === '/api/send' && c.body?.message === 'Acknowledged!'));
 
       // 8. runWaSend local file data URI encoding outside ALLOWED_MEDIA_DIR + live cross-process sync
       gatewayCalls.length = 0;
-      hermesCalls.length = 0;
+      agentCalls.length = 0;
       const docPath = path.join(mediaOutsideDir, 'report.pdf');
       fs.writeFileSync(docPath, Buffer.from('%PDF-1.4\n%fake'));
       const cliExit = await runWaSend(['doc', '--name=custom-report.pdf', '@new_lead', docPath, 'Monthly PDF'], {
@@ -777,8 +777,8 @@ describe('Receiver end-to-end integration with mock Gateway & wa-send CLI', () =
       });
       await runtime.waitForIdle();
       assert.equal(runtime.stores.chatMap.resolveKey('777888999000111@lid').chatKey, '@new_lead');
-      assert.ok(hermesCalls[0].prompt.includes('[Earlier Conversation History'));
-      assert.ok(hermesCalls[0].prompt.includes('[document sent: custom-report.pdf] Monthly PDF'));
+      assert.ok(agentCalls[0].prompt.includes('[Earlier Conversation History'));
+      assert.ok(agentCalls[0].prompt.includes('[document sent: custom-report.pdf] Monthly PDF'));
     } finally {
       await runtime.shutdown();
       await new Promise<void>((resolve) => mockGateway.close(() => resolve()));
@@ -791,19 +791,19 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
     const savedEnv = {
       RECEIVER_DATA_DIR: process.env.RECEIVER_DATA_DIR,
       WHISPER_CACHE_DIR: process.env.WHISPER_CACHE_DIR,
-      HERMES_RULES_PATH: process.env.HERMES_RULES_PATH,
-      HERMES_BIN: process.env.HERMES_BIN
+      AGENT_RULES_PATH: process.env.AGENT_RULES_PATH,
+      AGENT_BIN: process.env.AGENT_BIN
     };
     process.env.RECEIVER_DATA_DIR = '~/rx-data-test';
     process.env.WHISPER_CACHE_DIR = '~/rx-models-test';
-    process.env.HERMES_RULES_PATH = '~/.hermes/skills/test-rules/SKILL.md';
-    process.env.HERMES_BIN = '~/bin/hermes';
+    process.env.AGENT_RULES_PATH = '~/.whatsapp-ai-agent/skills/test-rules/SKILL.md';
+    process.env.AGENT_BIN = '~/bin/agent';
     try {
       const cfg = buildReceiverConfig();
       assert.equal(cfg.dataDir, path.join(os.homedir(), 'rx-data-test'));
       assert.equal(cfg.whisperCacheDir, path.join(os.homedir(), 'rx-models-test'));
-      assert.equal(cfg.rulesPath, path.join(os.homedir(), '.hermes', 'skills', 'test-rules', 'SKILL.md'));
-      assert.equal(cfg.hermesBin, path.join(os.homedir(), 'bin', 'hermes'));
+      assert.equal(cfg.rulesPath, path.join(os.homedir(), '.whatsapp-ai-agent', 'skills', 'test-rules', 'SKILL.md'));
+      assert.equal(cfg.agentBin, path.join(os.homedir(), 'bin', 'agent'));
     } finally {
       for (const [k, v] of Object.entries(savedEnv)) {
         if (v === undefined) delete process.env[k];
@@ -889,7 +889,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
 
     let concurrentOverlapDetected = false;
     const activeByPromptTag = new Set<string>();
-    const hermesCalls: Array<{ prompt: string; sessionId?: string; aborted: boolean }> = [];
+    const agentCalls: Array<{ prompt: string; sessionId?: string; aborted: boolean }> = [];
     let holdSignalTurnStarted: (() => void) | null = null;
     let holdWaitPromise = new Promise<void>((resolve) => {
       holdSignalTurnStarted = resolve;
@@ -900,9 +900,9 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       });
     };
 
-    const fakeRunHermes = async (_cfg: unknown, opts: RunHermesOptions) => {
+    const fakeRunAgent = async (_cfg: unknown, opts: RunAgentOptions) => {
       const entry = { prompt: opts.prompt, sessionId: opts.sessionId, aborted: false };
-      hermesCalls.push(entry);
+      agentCalls.push(entry);
 
       const turnIdx = opts.prompt.lastIndexOf('[New Inbound Turn');
       const masterIdx = opts.prompt.lastIndexOf('[Master DM Turn');
@@ -967,7 +967,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       mediaDir,
       gatewayUrl: `http://127.0.0.1:${gwPort}`,
       gatewayApiKey: 'key-12345',
-      hermesSecretToken: 'hook-12345',
+      agentSecretToken: 'hook-12345',
       masterPhone: '60190000001',
       masterName: 'Desmond',
       coalesceWindowSeconds: 0.04,
@@ -977,14 +977,14 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
 
     const runtime = createReceiverServer(cfg, {
       transcribeAudio: async () => '[voice note | engine: whisper-onnx | transcript: "Voice cleanup check"]',
-      runHermes: fakeRunHermes
+      runAgent: fakeRunAgent
     });
     const srv = await runtime.start();
     const rxPort = (srv.address() as { port: number }).port;
     const postHook = (body: Record<string, unknown>) =>
       fetch(`http://127.0.0.1:${rxPort}/api/webhook`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-hermes-token': 'hook-12345' },
+        headers: { 'Content-Type': 'application/json', 'x-agent-token': 'hook-12345' },
         body: JSON.stringify(body)
       });
 
@@ -1026,7 +1026,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       assert.ok(sentPayloads.some((p) => p.url === '/api/send' && String(p.body.message).includes('*WhatsApp Agent Status*')));
 
       // 3. Mid-turn identity promotion migrates queue so Run 1 aborts and merges cleanly under phone key
-      hermesCalls.length = 0;
+      agentCalls.length = 0;
       await postHook({
         event: 'message.received',
         messageId: 'promo_m1',
@@ -1050,15 +1050,15 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       });
       await runtime.waitForIdle();
 
-      assert.equal(hermesCalls[0].aborted, true);
-      assert.ok(hermesCalls[1].prompt.includes('anon lid first'));
-      assert.ok(hermesCalls[1].prompt.includes('revealed phone second'));
+      assert.equal(agentCalls[0].aborted, true);
+      assert.ok(agentCalls[1].prompt.includes('anon lid first'));
+      assert.ok(agentCalls[1].prompt.includes('revealed phone second'));
       assert.equal(runtime.stores.sessions.get('60166665555'), 'sess_promoted_1');
       assert.equal(runtime.stores.sessions.get('555666777888999'), undefined);
 
       // 4. Manual phone takeover aborts active AI draft, prevents bot reply, and preserves manual reply in history
       armHoldSignal();
-      hermesCalls.length = 0;
+      agentCalls.length = 0;
       sentPayloads.length = 0;
       await postHook({
         event: 'message.received',
@@ -1085,7 +1085,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       assert.deepEqual(await echoRes.json(), { reply: null, recorded: true });
       await runtime.waitForIdle();
 
-      assert.equal(hermesCalls[0].aborted, true);
+      assert.equal(agentCalls[0].aborted, true);
       assert.equal(sentPayloads.filter((p) => p.url === '/api/send').length, 0);
       assert.equal(runtime.stores.handled.has('takeover_in_1'), true);
 
@@ -1100,7 +1100,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
         rawTimestamp: Math.floor(Date.now() / 1000)
       });
       await runtime.waitForIdle();
-      const followUpPrompt = hermesCalls[hermesCalls.length - 1].prompt;
+      const followUpPrompt = agentCalls[agentCalls.length - 1].prompt;
       assert.ok(followUpPrompt.includes('Got it, calling you now!'));
 
       // 5. Multiple coalesce windows arriving while an active turn is finishing never overlap for the same chat
@@ -1142,7 +1142,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
     }
   });
 
-  it('queues unsent split chunks on partial HTTP 503 failure and flushes them on replayOrphans without re-running Hermes', async () => {
+  it('queues unsent split chunks on partial HTTP 503 failure and flushes them on replayOrphans without re-running AI Agent', async () => {
     const workDir = makeTempDir('wa-split-recover-');
     const cfg = buildReceiverConfig({
       host: '127.0.0.1',
@@ -1150,7 +1150,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       dataDir: workDir,
       gatewayUrl: 'http://127.0.0.1:1',
       gatewayApiKey: 'key-12345',
-      hermesSecretToken: 'hook-12345',
+      agentSecretToken: 'hook-12345',
       masterPhone: '60190000001',
       masterName: 'Desmond',
       coalesceWindowSeconds: 0.02,
@@ -1178,11 +1178,11 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       }
     }
 
-    let hermesRuns = 0;
+    let agentRuns = 0;
     const runtime = createReceiverServer(cfg, {
       gateway: new StubGatewayClient(cfg),
-      runHermes: async () => {
-        hermesRuns += 1;
+      runAgent: async () => {
+        agentRuns += 1;
         return {
           stdout: 'Part one===MSG===Part two',
           stderr: 'session_id: sess_split_1\n',
@@ -1201,7 +1201,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       const nowSec = Math.floor(Date.now() / 1000);
       await fetch(`http://127.0.0.1:${rxPort}/api/webhook`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-hermes-token': 'hook-12345' },
+        headers: { 'Content-Type': 'application/json', 'x-agent-token': 'hook-12345' },
         body: JSON.stringify({
           event: 'message.received',
           messageId: 'split_m1',
@@ -1214,7 +1214,7 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       });
       await fetch(`http://127.0.0.1:${rxPort}/api/webhook`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-hermes-token': 'hook-12345' },
+        headers: { 'Content-Type': 'application/json', 'x-agent-token': 'hook-12345' },
         body: JSON.stringify({
           event: 'message.received',
           messageId: 'split_m2',
@@ -1227,20 +1227,20 @@ describe('Receiver hardening: tilde paths, pause aliases, takeover, queue migrat
       });
       await runtime.waitForIdle();
 
-      assert.equal(hermesRuns, 1);
+      assert.equal(agentRuns, 1);
       assert.equal(runtime.stores.handled.has('split_m1'), true);
       assert.equal(runtime.stores.handled.has('split_m2'), true);
       const alertCall = deliveredTexts.find((d) => d.to === '60190000001' && d.message.startsWith('[Alert]'));
       assert.ok(alertCall);
       assert.equal(alertCall.retryOn503, false);
 
-      // Reconnect gateway and run replayOrphans(): must send ONLY Part two without re-running Hermes or re-sending Part one
+      // Reconnect gateway and run replayOrphans(): must send ONLY Part two without re-running AI Agent or re-sending Part one
       failChunk2 = false;
       deliveredTexts.length = 0;
       const replayed = await runtime.replayOrphans();
       await runtime.waitForIdle();
       assert.equal(replayed, 1);
-      assert.equal(hermesRuns, 1);
+      assert.equal(agentRuns, 1);
       assert.deepEqual(
         deliveredTexts.map((d) => d.message),
         ['Part two']

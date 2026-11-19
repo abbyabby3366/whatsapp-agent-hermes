@@ -81,22 +81,22 @@ export function formatDateTimeParts(
 }
 
 const apiKey = process.env.GATEWAY_API_KEY?.trim() || '';
-const webhookToken = process.env.HERMES_SECRET_TOKEN || '';
+const webhookToken = process.env.AGENT_SECRET_TOKEN || '';
 
 export const config = {
   port: intFromEnv('PORT', 3100),
-  /** Loopback by default: Hermes runs on the same server, so nothing else needs to reach the gateway. */
+  /** Loopback by default: the AI Agent runs on the same server, so nothing else needs to reach the gateway. */
   host: process.env.HOST?.trim() || '127.0.0.1',
   sessionsDir: expandHomePath(process.env.SESSIONS_DIR?.trim() || './sessions'),
   dataDir,
   /** Optional key protecting /api/* (except /api/health). Send as "Authorization: Bearer <key>" or "x-api-key". */
   apiKey,
   hasPlaceholderApiKey: Boolean(apiKey) && isPlaceholderSecret(apiKey),
-  webhookUrl: process.env.HERMES_WEBHOOK_URL?.trim() || '',
+  webhookUrl: process.env.AGENT_WEBHOOK_URL?.trim() || '',
   webhookToken,
   hasPlaceholderWebhookToken: Boolean(webhookToken) && isPlaceholderSecret(webhookToken),
-  webhookTimeoutMs: intFromEnv('HERMES_WEBHOOK_TIMEOUT_MS', 15000),
-  webhookRetries: intFromEnv('HERMES_WEBHOOK_RETRIES', 2),
+  webhookTimeoutMs: intFromEnv('AGENT_WEBHOOK_TIMEOUT_MS', 15000),
+  webhookRetries: intFromEnv('AGENT_WEBHOOK_RETRIES', 2),
   webhookConcurrency: Math.max(1, intFromEnv('WEBHOOK_CONCURRENCY', 8)),
   /** Directory allowlisted for local file paths passed to outbound media APIs. */
   allowedMediaDir: path.resolve(expandHomePath(process.env.ALLOWED_MEDIA_DIR?.trim() || path.join(dataDir, 'media'))),
@@ -107,7 +107,7 @@ export const config = {
   defaultCountryCode,
   /**
    * Comma-separated phone numbers and/or @usernames (e.g. "60123456789, @alex_tan").
-   * When set, only these senders are forwarded to Hermes.
+   * When set, only these senders are forwarded to the AI Agent.
    */
   allowedNumbers: allowedSendersFromEnv('ALLOWED_NUMBERS', defaultCountryCode),
   forwardGroups: boolFromEnv('FORWARD_GROUPS', true),

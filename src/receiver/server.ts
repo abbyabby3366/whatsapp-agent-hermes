@@ -7,9 +7,9 @@ import { formatDateTimeParts } from '../formatting.js';
 import { handleMasterAdminCommand } from './admin-commands.js';
 import type { ReceiverConfig } from './config.js';
 import { GatewayClient } from './gateway-client.js';
-import { runHermesWithSessionFallback, type RunHermesOptions, type RunHermesResult } from './hermes-runner.js';
+import { runAgentWithSessionFallback, type RunAgentOptions, type RunAgentResult } from './agent-runner.js';
 import { HistoryStore } from './history.js';
-import { cleanUntrusted, loadContactRules, parseHermesOutput } from './sanitizer.js';
+import { cleanUntrusted, loadContactRules, parseAgentOutput } from './sanitizer.js';
 import {
   ChatMapStore,
   ContactsStore,
@@ -100,10 +100,10 @@ class ConcurrencySemaphore {
 export interface ReceiverDependencies {
   gateway?: GatewayClient;
   transcribeAudio?: (audioPath: string) => Promise<string>;
-  runHermes?: (
-    cfg: Pick<ReceiverConfig, 'hermesBin' | 'dataDir' | 'agentTimeoutSeconds'>,
-    opts: RunHermesOptions & { onStaleSession?: () => void }
-  ) => Promise<RunHermesResult>;
+  runAgent?: (
+    cfg: Pick<ReceiverConfig, 'agentBin' | 'dataDir' | 'agentTimeoutSeconds'>,
+    opts: RunAgentOptions & { onStaleSession?: () => void }
+  ) => Promise<RunAgentResult>;
 }
 
 export interface ReceiverRuntime {
@@ -156,7 +156,7 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
 
   const gateway = deps.gateway ?? new GatewayClient(cfg);
   const transcribeAudio = deps.transcribeAudio ?? ((audioPath: string) => transcribeWithLocalWhisper(audioPath, cfg));
-  const runHermes = deps.runHermes ?? runHermesWithSessionFallback;
+  const runAgent = deps.runAgent ?? runAgentWithSessionFallback;
 
   const semaphore = new ConcurrencySemaphore(cfg.maxConcurrentRuns);
   const chatQueues = new Map<string, ChatQueueState>();
@@ -172,12 +172,12 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
   app.use(express.json({ limit: '2mb' }));
 
   const verifyWebhookToken = (req: Request, res: Response, next: NextFunction): void => {
-    if (!cfg.hermesSecretToken) {
+    if (!cfg.agentSecretToken) {
       next();
       return;
     }
-    const provided = String(req.headers['x-hermes-token'] ?? '');
-    if (provided && crypto.timingSafeEqual(sha256(provided), sha256(cfg.hermesSecretToken))) {
+    const provided = String(req.headers['x-agent-token'] ?? '');
+    if (provided && crypto.timingSafeEqual(sha256(provided), sha256(cfg.agentSecretToken))) {
       next();
       return;
     }
@@ -850,7 +850,7 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
       const existingSessionId = sessions.get(chatKey);
       const imagePaths = Array.from(new Set(items.flatMap((i) => i.imagePaths)));
 
-      const result = await runHermes(cfg, {
+      const result = await runAgent(cfg, {
         prompt,
         toolsets,
         sessionId: existingSessionId,
@@ -889,15 +889,15 @@ export function createReceiverServer(cfg: ReceiverConfig, deps: ReceiverDependen
         if (now - lastProxyAlertMs > 15 * 60_000) {
           lastProxyAlertMs = now;
           await sendMasterAlert(
-            `[Alert] Hermes AI proxy rejected \`hermes chat -Q\` (exit=${result.exitCode}). Check host proxy credentials/budget.`
+            `[Alert] AI Agent proxy rejected \`${cfg.agentBin}\` (exit=${result.exitCode}). Check host proxy credentials/budget.`
           );
         }
       }
 
-      const parsed = parseHermesOutput(result.stdout, cfg.maxMessagesPerTurn);
+      const parsed = parseAgentOutput(result.stdout, cfg.maxMessagesPerTurn);
       if (parsed.kind === 'no-answer') {
         console.error(
-          `[Receiver] Empty/failed Hermes response for ${chatKey} (exit=${result.exitCode}, timedOut=${result.timedOut}): ${result.stderr.slice(0, 300)}`
+          `[Receiver] Empty/failed AI Agent response for ${chatKey} (exit=${result.exitCode}, timedOut=${result.timedOut}): ${result.stderr.slice(0, 300)}`
         );
         return; // Leave unledgered for replayOrphans()
       }

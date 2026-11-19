@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Requests a fresh WhatsApp pairing QR from whatsapp-agent-hermes and saves it as a PNG.
+# Requests a fresh WhatsApp pairing QR from whatsapp-ai-agent and saves it as a PNG.
 # Usage: bash fetch-pairing-qr.sh [output_png_path]
 
 set -euo pipefail
@@ -11,8 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_CANDIDATES=(
   "${RECEIVER_ENV_FILE:-}"
   "${SCRIPT_DIR}/../.env"
-  "${HOME}/whatsapp-agent-hermes/.env"
-  "${HOME}/whatsapp-hermes-receiver/receiver.env"
+  "${HOME}/whatsapp-ai-agent/.env"
+  "${HOME}/whatsapp-ai-agent-receiver/receiver.env"
   ".env"
 )
 
@@ -39,7 +39,7 @@ fi
 
 # Trigger connection if currently disconnected
 if ! curl -fsS -X POST "${GATEWAY_URL}/api/connect" "${AUTH_ARGS[@]}" -H "Content-Type: application/json" >/dev/null; then
-  echo "Failed to reach ${GATEWAY_URL}/api/connect (check that whatsapp-agent-hermes is running and GATEWAY_API_KEY matches)." >&2
+  echo "Failed to reach ${GATEWAY_URL}/api/connect (check that whatsapp-ai-agent is running and GATEWAY_API_KEY matches)." >&2
   exit 1
 fi
 

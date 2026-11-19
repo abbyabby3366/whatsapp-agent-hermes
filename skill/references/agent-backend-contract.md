@@ -1,6 +1,6 @@
-# Hermes Backend & Receiver Implementation Contract
+# AI Agent Backend & Receiver Implementation Contract
 
-This reference specifies the exact runtime invariants between the Node/Baileys gateway (`src/index.ts`, port `3100`), the built-in Node webhook receiver (`src/receiver/*`, port `5000`, state in `~/whatsapp-hermes-receiver/`), and the `hermes` CLI subprocess.
+This reference specifies the exact runtime invariants between the Node/Baileys gateway (`src/index.ts`, port `3100`), the built-in Node webhook receiver (`src/receiver/*`, port `5000`, state in `~/whatsapp-ai-agent-receiver/`), and the AI Agent runner (`src/receiver/agent-runner.ts`).
 
 ---
 
@@ -37,7 +37,7 @@ export function cleanUntrusted(value: string | null | undefined): string {
 }
 ```
 
-Operator context is injected **outside** the XML boundary (including hot-reloaded `## 2. Global Contact Reply Rules & Business Facts` and **only** the matching contact's `### <phone | @username | Name>` block under `## 3. Contact-Specific Rules` from `~/.hermes/skills/whatsapp-agent-rules/SKILL.md` via `loadContactRules()`, never exposing `## 1. Operator & Outbound Workflow Rules` or other contacts' `###` blocks), while inbound WhatsApp content is wrapped **inside** `<untrusted_inbound_message>`:
+Operator context is injected **outside** the XML boundary (including hot-reloaded `## 2. Global Contact Reply Rules & Business Facts` and **only** the matching contact's `### <phone | @username | Name>` block under `## 3. Contact-Specific Rules` from `~/.whatsapp-ai-agent/skills/whatsapp-agent-rules/SKILL.md` via `loadContactRules()`, never exposing `## 1. Operator & Outbound Workflow Rules` or other contacts' `###` blocks), while inbound WhatsApp content is wrapped **inside** `<untrusted_inbound_message>`:
 
 ```text
 [Trusted Operator Context]
@@ -65,15 +65,15 @@ messages (count=1):
 
 ---
 
-## 3. Hermes Subprocess Invocation & Stdout/Stderr Split (`src/receiver/hermes-runner.ts`)
+## 3. AI Agent Subprocess Invocation & Stdout/Stderr Split (`src/receiver/agent-runner.ts`)
 
-- Invoke `hermes chat -Q --toolsets <toolsets> [--resume <session_id>] [--image <local_path>] -q <prompt>` with `detached: true` (on POSIX) so superseding bursts cleanly terminate the entire child process group via `process.kill(-child.pid, 'SIGTERM')` (with 3s `SIGKILL` escalation).
-- **Brain = the box's own built-in AI proxy, ONLY**: `hermes chat -Q` uses whatever model/provider Hermes is already configured with on this host. Never ask the owner for an LLM / OpenAI / OpenRouter / Anthropic / provider API key, never add an alternate endpoint or model override, and never write LLM keys into any vault or `.env`.
-- **Subprocess Secret Hygiene (deny-list, NOT allow-list)**: `buildHermesChildEnv()` copies `process.env` and deletes **only** `GATEWAY_API_KEY` and `HERMES_SECRET_TOKEN`. Never build the child env from scratch or strip `HOME`, `PATH`, `XDG_*`, `*_BASE_URL`, or proxy credentials.
-- **AI proxy failure handling**: If `hermes chat -Q` fails with an auth/quota error (`401`/`402`/`403`/`429`, `unauthorized`, `budget`, `quota`), `server.ts` logs the failure and alerts `MASTER_PHONE` at most once per 15 minutes without asking for an API key.
+- Invoke `<AGENT_BIN> chat -Q --toolsets <toolsets> [--resume <session_id>] [--image <local_path>] -q <prompt>` with `detached: true` (on POSIX) so superseding bursts cleanly terminate the entire child process group via `process.kill(-child.pid, 'SIGTERM')` (with 3s `SIGKILL` escalation).
+- **Brain = the host's configured AI Agent runner**: `src/receiver/agent-runner.ts` delegates turns to the configured `AGENT_BIN` (or custom adapter).
+- **Subprocess Secret Hygiene (deny-list, NOT allow-list)**: `buildAgentChildEnv()` copies `process.env` and deletes **only** `GATEWAY_API_KEY` and `AGENT_SECRET_TOKEN`. Never build the child env from scratch or strip `HOME`, `PATH`, `XDG_*`, `*_BASE_URL`, or proxy credentials.
+- **AI proxy failure handling**: If the AI Agent runner fails with an auth/quota error (`401`/`402`/`403`/`429`, `unauthorized`, `budget`, `quota`), `server.ts` logs the failure and alerts `MASTER_PHONE` at most once per 15 minutes without asking for an API key.
 - **Stdout vs. Stderr Invariant**:
   - `stdout`: Raw assistant reply text only.
-  - `stderr`: Diagnostics and `session_id: <id>`. Parse `session_id` exclusively from `stderr` and persist in `sessions.json` keyed by canonical `chatKey`. If resuming a stale session fails with non-zero exit and empty stdout, `runHermesWithSessionFallback()` clears the stored session ID and retries once fresh.
+  - `stderr`: Diagnostics and `session_id: <id>`. Parse `session_id` exclusively from `stderr` and persist in `sessions.json` keyed by canonical `chatKey`. If resuming a stale session fails with non-zero exit and empty stdout, `runAgentWithSessionFallback()` clears the stored session ID and retries once fresh.
 
 ---
 
@@ -82,7 +82,7 @@ messages (count=1):
 - Download `.ogg` / `audio` payloads immediately via `GET /api/media/<messageId>` (with header `x-api-key: <GATEWAY_API_KEY>`) into `media/`.
 - **Transcription Engine (`src/receiver/transcribe.ts`)**:
   - Decodes arbitrary WhatsApp audio formats (`.ogg` Opus, `.m4a`, `.mp3`, `.wav`) in memory to 16 kHz mono `Float32Array` (`f32le` PCM) via bundled `ffmpeg-static`.
-  - Runs `@huggingface/transformers` (`automatic-speech-recognition` pipeline, default `onnx-community/whisper-base`, CPU `dtype: 'q8'`, cached persistently under `WHISPER_CACHE_DIR`, default `~/whatsapp-hermes-receiver/models`). Zero Python, zero `.venv`, zero API keys.
+  - Runs `@huggingface/transformers` (`automatic-speech-recognition` pipeline, default `onnx-community/whisper-base`, CPU `dtype: 'q8'`, cached persistently under `WHISPER_CACHE_DIR`, default `~/whatsapp-ai-agent-receiver/models`). Zero Python, zero `.venv`, zero API keys.
   - Mutex-serialized lazy singleton pipeline prevents OOM under concurrent voice bursts.
   - Injects `[voice note | engine: whisper-onnx | transcript: "..."]` (cleaned via `cleanUntrusted()`), or `[voice note | engine: whisper-onnx | quality: unclear | transcript: "(inaudible/muffled)"]` when speech is empty or noise-only (`[BLANK_AUDIO]`, `[Music]`, etc.).
 
@@ -90,7 +90,7 @@ messages (count=1):
 
 ## 5. Output Parsing Order (`@@FLAG@@`, `NO_REPLY`, `===MSG===`, `sanitizeReply`)
 
-Process raw `stdout` in `parseHermesOutput()` (`src/receiver/sanitizer.ts`):
+Process raw `stdout` in `parseAgentOutput()` (`src/receiver/sanitizer.ts`):
 
 1. **Empty Check**: If trimmed `rawStdout` is empty, treat as **`no-answer`** (process failure/timeout). Leave unledgered in `handled.json` so `replayOrphans()` can retry on restart.
 2. **Extract & Strip `@@FLAG@@` First**:

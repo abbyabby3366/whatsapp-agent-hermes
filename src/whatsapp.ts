@@ -36,19 +36,19 @@ import fs from 'fs';
 import path from 'path';
 import { config, formatDateTimeParts, loadSettings, saveSettings, type RuntimeSettings } from './config.js';
 import { formatWhatsAppText } from './formatting.js';
-import { postToHermes } from './hermes.js';
+import { postToAgent } from './agent.js';
 import { MediaResolutionError, resolveMediaInput } from './media.js';
 import { inferDocumentMimetype } from './mime.js';
 import { DebouncedJsonWriter } from './persistence.js';
 import { prepareSticker } from './sticker.js';
 
 export type WebhookStatus =
-  | 'forwarded' // delivery to Hermes in progress
-  | 'processing' // Hermes acknowledged and will reply later through /api/send
+  | 'forwarded' // delivery to AI Agent in progress
+  | 'processing' // AI Agent acknowledged and will reply later through /api/send
   | 'replied'
-  | 'ignored' // Hermes chose not to reply
+  | 'ignored' // AI Agent chose not to reply
   | 'failed'
-  | 'disabled' // no HERMES_WEBHOOK_URL configured
+  | 'disabled' // no AGENT_WEBHOOK_URL configured
   | 'paused' // forwarding switched off from the dashboard
   | 'filtered'; // blocked by ALLOWED_NUMBERS / FORWARD_GROUPS
 
@@ -69,7 +69,7 @@ export interface RecentMessage {
   hasMedia?: boolean;
   webhookStatus?: WebhookStatus;
   webhookError?: string;
-  hermesReply?: string;
+  agentReply?: string;
   /** Set on outbound messages that WhatsApp rejected after sending (e.g. Error 463 / 479). */
   deliveryError?: string;
 }
@@ -117,8 +117,8 @@ export interface WhatsAppClientState {
   recentMessages: RecentMessage[];
   stats: {
     receivedCount: number;
-    forwardedToHermesCount: number;
-    hermesRepliesCount: number;
+    forwardedToAgentCount: number;
+    agentRepliesCount: number;
     sentCount: number;
   };
   webhookConfig: {
@@ -332,8 +332,8 @@ export class WhatsAppClient {
   private chatQueues = new Map<string, Promise<void>>();
   private activeWebhooks = 0;
   private webhookWaiters: Array<() => void> = [];
-  /** Outbound Hermes reply id -> inbound message id it answered (to undo "replied" on a late rejection). */
-  private hermesReplyLinks = new Map<string, string>();
+  /** Outbound AI Agent reply id -> inbound message id it answered (to undo "replied" on a late rejection). */
+  private agentReplyLinks = new Map<string, string>();
   private status: WhatsAppConnectionStatus = 'disconnected';
   private qrCodeDataUrl: string | null = null;
   private user: { id: string; name?: string } | null = null;
@@ -353,8 +353,8 @@ export class WhatsAppClient {
 
   private stats = {
     receivedCount: 0,
-    forwardedToHermesCount: 0,
-    hermesRepliesCount: 0,
+    forwardedToAgentCount: 0,
+    agentRepliesCount: 0,
     sentCount: 0
   };
 
@@ -418,11 +418,11 @@ export class WhatsAppClient {
       const raw = JSON.parse(fs.readFileSync(this.activityFile, 'utf8')) as Partial<PersistedActivity>;
       if (raw.stats && typeof raw.stats === 'object') {
         if (typeof raw.stats.receivedCount === 'number') this.stats.receivedCount = raw.stats.receivedCount;
-        if (typeof raw.stats.forwardedToHermesCount === 'number') {
-          this.stats.forwardedToHermesCount = raw.stats.forwardedToHermesCount;
+        if (typeof raw.stats.forwardedToAgentCount === 'number') {
+          this.stats.forwardedToAgentCount = raw.stats.forwardedToAgentCount;
         }
-        if (typeof raw.stats.hermesRepliesCount === 'number') {
-          this.stats.hermesRepliesCount = raw.stats.hermesRepliesCount;
+        if (typeof raw.stats.agentRepliesCount === 'number') {
+          this.stats.agentRepliesCount = raw.stats.agentRepliesCount;
         }
         if (typeof raw.stats.sentCount === 'number') this.stats.sentCount = raw.stats.sentCount;
       }
@@ -435,7 +435,7 @@ export class WhatsAppClient {
           .slice(0, MAX_RECENT_MESSAGES)
           .map((m) =>
             m.webhookStatus === 'forwarded'
-              ? { ...m, webhookStatus: 'failed', webhookError: 'Gateway restarted before Hermes responded' }
+              ? { ...m, webhookStatus: 'failed', webhookError: 'Gateway restarted before AI Agent responded' }
               : m
           );
       }
@@ -1259,7 +1259,7 @@ export class WhatsAppClient {
   }
 
   // ---------------------------------------------------------------------------
-  // Incoming messages -> Hermes
+  // Incoming messages -> AI Agent
   // ---------------------------------------------------------------------------
 
   private parseContent(message: WAMessageContent | null | undefined): ParsedContent | null {
@@ -1555,13 +1555,13 @@ export class WhatsAppClient {
       };
 
       try {
-        const echoRes = await this.withWebhookSlot(() => postToHermes(echoPayload));
+        const echoRes = await this.withWebhookSlot(() => postToAgent(echoPayload));
         if (!echoRes.ok) {
-          console.warn(`[Webhook] Hermes returned HTTP ${echoRes.status} for manual echo ${id}`);
+          console.warn(`[Webhook] AI Agent returned HTTP ${echoRes.status} for manual echo ${id}`);
         }
       } catch (err: unknown) {
         console.warn(
-          `[Webhook] Could not forward manual echo ${id} to Hermes: ${err instanceof Error ? err.message : String(err)}`
+          `[Webhook] Could not forward manual echo ${id} to AI Agent: ${err instanceof Error ? err.message : String(err)}`
         );
       }
       return;
@@ -1578,7 +1578,7 @@ export class WhatsAppClient {
       sender: phone || senderId,
       senderName: displaySenderName,
       senderUsername,
-      recipient: 'Hermes Agent',
+      recipient: 'AI Agent',
       content: parsed.text,
       timestamp: this.formatDateTime(eventDate),
       isoTimestamp: eventDate.toISOString(),
@@ -1647,17 +1647,17 @@ export class WhatsAppClient {
     };
 
     try {
-      const result = await this.withWebhookSlot(() => postToHermes(payload));
+      const result = await this.withWebhookSlot(() => postToAgent(payload));
 
       if (!result.ok) {
         record.webhookStatus = 'failed';
-        record.webhookError = `Hermes answered HTTP ${result.status}`;
+        record.webhookError = `AI Agent answered HTTP ${result.status}`;
         this.scheduleActivitySave();
-        console.warn(`[Webhook] Hermes returned HTTP ${result.status} for message ${id}`);
+        console.warn(`[Webhook] AI Agent returned HTTP ${result.status} for message ${id}`);
         return;
       }
 
-      this.stats.forwardedToHermesCount++;
+      this.stats.forwardedToAgentCount++;
       this.scheduleActivitySave();
       const reply = typeof result.json?.reply === 'string' ? result.json.reply.trim() : '';
       const stickerReply =
@@ -1668,13 +1668,13 @@ export class WhatsAppClient {
             : null;
 
       if (reply) {
-        record.hermesReply = reply;
+        record.agentReply = reply;
         const quote = typeof result.json?.quote === 'boolean' ? result.json.quote : isGroup;
-        // On success sendMessage() marks this record as "replied" (see linkHermesReply).
+        // On success sendMessage() marks this record as "replied" (see linkAgentReply).
         const sent = await this.sendMessage(chatJid, reply, {
           quotedMessageId: quote ? id : undefined,
           inReplyTo: id,
-          source: 'hermes'
+          source: 'agent'
         });
         if (!sent.success) {
           record.webhookStatus = 'failed';
@@ -1682,12 +1682,12 @@ export class WhatsAppClient {
           this.scheduleActivitySave();
         }
       } else if (stickerReply) {
-        record.hermesReply = '[Sticker]';
+        record.agentReply = '[Sticker]';
         const quote = typeof result.json?.quote === 'boolean' ? result.json.quote : isGroup;
         const sent = await this.sendSticker(chatJid, stickerReply, {
           quotedMessageId: quote ? id : undefined,
           inReplyTo: id,
-          source: 'hermes',
+          source: 'agent',
           isAnimated: typeof result.json?.isAnimated === 'boolean' ? result.json.isAnimated : undefined,
           pack: typeof result.json?.pack === 'string' ? result.json.pack : undefined,
           author: typeof result.json?.author === 'string' ? result.json.author : undefined
@@ -1705,7 +1705,7 @@ export class WhatsAppClient {
       record.webhookStatus = 'failed';
       record.webhookError = err instanceof Error ? err.message : String(err);
       this.scheduleActivitySave();
-      console.error(`[Webhook] Could not reach Hermes at ${config.webhookUrl}: ${record.webhookError}`);
+      console.error(`[Webhook] Could not reach AI Agent at ${config.webhookUrl}: ${record.webhookError}`);
     }
   }
 
@@ -1718,24 +1718,24 @@ export class WhatsAppClient {
   }
 
   /**
-   * Marks the inbound message a Hermes reply answers as "replied", so asynchronous replies
+   * Marks the inbound message an AI Agent reply answers as "replied", so asynchronous replies
    * (sent later through POST /api/send) close the loop in the dashboard and the stats.
    */
-  private linkHermesReply(chatJid: string, replyText: string, inReplyTo?: string): string | undefined {
+  private linkAgentReply(chatJid: string, replyText: string, inReplyTo?: string): string | undefined {
     const target =
       (inReplyTo && this.recentMessages.find((m) => !m.fromMe && m.id === inReplyTo)) ||
       this.recentMessages.find((m) => !m.fromMe && m.chatJid === chatJid && m.webhookStatus === 'processing');
     if (!target || target.webhookStatus === 'replied') return undefined;
     target.webhookStatus = 'replied';
-    target.hermesReply = replyText;
+    target.agentReply = replyText;
     delete target.webhookError;
-    this.stats.hermesRepliesCount++;
+    this.stats.agentRepliesCount++;
     this.scheduleActivitySave();
     return target.id;
   }
 
   // ---------------------------------------------------------------------------
-  // Outgoing actions (used by the dashboard and by Hermes)
+  // Outgoing actions (used by the dashboard and by the AI Agent)
   // ---------------------------------------------------------------------------
 
   /**
@@ -2114,7 +2114,7 @@ export class WhatsAppClient {
     messageType?: string;
     quotedMessageId?: string;
     inReplyTo?: string;
-    source?: 'hermes' | 'api';
+    source?: 'agent' | 'api';
     ackTimeoutMs?: number;
   }): Promise<SendResult> {
     const sock = this.sock;
@@ -2160,7 +2160,7 @@ export class WhatsAppClient {
         const ackDate = new Date();
         this.addRecentMessage({
           id: messageId,
-          sender: params.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
+          sender: params.source === 'agent' ? 'AI Agent' : 'Dashboard / API',
           recipient: displayRecipient,
           content: params.summaryText,
           timestamp: this.formatDateTime(ackDate),
@@ -2174,20 +2174,20 @@ export class WhatsAppClient {
       }
 
       this.stats.sentCount++;
-      if (params.source === 'hermes') {
-        const answeredId = this.linkHermesReply(jid, params.summaryText, params.inReplyTo ?? params.quotedMessageId);
+      if (params.source === 'agent') {
+        const answeredId = this.linkAgentReply(jid, params.summaryText, params.inReplyTo ?? params.quotedMessageId);
         if (answeredId) {
-          this.hermesReplyLinks.set(messageId, answeredId);
-          if (this.hermesReplyLinks.size > MAX_CACHED_MESSAGES) {
-            const oldest = this.hermesReplyLinks.keys().next().value;
-            if (oldest) this.hermesReplyLinks.delete(oldest);
+          this.agentReplyLinks.set(messageId, answeredId);
+          if (this.agentReplyLinks.size > MAX_CACHED_MESSAGES) {
+            const oldest = this.agentReplyLinks.keys().next().value;
+            if (oldest) this.agentReplyLinks.delete(oldest);
           }
         }
       }
       const sentDate = new Date();
       this.addRecentMessage({
         id: messageId,
-        sender: params.source === 'hermes' ? 'Hermes Agent' : 'Dashboard / API',
+        sender: params.source === 'agent' ? 'AI Agent' : 'Dashboard / API',
         recipient: displayRecipient,
         content: params.summaryText,
         timestamp: this.formatDateTime(sentDate),
@@ -2218,15 +2218,15 @@ export class WhatsAppClient {
       this.stats.sentCount = Math.max(0, this.stats.sentCount - 1);
       changed = true;
 
-      // If this was a Hermes reply, the inbound message it answered was not actually answered
-      const answeredId = this.hermesReplyLinks.get(key.id);
+      // If this was an AI Agent reply, the inbound message it answered was not actually answered
+      const answeredId = this.agentReplyLinks.get(key.id);
       if (answeredId) {
-        this.hermesReplyLinks.delete(key.id);
+        this.agentReplyLinks.delete(key.id);
         const inbound = this.recentMessages.find((m) => !m.fromMe && m.id === answeredId);
         if (inbound && inbound.webhookStatus === 'replied') {
           inbound.webhookStatus = 'failed';
           inbound.webhookError = `Reply was rejected by WhatsApp: ${record.deliveryError}`;
-          this.stats.hermesRepliesCount = Math.max(0, this.stats.hermesRepliesCount - 1);
+          this.stats.agentRepliesCount = Math.max(0, this.stats.agentRepliesCount - 1);
         }
       }
       console.warn(`[WhatsApp] Message ${key.id} to ${record.recipient} was rejected by WhatsApp (error ${code}).`);
@@ -2246,7 +2246,7 @@ export class WhatsAppClient {
       quotedMessageId?: string;
       /** Inbound message this reply answers (marks it "replied" in the dashboard). */
       inReplyTo?: string;
-      source?: 'hermes' | 'api';
+      source?: 'agent' | 'api';
     } = {}
   ): Promise<SendResult> {
     if (!recipient?.trim() || !messageText?.trim()) {
@@ -2282,7 +2282,7 @@ export class WhatsAppClient {
       quotedMessageId?: string;
       /** Inbound message this reply answers (marks it "replied" in the dashboard). */
       inReplyTo?: string;
-      source?: 'hermes' | 'api';
+      source?: 'agent' | 'api';
     } = {}
   ): Promise<SendResult> {
     if (!recipient?.trim() || !imageUrl?.trim()) {
@@ -2342,7 +2342,7 @@ export class WhatsAppClient {
       quotedMessageId?: string;
       /** Inbound message this reply answers (marks it "replied" in the dashboard). */
       inReplyTo?: string;
-      source?: 'hermes' | 'api';
+      source?: 'agent' | 'api';
     } = {}
   ): Promise<SendResult> {
     if (!recipient?.trim() || !documentUrl?.trim()) {
@@ -2424,7 +2424,7 @@ export class WhatsAppClient {
       quotedMessageId?: string;
       /** Inbound message this reply answers (marks it "replied" in the dashboard). */
       inReplyTo?: string;
-      source?: 'hermes' | 'api';
+      source?: 'agent' | 'api';
     } = {}
   ): Promise<SendResult> {
     if (!recipient?.trim() || !sticker || (typeof sticker === 'string' && !sticker.trim())) {

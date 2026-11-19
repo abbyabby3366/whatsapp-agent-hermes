@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deterministic, idempotent installer for WhatsApp Agent Hermes (Gateway + Built-In Node Receiver).
+# Deterministic, idempotent installer for WhatsApp AI Agent (Gateway + Built-In Node Receiver).
 # Usage:
 #   bash scripts/install.sh --master-phone 60123456789 --master-name "Alex" [options]
 
@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RECEIVER_DIR="${HOME}/whatsapp-hermes-receiver"
+RECEIVER_DIR="${HOME}/whatsapp-ai-agent-receiver"
 MASTER_PHONE=""
 MASTER_NAME=""
 MASTER_LID=""
@@ -27,7 +27,7 @@ Options:
   --master-lid <lid>              Optional 15-digit WhatsApp LID for Master 1:1 DM recognition
   --timezone <iana_tz>            IANA timezone (default: Asia/Kuala_Lumpur)
   --default-country-code <digits> Country code for leading-0 numbers (default: 60)
-  --receiver-dir <path>           Receiver data directory (default: ~/whatsapp-hermes-receiver)
+  --receiver-dir <path>           Receiver data directory (default: ~/whatsapp-ai-agent-receiver)
   --skip-build                    Skip npm ci, typecheck, and build (useful when already built)
   --skip-systemd                  Skip systemd --user unit installation and live checks
   --skip-whisper-warmup           Skip downloading ONNX Whisper model during install
@@ -111,15 +111,12 @@ if (major < 22 || (major === 22 && minor < 5)) {
 console.log(`[install] Node.js v${process.versions.node} detected`);
 NODE
 
-HERMES_BIN_PATH="${HERMES_BIN:-$(command -v hermes || true)}"
-if [[ -z "${HERMES_BIN_PATH}" && -x "${HOME}/.hermes/hermes-agent/venv/bin/hermes" ]]; then
-  HERMES_BIN_PATH="${HOME}/.hermes/hermes-agent/venv/bin/hermes"
-fi
-if [[ -z "${HERMES_BIN_PATH}" ]]; then
-  echo "[install] Warning: 'hermes' CLI not found on PATH yet; ensure Hermes is installed before live turns run." >&2
-  HERMES_BIN_PATH="hermes"
+AGENT_BIN_PATH="${AGENT_BIN:-$(command -v agent || true)}"
+if [[ -z "${AGENT_BIN_PATH}" ]]; then
+  echo "[install] Warning: 'agent' CLI not found on PATH yet; set AGENT_BIN in receiver.env before live turns run." >&2
+  AGENT_BIN_PATH="agent"
 else
-  echo "[install] Hermes CLI detected at ${HERMES_BIN_PATH}"
+  echo "[install] AI Agent CLI detected at ${AGENT_BIN_PATH}"
 fi
 
 # 2. Configure .env and receiver.env idempotently (fail fast before slow installs if MASTER_* is missing)
@@ -133,7 +130,7 @@ mkdir -p "${RECEIVER_DIR}" "${RECEIVER_DIR}/media" "${RECEIVER_DIR}/models"
   "${MASTER_LID}" \
   "${TIMEZONE_ARG}" \
   "${COUNTRY_CODE_ARG}" \
-  "${HERMES_BIN_PATH}" <<'NODE'
+  "${AGENT_BIN_PATH}" <<'NODE'
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -146,7 +143,7 @@ const [
   argMasterLid,
   argTimezone,
   argCountryCode,
-  hermesBinPath
+  agentBinPath
 ] = process.argv.slice(2);
 
 const isPlaceholder = (val) => /^change-me(-|$)/i.test((val || '').trim());
@@ -238,7 +235,7 @@ try {
 }
 
 const gatewayApiKey = pickSecret(oldGw.get('GATEWAY_API_KEY'), oldRx.get('GATEWAY_API_KEY'));
-const hermesSecretToken = pickSecret(oldGw.get('HERMES_SECRET_TOKEN'), oldRx.get('HERMES_SECRET_TOKEN'));
+const agentSecretToken = pickSecret(oldGw.get('AGENT_SECRET_TOKEN'), oldRx.get('AGENT_SECRET_TOKEN'));
 
 const gatewayPort = pickNonEmpty(oldGw.get('PORT'), '3100');
 const receiverPort = pickNonEmpty(oldRx.get('RECEIVER_PORT'), '5000');
@@ -269,19 +266,10 @@ writeEnvAtomic(
     ['PORT', gatewayPort],
     ['HOST', pickNonEmpty(oldGw.get('HOST'), '127.0.0.1')],
     ['GATEWAY_API_KEY', gatewayApiKey],
-    ['SESSIONS_DIR', pickNonEmpty(oldGw.get('SESSIONS_DIR'), './sessions')],
-    ['DATA_DIR', pickNonEmpty(oldGw.get('DATA_DIR'), './data')],
-    ['ALLOWED_MEDIA_DIR', pickNonEmpty(oldGw.get('ALLOWED_MEDIA_DIR'), './data/media')],
-    ['MAX_MEDIA_BYTES', pickNonEmpty(oldGw.get('MAX_MEDIA_BYTES'), '26214400')],
     ['TIMEZONE', timezone],
-    ['HERMES_WEBHOOK_URL', pickNonEmpty(oldGw.get('HERMES_WEBHOOK_URL'), `http://127.0.0.1:${receiverPort}/api/webhook`)],
-    ['HERMES_SECRET_TOKEN', hermesSecretToken],
-    ['HERMES_WEBHOOK_TIMEOUT_MS', pickNonEmpty(oldGw.get('HERMES_WEBHOOK_TIMEOUT_MS'), '15000')],
-    ['HERMES_WEBHOOK_RETRIES', pickNonEmpty(oldGw.get('HERMES_WEBHOOK_RETRIES'), '2')],
-    ['WEBHOOK_CONCURRENCY', pickNonEmpty(oldGw.get('WEBHOOK_CONCURRENCY'), '8')],
+    ['AGENT_WEBHOOK_URL', pickNonEmpty(oldGw.get('AGENT_WEBHOOK_URL'), `http://127.0.0.1:${receiverPort}/api/webhook`)],
+    ['AGENT_SECRET_TOKEN', agentSecretToken],
     ['DEFAULT_COUNTRY_CODE', countryCode],
-    ['ALLOWED_NUMBERS', oldGw.get('ALLOWED_NUMBERS') ?? ''],
-    ['FORWARD_GROUPS', pickNonEmpty(oldGw.get('FORWARD_GROUPS'), 'true')],
     ['MASTER_PHONE', masterPhone],
     ['MASTER_LID', masterLid],
     ['MASTER_NAME', masterName]
@@ -297,7 +285,7 @@ writeEnvAtomic(
     ['RECEIVER_DATA_DIR', receiverDir],
     ['WHATSAPP_GATEWAY_URL', pickNonEmpty(oldRx.get('WHATSAPP_GATEWAY_URL'), `http://127.0.0.1:${gatewayPort}`)],
     ['GATEWAY_API_KEY', gatewayApiKey],
-    ['HERMES_SECRET_TOKEN', hermesSecretToken],
+    ['AGENT_SECRET_TOKEN', agentSecretToken],
     ['MASTER_PHONE', masterPhone],
     ['MASTER_LID', masterLid],
     ['MASTER_NAME', masterName],
@@ -306,8 +294,8 @@ writeEnvAtomic(
     ['WHISPER_MODEL', pickNonEmpty(oldRx.get('WHISPER_MODEL'), 'base')],
     ['WHISPER_DTYPE', pickNonEmpty(oldRx.get('WHISPER_DTYPE'), 'q8')],
     ['WHISPER_CACHE_DIR', pickNonEmpty(oldRx.get('WHISPER_CACHE_DIR'), path.join(receiverDir, 'models'))],
-    ['HERMES_BIN', pickNonEmpty(oldRx.get('HERMES_BIN'), hermesBinPath)],
-    ['HERMES_RULES_PATH', pickNonEmpty(oldRx.get('HERMES_RULES_PATH'), path.join(process.env.HOME || '', '.hermes', 'skills', 'whatsapp-agent-rules', 'SKILL.md'))],
+    ['AGENT_BIN', pickNonEmpty(oldRx.get('AGENT_BIN'), agentBinPath)],
+    ['AGENT_RULES_PATH', pickNonEmpty(oldRx.get('AGENT_RULES_PATH'), path.join(process.env.HOME || '', '.whatsapp-ai-agent', 'skills', 'whatsapp-agent-rules', 'SKILL.md'))],
     ['AGENT_TOOLSETS', pickNonEmpty(oldRx.get('AGENT_TOOLSETS'), 'web,vision')],
     ['AGENT_TOOLSETS_OWNER', pickNonEmpty(oldRx.get('AGENT_TOOLSETS_OWNER'), 'terminal,file,web,vision')],
     ['AGENT_TIMEOUT_SECONDS', pickNonEmpty(oldRx.get('AGENT_TIMEOUT_SECONDS'), '300')],
@@ -341,17 +329,17 @@ else
   echo "[install] --skip-build set; skipping npm ci, typecheck, and build."
 fi
 
-# 4. Install Hermes global skills, prompt templates, QR helper, and CLI shims
-SKILLS_DIR="${HOME}/.hermes/skills"
+# 4. Install AI Agent global skills, prompt templates, QR helper, and CLI shims
+SKILLS_DIR="${HOME}/.whatsapp-ai-agent/skills"
 mkdir -p \
-  "${SKILLS_DIR}/whatsapp-agent-hermes-gateway" \
+  "${SKILLS_DIR}/whatsapp-ai-agent-gateway" \
   "${SKILLS_DIR}/skill-crafter" \
   "${SKILLS_DIR}/whatsapp-agent-rules" \
   "${HOME}/.local/bin"
 
-cp "${REPO_DIR}/wa-agent-SKILL.md" "${SKILLS_DIR}/whatsapp-agent-hermes-gateway/SKILL.md"
-cp -r "${REPO_DIR}/skill/." "${SKILLS_DIR}/whatsapp-agent-hermes-gateway/"
-chmod +x "${SKILLS_DIR}/whatsapp-agent-hermes-gateway/scripts/fetch-pairing-qr.sh"
+cp "${REPO_DIR}/wa-agent-SKILL.md" "${SKILLS_DIR}/whatsapp-ai-agent-gateway/SKILL.md"
+cp -r "${REPO_DIR}/skill/." "${SKILLS_DIR}/whatsapp-ai-agent-gateway/"
+chmod +x "${SKILLS_DIR}/whatsapp-ai-agent-gateway/scripts/fetch-pairing-qr.sh"
 cp "${REPO_DIR}/skill-crafter-SKILL.md" "${SKILLS_DIR}/skill-crafter/SKILL.md"
 
 RULES_SKILL_FILE="${SKILLS_DIR}/whatsapp-agent-rules/SKILL.md"
@@ -447,8 +435,8 @@ import path from 'node:path';
 
 const [repoDir, receiverDir, nodeBin, nodeBinDir, systemdUserDir] = process.argv.slice(2);
 const templates = [
-  ['whatsapp-agent-hermes.service.tpl', 'whatsapp-agent-hermes.service'],
-  ['hermes-wa-receiver.service.tpl', 'hermes-wa-receiver.service']
+  ['whatsapp-ai-agent.service.tpl', 'whatsapp-ai-agent.service'],
+  ['wa-agent-receiver.service.tpl', 'wa-agent-receiver.service']
 ];
 
 for (const [tplName, outName] of templates) {
@@ -463,8 +451,8 @@ for (const [tplName, outName] of templates) {
 NODE
 
 systemctl --user daemon-reload
-systemctl --user enable whatsapp-agent-hermes.service hermes-wa-receiver.service
-systemctl --user restart whatsapp-agent-hermes.service hermes-wa-receiver.service
+systemctl --user enable whatsapp-ai-agent.service wa-agent-receiver.service
+systemctl --user restart whatsapp-ai-agent.service wa-agent-receiver.service
 
 GATEWAY_PORT="$(grep -E '^PORT=' "${REPO_DIR}/.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r")"
 GATEWAY_API_KEY_VAL="$(grep -E '^GATEWAY_API_KEY=' "${REPO_DIR}/.env" | tail -n1 | cut -d'=' -f2- | tr -d "\"'\r")"
@@ -490,7 +478,7 @@ done
 
 if [[ "${gw_ok}" != "true" || "${rx_ok}" != "true" ]]; then
   echo "[install] Error: services did not become healthy in time (gateway=${gw_ok}, receiver=${rx_ok})." >&2
-  systemctl --user status whatsapp-agent-hermes.service hermes-wa-receiver.service --no-pager >&2 || true
+  systemctl --user status whatsapp-ai-agent.service wa-agent-receiver.service --no-pager >&2 || true
   exit 1
 fi
 

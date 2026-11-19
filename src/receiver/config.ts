@@ -12,7 +12,7 @@ export interface ReceiverConfig {
   mediaDir: string;
   gatewayUrl: string;
   gatewayApiKey: string;
-  hermesSecretToken: string;
+  agentSecretToken: string;
   masterPhone: string;
   masterLid: string;
   masterName: string;
@@ -21,7 +21,7 @@ export interface ReceiverConfig {
   whisperModel: string;
   whisperDtype: 'fp32' | 'fp16' | 'q8' | 'q4';
   whisperCacheDir: string;
-  hermesBin: string;
+  agentBin: string;
   rulesPath: string;
   repoAssetsDir: string;
   toolsetsContact: string;
@@ -43,7 +43,7 @@ export interface ReceiverConfig {
 }
 
 export function defaultReceiverDir(): string {
-  return path.join(os.homedir(), 'whatsapp-hermes-receiver');
+  return path.join(os.homedir(), 'whatsapp-ai-agent-receiver');
 }
 
 export function resolveEnvFileCandidates(explicitPath?: string): string[] {
@@ -58,7 +58,7 @@ export function resolveEnvFileCandidates(explicitPath?: string): string[] {
   candidates.push(path.resolve(process.cwd(), 'receiver.env'));
   candidates.push(path.join(defaultReceiverDir(), 'receiver.env'));
   candidates.push(path.resolve(process.cwd(), '.env'));
-  candidates.push(path.join(os.homedir(), 'whatsapp-agent-hermes', '.env'));
+  candidates.push(path.join(os.homedir(), 'whatsapp-ai-agent', '.env'));
   return [...new Set(candidates)];
 }
 
@@ -126,11 +126,11 @@ export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): Re
   const masterPhoneRaw = overrides.masterPhone ?? (process.env.MASTER_PHONE?.trim() || process.env.OWNER_WHATSAPP?.trim() || '');
   const masterLidRaw = overrides.masterLid ?? (process.env.MASTER_LID?.trim() || '');
   const repoAssetsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'skill', 'assets');
-  const rawHermesBin = overrides.hermesBin ?? (process.env.HERMES_BIN?.trim() || 'hermes');
-  const hermesBin =
-    rawHermesBin === '~' || rawHermesBin.startsWith('~/') || rawHermesBin.startsWith('~\\')
-      ? path.resolve(expandHomePath(rawHermesBin))
-      : rawHermesBin;
+  const rawAgentBin = overrides.agentBin ?? (process.env.AGENT_BIN?.trim() || 'agent');
+  const agentBin =
+    rawAgentBin === '~' || rawAgentBin.startsWith('~/') || rawAgentBin.startsWith('~\\')
+      ? path.resolve(expandHomePath(rawAgentBin))
+      : rawAgentBin;
 
   return {
     host: overrides.host ?? (process.env.RECEIVER_HOST?.trim() || '127.0.0.1'),
@@ -141,7 +141,7 @@ export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): Re
     ),
     gatewayUrl: (overrides.gatewayUrl ?? (process.env.WHATSAPP_GATEWAY_URL?.trim() || 'http://127.0.0.1:3100')).replace(/\/+$/, ''),
     gatewayApiKey: overrides.gatewayApiKey ?? (process.env.GATEWAY_API_KEY?.trim() || ''),
-    hermesSecretToken: overrides.hermesSecretToken ?? (process.env.HERMES_SECRET_TOKEN?.trim() || ''),
+    agentSecretToken: overrides.agentSecretToken ?? (process.env.AGENT_SECRET_TOKEN?.trim() || ''),
     masterPhone: normalizeDigits(masterPhoneRaw, defaultCountryCode),
     masterLid: normalizeDigits(masterLidRaw.replace(/@lid$/i, '')),
     masterName: overrides.masterName ?? (process.env.MASTER_NAME?.trim() || ''),
@@ -152,11 +152,11 @@ export function buildReceiverConfig(overrides: Partial<ReceiverConfig> = {}): Re
     whisperCacheDir: path.resolve(
       expandHomePath(overrides.whisperCacheDir ?? (process.env.WHISPER_CACHE_DIR?.trim() || path.join(dataDir, 'models')))
     ),
-    hermesBin,
+    agentBin,
     rulesPath: path.resolve(
       expandHomePath(
         overrides.rulesPath ??
-          (process.env.HERMES_RULES_PATH?.trim() || path.join(os.homedir(), '.hermes', 'skills', 'whatsapp-agent-rules', 'SKILL.md'))
+          (process.env.AGENT_RULES_PATH?.trim() || path.join(os.homedir(), '.whatsapp-ai-agent', 'skills', 'whatsapp-agent-rules', 'SKILL.md'))
       )
     ),
     repoAssetsDir: overrides.repoAssetsDir ?? repoAssetsDir,
@@ -183,8 +183,8 @@ export function validateProductionReceiverConfig(cfg: ReceiverConfig): void {
   if (!cfg.gatewayApiKey || isPlaceholderSecret(cfg.gatewayApiKey)) {
     throw new Error('[ReceiverConfig] GATEWAY_API_KEY is required and must not be a placeholder secret.');
   }
-  if (!cfg.hermesSecretToken || isPlaceholderSecret(cfg.hermesSecretToken)) {
-    throw new Error('[ReceiverConfig] HERMES_SECRET_TOKEN is required and must not be a placeholder secret.');
+  if (!cfg.agentSecretToken || isPlaceholderSecret(cfg.agentSecretToken)) {
+    throw new Error('[ReceiverConfig] AGENT_SECRET_TOKEN is required and must not be a placeholder secret.');
   }
   if (!cfg.masterPhone) {
     throw new Error('[ReceiverConfig] MASTER_PHONE is required for Master 1:1 DM authentication and @@FLAG@@ alerts.');
