@@ -1,0 +1,2 @@
+Install and set up this WhatsApp AI Agent on this server by following the "Install with an AI Agent" section in README.md:
+https://github.com/abbyabby3366/whatsapp-agent-hermes

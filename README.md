@@ -39,7 +39,8 @@ bash scripts/install.sh --master-phone "<MASTER_PHONE>" --master-name "<MASTER_N
 
 `scripts/install.sh` automatically verifies `node >= 22.5.0` & `npm`, generates `chmod 600` `.env` and `~/whatsapp-ai-agent-receiver/receiver.env` (preserving any existing non-placeholder secrets & learned rules), runs `npm ci && npm run typecheck && npm run build`, installs `~/.whatsapp-ai-agent/skills/` and `~/.local/bin/{wa-send,wa-history,wa-flow,wa-qr}`, pre-warms ONNX Whisper, enables `systemd --user` lingering, starts `whatsapp-ai-agent.service` (`:3100`) and `wa-agent-receiver.service` (`:5000`), verifies `401` auth lock on `:3100/api/status`, and tests `POST /api/webhook/test`.
 
-Read `~/.whatsapp-ai-agent/skills/whatsapp-ai-agent-gateway/SKILL.md` and `~/.whatsapp-ai-agent/skills/skill-crafter/SKILL.md` to confirm operational commands and rule persistence.
+- **Connect the receiver to yourself (this host's AI agent):** Ensure `AGENT_BIN` in `~/whatsapp-ai-agent-receiver/receiver.env` and `src/receiver/agent-runner.ts` invoke your own AI agent CLI/runtime. If you edit `src/receiver/agent-runner.ts`, run `npm run build` and `systemctl --user restart wa-agent-receiver`.
+- Read `~/.whatsapp-ai-agent/skills/whatsapp-ai-agent-gateway/SKILL.md` and `~/.whatsapp-ai-agent/skills/skill-crafter/SKILL.md` to confirm operational commands and rule persistence.
 
 ### Step 2: Pair WhatsApp
 Run either:
